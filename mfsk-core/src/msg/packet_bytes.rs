@@ -1,11 +1,20 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! `PacketBytesMessage` — variable-length byte-payload message codec.
 //!
-//! Used by the [`crate::uvpacket`] family. Unlike the WSJT-style
-//! codecs ([`crate::msg::Wsjt77Message`], [`crate::msg::Wspr50Message`],
-//! [`crate::msg::Jt72Codec`]) which pack callsign / grid / report
-//! fields into a fixed-width payload, this codec carries an
-//! arbitrary byte slice of length 1..=10 in 91 information bits.
+//! Worked example of a byte-oriented [`MessageCodec`]. Unlike the
+//! WSJT-style codecs ([`crate::msg::Wsjt77Message`],
+//! [`crate::msg::Wspr50Message`], [`crate::msg::Jt72Codec`]) which pack
+//! callsign / grid / report fields into a fixed-width payload, this
+//! codec carries an arbitrary byte slice of length 1..=10 in 91
+//! information bits — the K of [`crate::fec::Ldpc174_91`].
+//!
+//! No protocol in mfsk-core 0.3.0 uses this codec directly; it remains
+//! as a reference implementation demonstrating that the `MessageCodec`
+//! trait surface accommodates byte-oriented protocols, alongside the
+//! WSJT-77 callsign-packing flavour. Future binary-payload protocols
+//! (planned for 0.4.0+) can use it directly when the LDPC174_91 K=91
+//! payload size is a fit, or build analogous codecs for other LDPC
+//! sizes.
 //!
 //! ## Bit layout (91 bits)
 //!
@@ -143,7 +152,8 @@ impl MessageCodec for PacketBytesMessage {
 
     /// Verify the CRC-7 trailer. Called by the FEC layer (BP / OSD)
     /// to reject parity-converged candidates whose CRC doesn't match —
-    /// substantially reduces uvpacket false-decode rate.
+    /// substantially reduces the false-decode rate over the naive
+    /// "always accept" verifier.
     fn verify_info(info: &[u8]) -> bool {
         if info.len() != Self::PAYLOAD_BITS as usize {
             return false;

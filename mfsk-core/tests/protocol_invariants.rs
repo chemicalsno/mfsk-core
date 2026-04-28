@@ -42,9 +42,6 @@ use mfsk_core::Wspr;
 #[cfg(feature = "q65")]
 use mfsk_core::q65::{Q65a30, Q65a60, Q65b60, Q65c60, Q65d60, Q65e60};
 
-#[cfg(feature = "uvpacket")]
-use mfsk_core::{UvPacket150, UvPacket300, UvPacket600, UvPacket1200};
-
 /// Invariants that depend only on `<P as ModulationParams>`.
 fn assert_modulation_invariants<P: ModulationParams>(name: &str) {
     let ntones = P::NTONES;
@@ -298,19 +295,6 @@ fn q65_eme_submodes_satisfy_protocol_invariants() {
     assert_protocol_invariants::<Q65e60>("Q65e60");
 }
 
-#[cfg(feature = "uvpacket")]
-#[test]
-fn uvpacket_submodes_satisfy_protocol_invariants() {
-    // All four uvpacket sub-modes share Ldpc174_91 + PacketBytesMessage
-    // + the two-Costas-block sync layout + the stride-25 interleaver;
-    // only NSPS and TONE_SPACING_HZ vary. The same generic asserter
-    // covers them all.
-    assert_protocol_invariants::<UvPacket150>("UvPacket150");
-    assert_protocol_invariants::<UvPacket300>("UvPacket300");
-    assert_protocol_invariants::<UvPacket600>("UvPacket600");
-    assert_protocol_invariants::<UvPacket1200>("UvPacket1200");
-}
-
 // ─── Registry / trait-surface cross-check ─────────────────────────────
 
 /// Generic helper: assert that a [`ProtocolMeta`] entry's fields
@@ -481,10 +465,6 @@ fn registry_size_matches_wired_protocols() {
     {
         expected += 6;
     }
-    #[cfg(feature = "uvpacket")]
-    {
-        expected += 4;
-    }
     assert_eq!(
         PROTOCOLS.len(),
         expected,
@@ -533,15 +513,6 @@ fn every_wired_protocol_has_a_unique_protocol_id() {
         ids.push(("Q65d60", <Q65d60 as Protocol>::ID));
         ids.push(("Q65e60", <Q65e60 as Protocol>::ID));
     }
-    #[cfg(feature = "uvpacket")]
-    {
-        // All four uvpacket sub-modes share ProtocolId::UvPacket —
-        // same family-level FFI tag rationale as Q65.
-        ids.push(("UvPacket150", <UvPacket150 as Protocol>::ID));
-        ids.push(("UvPacket300", <UvPacket300 as Protocol>::ID));
-        ids.push(("UvPacket600", <UvPacket600 as Protocol>::ID));
-        ids.push(("UvPacket1200", <UvPacket1200 as Protocol>::ID));
-    }
 
     // Distinct protocol families must have distinct IDs.
     let _unique: Vec<ProtocolId> = {
@@ -551,8 +522,8 @@ fn every_wired_protocol_has_a_unique_protocol_id() {
         v
     };
 
-    // Q65 + uvpacket each contribute multiple ZSTs but one ID; assert
-    // the dedupe count matches the number of distinct families.
+    // Q65 contributes multiple ZSTs but one ID; assert the dedupe
+    // count matches the number of distinct families.
     #[cfg(all(
         feature = "ft8",
         feature = "ft4",
@@ -560,14 +531,13 @@ fn every_wired_protocol_has_a_unique_protocol_id() {
         feature = "wspr",
         feature = "jt9",
         feature = "jt65",
-        feature = "q65",
-        feature = "uvpacket"
+        feature = "q65"
     ))]
     assert_eq!(
         _unique.len(),
-        8,
-        "expected 8 distinct ProtocolId values \
-         (FT8, FT4, FST4, WSPR, JT9, JT65, Q65, UvPacket), \
+        7,
+        "expected 7 distinct ProtocolId values \
+         (FT8, FT4, FST4, WSPR, JT9, JT65, Q65), \
          got {:?} from {ids:?}",
         _unique
     );
@@ -584,8 +554,7 @@ fn every_wired_protocol_has_a_unique_protocol_id() {
             | ProtocolId::Jt65
             | ProtocolId::Jt9
             | ProtocolId::Wspr
-            | ProtocolId::Q65
-            | ProtocolId::UvPacket => {}
+            | ProtocolId::Q65 => {}
         }
         let _ = name;
     }

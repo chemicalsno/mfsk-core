@@ -18,9 +18,8 @@ use super::Protocol;
 /// FT8: `[(7, 29), (43, 29)]` — sync at 0/36/72, last block ends at the
 /// end of the frame so there is no trailing chunk.
 /// FT4: `[(4, 29), (37, 29), (70, 29)]` — same shape.
-/// uvpacket: `[(4, 43), (51, 44)]` — sync at 0 and 47, the trailing
-/// chunk picks up the data slots between block 1's tail (sym 51) and
-/// the end of the 95-symbol frame.
+/// A hypothetical protocol with sync at frame head plus mid-frame would
+/// produce a non-empty trailing chunk after the mid-frame sync block.
 pub fn data_chunks<P: Protocol>() -> Vec<(usize, usize)> {
     let blocks = P::SYNC_MODE.blocks();
     let n_sym = P::N_SYMBOLS as usize;
@@ -53,8 +52,8 @@ pub fn data_chunks<P: Protocol>() -> Vec<(usize, usize)> {
     }
 
     // Trailing data (after the last sync block). FT8/FT4 put their
-    // final sync at the tail so this is empty; uvpacket's mid-frame
-    // sync layout produces a non-empty trailing chunk.
+    // final sync at the tail so this is empty; protocols with mid-
+    // frame-only sync layouts produce a non-empty trailing chunk.
     if let Some(last) = blocks.last() {
         let after_last = last.start_symbol as usize + last.pattern.len();
         if n_sym > after_last {
@@ -73,8 +72,9 @@ pub fn data_chunks<P: Protocol>() -> Vec<(usize, usize)> {
 /// When [`P::CODEWORD_INTERLEAVE`](crate::core::FrameLayout::CODEWORD_INTERLEAVE)
 /// is `Some`, the codeword bits are read in interleaved order: channel bit
 /// position `j` gets `cw[INTERLEAVE[j]]`. This is the TX half of the
-/// burst-error-tolerance scheme uvpacket uses; protocols with the default
-/// `None` constant get the historical natural-order behaviour.
+/// burst-error-tolerance scheme available for fading-channel protocols;
+/// protocols with the default `None` constant get the historical
+/// natural-order behaviour.
 ///
 /// Panics if `cw.len() < total_data_symbols × BITS_PER_SYMBOL`.
 pub fn codeword_to_itone<P: Protocol>(cw: &[u8]) -> Vec<u8> {

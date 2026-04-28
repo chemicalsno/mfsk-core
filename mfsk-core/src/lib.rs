@@ -285,9 +285,6 @@ pub mod jt65;
 #[cfg(feature = "q65")]
 pub mod q65;
 
-#[cfg(feature = "uvpacket")]
-pub mod uvpacket;
-
 pub mod registry;
 
 // Flatten commonly-used types to the crate root.
@@ -309,7 +306,5 @@ pub use crate::jt9::Jt9;
 pub use crate::jt65::Jt65;
 #[cfg(feature = "q65")]
 pub use crate::q65::Q65a30;
-#[cfg(feature = "uvpacket")]
-pub use crate::uvpacket::{UvPacket150, UvPacket300, UvPacket600, UvPacket1200};
 #[cfg(feature = "wspr")]
 pub use crate::wspr::Wspr;

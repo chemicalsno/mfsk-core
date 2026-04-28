@@ -38,10 +38,6 @@ pub enum ProtocolId {
     /// Multiple T/R-period × tone-spacing variants share this tag at the
     /// FFI level; the protocol-layer ZST disambiguates.
     Q65 = 7,
-    /// UvPacket — 4-FSK GFSK packet protocol for AFSK-on-SSB at U/VHF
-    /// (multipath fading channels). Variable-byte payload, no UTC slot.
-    /// Multiple baud-rate variants share this tag.
-    UvPacket = 8,
 }
 
 /// Baseband modulation parameters (tones, symbol rate, Gray mapping, Gaussian
@@ -200,9 +196,9 @@ pub trait FrameLayout: Copy + Default + 'static {
     /// channels where a deep fade null can wipe out consecutive channel
     /// bits. The interleaver spreads consecutive codeword bits across the
     /// frame so the same fade null hits scattered codeword bits, which
-    /// soft-decision LDPC handles well. uvpacket uses a stride-25
-    /// polynomial interleaver: `INTERLEAVE[j] = (7 * j) mod 174` (the
-    /// modular inverse of stride 25, since 25 × 7 ≡ 1 mod 174).
+    /// soft-decision LDPC handles well. The table is a permutation of
+    /// `0..codeword_bits`; a polynomial form `INTERLEAVE[j] = (s * j)
+    /// mod n` with `gcd(s, n) = 1` gives uniform stride spacing.
     ///
     /// Both [`crate::core::tx::codeword_to_itone`] and the pipeline's
     /// LLR-deinterleave step honour this constant; protocols that
@@ -329,8 +325,9 @@ pub trait MessageCodec: Default + 'static {
     /// causes the FEC to keep iterating.
     ///
     /// Default: accept unconditionally — appropriate for codecs whose
-    /// message format carries no inline integrity field (e.g.
-    /// [`crate::msg::PacketBytesMessage`] in `uvpacket`).
+    /// message format carries no inline integrity field (the FEC layer
+    /// has already enforced parity convergence by the time this is
+    /// called).
     ///
     /// CRC-bearing codecs override this. For example,
     /// [`crate::msg::Wsjt77Message`] verifies the CRC-14 stored in

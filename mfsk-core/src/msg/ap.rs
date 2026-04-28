@@ -22,9 +22,9 @@ use crate::core::MessageCodec;
 /// Implementing this trait is an assertion that the codec's bit layout is
 /// byte-for-byte equivalent to [`crate::msg::Wsjt77Message`] for the first 77
 /// bits — the AP module reads / writes those positions directly. Codecs with
-/// different layouts (e.g. [`crate::msg::PacketBytesMessage`]'s 4-bit length
-/// field at bits 0..3) must NOT implement this trait; they need their own AP
-/// design.
+/// different layouts (e.g. byte-oriented packet codecs whose first bits
+/// encode a length field rather than a callsign hash) must NOT implement
+/// this trait; they need their own AP design.
 ///
 /// Sealed: only the `mfsk-core` crate may implement.
 pub trait WsjtApCompatible: MessageCodec + sealed::Sealed {}

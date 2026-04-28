@@ -1,6 +1,6 @@
 [package]
 name        = "mfsk-core"
-version     = "0.2.1"
+version     = "0.3.0"
 edition     = "2024"
 license     = "GPL-3.0-or-later"
 description = "Pure-Rust library for WSJT-family digital amateur-radio modes (FT8/FT4/FST4/WSPR/JT9/JT65/Q65): protocol traits, DSP, FEC codecs, message codecs, decoders and synthesisers — unified behind a zero-cost generic abstraction."
@@ -10,19 +10,19 @@ keywords    = ["wsjt", "ft8", "q65", "amateur-radio", "dsp"]
 categories  = ["science", "encoding", "multimedia::audio"]
 
 [features]
-default     = ["ft8", "ft4", "parallel"]
-full        = ["ft8", "ft4", "fst4", "wspr", "jt9", "jt65", "q65", "uvpacket"]
-ft8         = []
-ft4         = []
-fst4        = []
-wspr        = []
-jt9         = []
-jt65        = []
-q65         = []
-uvpacket    = []
-parallel    = ["dep:rayon"]
-osd-deep    = []
-eq-fallback = []
+default      = ["ft8", "ft4", "parallel"]
+full         = ["ft8", "ft4", "fst4", "wspr", "jt9", "jt65", "q65", "packet-bytes"]
+ft8          = []
+ft4          = []
+fst4         = []
+wspr         = []
+jt9          = []
+jt65         = []
+q65          = []
+packet-bytes = []
+parallel     = ["dep:rayon"]
+osd-deep     = []
+eq-fallback  = []
 
 [dependencies]
 num-complex = "0.4"
@@ -32,7 +32,7 @@ rayon       = { version = "1", optional = true }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = [
-    'cfg(feature, values("ft8","ft4","fst4","wspr","jt9","jt65","q65","uvpacket","parallel","osd-deep","eq-fallback","full"))',
+    'cfg(feature, values("ft8","ft4","fst4","wspr","jt9","jt65","q65","packet-bytes","parallel","osd-deep","eq-fallback","full"))',
 ] }
 
 # Build docs.rs with every protocol feature enabled so users browsing

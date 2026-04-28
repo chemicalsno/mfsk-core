@@ -83,7 +83,7 @@ pub fn check_crc14(decoded: &[u8]) -> bool {
 /// the struct can serve any [`LdpcParams`] without const-generic
 /// gymnastics. `message77` exposes the leading 77 bits as a fixed-size
 /// array for the Wsjt77-family ergonomics that pre-existing FT8 code
-/// relies on; uvpacket-class callers ignore it and read `info`.
+/// relies on; non-Wsjt77 callers ignore it and read `info`.
 pub struct BpResult {
     /// Leading 77 info bits (Wsjt77 message field). Same content as
     /// `info[..77]` — duplicated here for callers that take fixed-size

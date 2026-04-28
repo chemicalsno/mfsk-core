@@ -43,7 +43,7 @@ fn ap_max_errors(strictness: DecodeStrictness, locked_bits: usize) -> u32 {
 ///
 /// Bound on [`WsjtApCompatible`] keeps callers honest: the hint encodes
 /// callsign / grid / report at fixed Wsjt77 bit positions and is meaningless
-/// for protocols whose info layout differs (e.g. uvpacket / PacketBytes).
+/// for protocols whose info layout differs (e.g. byte-oriented codecs).
 pub fn ap_bits_for<P: Protocol>(hint: &ApHint) -> (Vec<u8>, Vec<u8>)
 where
     P::Msg: WsjtApCompatible,
