@@ -70,7 +70,7 @@ shared pipeline code.
 
 ```toml
 [dependencies]
-mfsk-core = { version = "0.1", features = ["ft8", "ft4"] }
+mfsk-core = { version = "0.3", features = ["ft8", "ft4"] }
 ```
 
 ## Attribution
@@ -223,8 +223,8 @@ reference:
 
 ## Status
 
-`0.2.x` — API is deliberately not frozen. Breaking changes follow
-cargo-style minor bumps (`0.2 → 0.3`). Algorithm correctness is
+`0.3.x` — API is deliberately not frozen. Breaking changes follow
+cargo-style minor bumps (`0.3 → 0.4`). Algorithm correctness is
 covered by ~330 tests across the workspace, including end-to-end
 synth → decode roundtrips for every protocol, an AWGN sensitivity
 sweep that confirms Q65-30A hits its WSJT-X-published −24 dB

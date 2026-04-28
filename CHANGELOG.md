@@ -1,5 +1,87 @@
 # Changelog
 
+## 0.3.0 — 2026-04-29
+
+Internal cleanup release that closes long-standing abstraction
+leaks in the FEC / message / pipeline layers, opens the door for
+non-Wsjt77 message codecs, and lifts `coarse_sync` to handle
+multi-frame chained signals at the same audio centre.
+
+The 0.3.0-cycle uvpacket protocol prototype was developed and
+abandoned within this cycle (an honest airtime comparison vs.
+AFSK 1200 / AX.25 invalidated the original "drop-in" pitch); the
+redesign for 0.3.1 is captured in `docs/0.3.1_PLAN.md`.
+
+### Added
+
+- `fec::ldpc::params::LdpcParams` sealed trait + generic
+  `bp_decode_generic<P>` / `osd_decode_generic<P>` /
+  `ldpc_encode_generic<P>`. Both `Ldpc174_91` and `Ldpc240_101`
+  collapse onto the same algorithm code; ~600 lines of duplicate
+  BP / OSD in `fec/ldpc240_101/{bp,osd}.rs` deleted.
+- `MessageCodec::verify_info(&[u8]) -> bool` — message-level
+  integrity verification hook. `Wsjt77Message` overrides to
+  delegate to `check_crc14` / `check_crc24` (length-dispatched
+  between K=91 and K=101). Future codecs with bespoke or no
+  integrity field can opt out by overriding the default
+  unconditional accept.
+- `WsjtApCompatible` sealed marker trait on the AP module —
+  `process_candidate_ap` / `decode_sniper_ap` / `ap_bits_for` only
+  accept message codecs whose 77-bit field matches the Wsjt77
+  layout. Codecs with different layouts (e.g. byte-oriented
+  packet codecs) fail to compile against the AP path, surfacing
+  the constraint at the type level instead of as a runtime panic.
+- `PacketBytesMessage` byte-payload `MessageCodec` worked example
+  (4-bit length + 80-bit payload + 7-bit CRC-7 in 91 info bits —
+  the K of `Ldpc174_91`). Demonstrates that the trait
+  accommodates byte-oriented protocols alongside the WSJT-77
+  callsign-packing flavour. Gated on the new `packet-bytes`
+  Cargo feature; not used by any wired protocol in 0.3.0.
+
+### Changed
+
+- `core::sync::coarse_sync` now emits multiple Costas peaks per
+  frequency bin via greedy non-maximum suppression with ±MLAG
+  spacing (cap 8 / bin). Strict superset of the previous
+  one-or-two-peaks-per-bin behaviour: slot-based protocols
+  (FT8/FT4/WSPR/JT9/JT65/Q65) keep byte-identical output because
+  the second-best lag falls below `sync_min` after the
+  noise-floor normalisation. Chained-frame protocols (multiple
+  frames at the same audio centre, separated only in time) gain
+  multi-frame discovery in a single pipeline pass.
+- `pipeline::encode_tones_for_snr` drops its local `crc14` /
+  `crc24` reconstruction and feeds `FecResult.info` straight back
+  into `fec.encode`. The verifier-acceptance invariant guarantees
+  this is bit-identical to the previous "extract msg77, recompute
+  CRC, encode" path. Same simplification in
+  `pipeline_ap::finalise_result`.
+- `DecodeResult.message77: [u8; 77]` becomes `info: Box<[u8]>`
+  carrying the FEC's full K information bits. The legacy 77-bit
+  field survives as `DecodeResult::message77()` accessor for
+  Wsjt77-family ergonomics that mfsk-ffi and the FT4 / FST4
+  doctests rely on.
+- `Q65Codec::decode` becomes CRC-agnostic: the trailing CRC-12
+  check moves up to `Q65Message::verify_info`, mirroring the
+  same shape as the LDPC families. `Q65DecodeError::CrcMismatch`
+  is retained as a type but no longer produced internally.
+
+### Removed
+
+- The 0.3.0-cycle uvpacket protocol prototype (UvPacket150 / 300 /
+  600 / 1200, the `mfsk-core/src/uvpacket/` module, the
+  `docs/UVPACKET.{md,ja.md}` deep-dive, the
+  `tests/uvpacket_roundtrip.rs` integration test). The
+  redesign is in `docs/0.3.1_PLAN.md`.
+- `ProtocolId::UvPacket` enum variant (will be reintroduced in
+  0.3.1 with the new sub-mode tags).
+- The `uvpacket` Cargo feature (its byte-codec content moved to
+  the new `packet-bytes` feature).
+
+### Internal
+
+- `LIBRARY.{md,ja.md}` §11 motivating-example section reverted
+  with the rest of the prototype.
+
 ## 0.2.1 — 2026-04-26
 
 Patch release with no code changes — README hot-fix only.
