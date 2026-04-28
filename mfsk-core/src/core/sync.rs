@@ -231,27 +231,31 @@ pub fn coarse_sync<P: Protocol>(
         }
     }
 
-    // Per-frequency peak detection.
+    // Per-frequency peak detection — non-maximum suppression.
+    //
+    // The previous implementation kept one or two peaks per
+    // frequency bin (best in ±MLAG, plus best in ±jz when
+    // distinct). That works for slot-based protocols (FT8, FT4,
+    // WSPR, JT9/65, Q65) where one transmitter occupies one
+    // (freq, slot) cell. It silently drops most frames for
+    // chained-frame protocols where many frames sit at the same
+    // audio centre, separated only in time.
+    //
+    // The multi-peak NMS below is a strict superset: for slot-
+    // based protocols the second-best lag scores below sync_min
+    // after normalisation and is filtered out, recovering the
+    // previous behaviour. For chained-frame protocols every frame
+    // whose Costas peak survives MLAG-spacing NMS is emitted as
+    // its own candidate.
     const MLAG: i32 = 10;
+
+    // First compute the per-bin best score (still needed for the
+    // 40-percentile noise-floor normalisation that anchors sync_min).
     let mut red = vec![0.0f32; n_freq];
-    let mut red2 = vec![0.0f32; n_freq];
-    let mut jpeak = vec![0i32; n_freq];
-    let mut jpeak2 = vec![0i32; n_freq];
-
     for fi in 0..n_freq {
-        let (jp, rv) = (-MLAG..=MLAG)
-            .map(|lag| (lag, sync2d[idx(fi, lag)]))
-            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
-            .unwrap_or((0, 0.0));
-        jpeak[fi] = jp;
-        red[fi] = rv;
-
-        let (jp2, rv2) = (-d.jz..=d.jz)
-            .map(|lag| (lag, sync2d[idx(fi, lag)]))
-            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
-            .unwrap_or((0, 0.0));
-        jpeak2[fi] = jp2;
-        red2[fi] = rv2;
+        red[fi] = (-d.jz..=d.jz)
+            .map(|lag| sync2d[idx(fi, lag)])
+            .fold(0.0f32, f32::max);
     }
 
     let pct = |xs: &[f32]| {
@@ -261,39 +265,52 @@ pub fn coarse_sync<P: Protocol>(
         sorted[pct_idx.min(n_freq - 1)].max(f32::EPSILON)
     };
     let base = pct(&red);
-    let base2 = pct(&red2);
-    for r in red.iter_mut() {
-        *r /= base;
-    }
-    for r in red2.iter_mut() {
-        *r /= base2;
-    }
 
     let mut cands: Vec<SyncCandidate> = Vec::new();
-    let mut order: Vec<usize> = (0..n_freq).collect();
-    order.sort_by(|&a, &b| red[b].partial_cmp(&red[a]).unwrap());
-
-    for fi in order {
-        if cands.len() >= max_cand * 2 {
-            break;
-        }
+    for fi in 0..n_freq {
         let i = ia + fi;
-        if red[fi] >= sync_min && !red[fi].is_nan() {
+        let freq_hz = i as f32 * d.df;
+
+        // Collect every (lag, normalised_score) pair above the
+        // threshold within the full ±jz lag range.
+        let mut peaks: Vec<(i32, f32)> = (-d.jz..=d.jz)
+            .filter_map(|lag| {
+                let raw = sync2d[idx(fi, lag)];
+                let norm = raw / base;
+                if norm.is_finite() && norm >= sync_min {
+                    Some((lag, norm))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        peaks.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+        // Greedy NMS: each pick suppresses every neighbour within
+        // ±MLAG. Two genuine frames at the same audio centre are
+        // separated by ≥ frame airtime in lag steps, far more than
+        // MLAG, so they survive as distinct candidates.
+        let mut picked: Vec<i32> = Vec::new();
+        'outer: for (lag, score) in peaks {
+            for &pl in &picked {
+                if (lag - pl).abs() <= MLAG {
+                    continue 'outer;
+                }
+            }
+            picked.push(lag);
             cands.push(SyncCandidate {
-                freq_hz: i as f32 * d.df,
-                dt_sec: (jpeak[fi] as f32 - 0.5) * d.tstep,
-                score: red[fi],
+                freq_hz,
+                dt_sec: (lag as f32 - 0.5) * d.tstep,
+                score,
             });
+            // Cap per-bin candidates so a noisy bin can't crowd out
+            // the rest of the spectrum.
+            if picked.len() >= 8 {
+                break;
+            }
         }
-        if jpeak2[fi] != jpeak[fi] && red2[fi] >= sync_min && !red2[fi].is_nan() {
-            cands.push(SyncCandidate {
-                freq_hz: i as f32 * d.df,
-                dt_sec: (jpeak2[fi] as f32 - 0.5) * d.tstep,
-                score: red2[fi],
-            });
-        }
-        let _ = pattern_len; // silence unused
     }
+    let _ = pattern_len; // currently unused; kept for future scoring weights
 
     // De-duplicate: within 4 Hz and 40 ms, keep highest score.
     for i in 1..cands.len() {
