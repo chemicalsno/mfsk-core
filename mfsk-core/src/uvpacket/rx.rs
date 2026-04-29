@@ -1510,23 +1510,37 @@ fn decode_multichannel_inner(
     }
 
     // 3. Per-peak decode. The coarse grid leaves ≤ 12.5 Hz
-    //    residual at the picked centre; the LMS phase fit inside
-    //    `decode_known_layout_with_opts` absorbs that, so we use
-    //    the non-AFC entry point.
+    //    residual at the picked centre; an additional 1-shot AFC at
+    //    each accepted peak narrows the residual to sub-Hz before the
+    //    layout sweep runs. Mirrors the FM `decode_inner` AFC step —
+    //    same `diag_estimate_freq_offset` primitive, same window.
+    let afc_opts = AfcOpts::default();
     let mut frames: Vec<(f32, DecodedFrame)> = Vec::new();
     for (cf, mf_off, _) in kept {
         let Some(audio_off) = mf_off.checked_sub(SYM_PEAK_OFFSET) else {
             continue;
+        };
+        let afc_window = (PREAMBLE_LEN - 1) * NSPS + 1 + RRC_LEN;
+        let corrected_cf = if audio_off + afc_window <= audio.len() {
+            cf + diag_estimate_freq_offset(audio, audio_off, cf, afc_window, &afc_opts)
+                .unwrap_or(0.0)
+        } else {
+            cf
         };
         for &(mode, n_blocks) in layouts {
             let needed = needed_samples_for(mode, n_blocks);
             if audio_off + needed > audio.len() {
                 continue;
             }
-            if let Ok(frame) =
-                decode_known_layout_with_opts(audio, audio_off, cf, mode, n_blocks, fec_opts)
-            {
-                frames.push((cf, frame));
+            if let Ok(frame) = decode_known_layout_with_opts(
+                audio,
+                audio_off,
+                corrected_cf,
+                mode,
+                n_blocks,
+                fec_opts,
+            ) {
+                frames.push((corrected_cf, frame));
                 break;
             }
         }
