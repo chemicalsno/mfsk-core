@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.3.4 — 2026-04-29
+
+uvpacket RX: hard sync-rejection on the auto-detect path, fixing a
+runaway-CPU bug discovered by uvpacket-web (https://jl1nie.github.io/webft8/uvpacket/)
+under steady-state listening on noise-only audio.
+
+### Fixed
+
+- `uvpacket::rx::decode` and `uvpacket::rx::decode_multichannel` now
+  short-circuit when the global preamble-correlation peak is not a
+  clear outlier from the score-distribution median (≥ `20×` median).
+
+  On pure χ²(2)-distributed noise the natural `max/median` ratio
+  saturates around `ln(N)/ln(2) ≈ 17` (extreme-value statistics over
+  `N ≈ 80 k` correlation offsets in a 7 s buffer); on real signal at
+  +1 dB Eb/N0_info — Robust mode's 50 %-PER threshold — the ratio
+  is `≈ 56`. The 20× gate cleanly separates them with a 4.5 dB
+  signal-side margin (rejection at `−3.5 dB SNR`, well below any
+  rate's actual decoding threshold).
+
+  Without the gate, the 50 % relative-peak threshold left ~290 false
+  NMS-survived peaks per 7 s noise buffer, each running a
+  `4 modes × 32 n_blocks` LDPC BP+OSD-2 sweep — empirically 30–180 s
+  of release-mode work per call. With the gate, a noise buffer
+  short-circuits in `~330 µs` (≈ 7 000× speedup; new test
+  `tests/uvpacket_noise_floor.rs`).
+
+  No behaviour change for real signals — all 271 existing uvpacket
+  tests still pass byte-identically.
+
 ## 0.3.3 — 2026-04-29
 
 Multi-channel SSB receive + slotted-ALOHA TX primitives for

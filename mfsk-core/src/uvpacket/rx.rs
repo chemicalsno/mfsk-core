@@ -1017,6 +1017,28 @@ fn interp_phase(anchor_idx: &[usize], anchor_phase: &[f32], sym_idx: usize) -> f
 /// moderate-SNR conditions; Phase 2 will revisit.
 const PREAMBLE_PEAK_REL_THRESHOLD: f32 = 0.5;
 
+/// Hard sync-rejection threshold: the global preamble-correlation peak
+/// must be at least this multiple of the score-distribution median to
+/// be considered a real preamble.
+///
+/// On pure Gaussian noise the score distribution is χ²(2)-like
+/// (preamble correlation = sum of 31 ± noise samples) and `max/median`
+/// follows extreme-value statistics — `≤ ln(N)/ln(2) ≈ 17` for the
+/// `N ≈ 80 k` offsets in a 7 s buffer, with comfortable variance.
+///
+/// On real signal at +1 dB Eb/N0_info — mfsk-core's lowest 50%-PER
+/// decoding threshold (Robust mode, AWGN) — the ratio is ≈ 56. Setting
+/// the gate at 20 rejects pure noise reliably without rejecting any
+/// signal the FEC could plausibly recover (the signal floor for the
+/// gate is `−3.5 dB`, 4.5 dB below the FEC's own decoding threshold).
+///
+/// The point of this gate is **not** to discriminate signal/noise as
+/// the decoder eventually does — it's to prevent the
+/// `(picked_peaks × 4 modes × 32 n_blocks)` LDPC BP+OSD-2 sweep from
+/// running on noise-only buffers, which can take 30+ s in release for
+/// a 7 s window.
+const SYNC_PEAK_REL_TO_MEDIAN: f32 = 20.0;
+
 /// Auto-detecting receiver: scan audio for preamble correlations,
 /// attempt [`decode_known_layout`] across the (mode × n_blocks) grid
 /// for each candidate head, return the successful frames.
@@ -1038,6 +1060,10 @@ pub fn decode(audio: &[f32], audio_centre_hz: f32) -> Vec<DecodedFrame> {
     }
     let global_max = scores.iter().cloned().fold(0.0f32, f32::max);
     if global_max <= 0.0 {
+        return Vec::new();
+    }
+    // Sync gate — see SYNC_PEAK_REL_TO_MEDIAN.
+    if !global_max_is_sync_outlier(&scores, global_max) {
         return Vec::new();
     }
     let threshold = global_max * PREAMBLE_PEAK_REL_THRESHOLD;
@@ -1096,6 +1122,29 @@ pub fn decode(audio: &[f32], audio_centre_hz: f32) -> Vec<DecodedFrame> {
     }
 
     frames
+}
+
+/// Returns `true` iff `global_max` is plausibly a real preamble peak
+/// — i.e. far enough above the score-distribution median that it can't
+/// be the natural extreme value of pure noise.
+///
+/// Uses `select_nth_unstable` for O(N) median (no full sort).
+fn global_max_is_sync_outlier(scores: &[f32], global_max: f32) -> bool {
+    if scores.is_empty() {
+        return false;
+    }
+    let mid = scores.len() / 2;
+    let mut buf: Vec<f32> = scores.to_vec();
+    buf.select_nth_unstable_by(mid, |a, b| a.partial_cmp(b).unwrap());
+    let median = buf[mid];
+    if median <= 0.0 {
+        // Median 0 means the buffer is mostly silent — only accept the
+        // peak if it's at least nominally non-zero. This branch is
+        // mostly defensive; downconvert + matched filter on real audio
+        // produces strictly positive |·|².
+        return global_max > 0.0;
+    }
+    global_max >= SYNC_PEAK_REL_TO_MEDIAN * median
 }
 
 /// Compute the audio sample count required for a given (mode,
@@ -1204,7 +1253,7 @@ pub fn decode_multichannel(
                     local_max = m2;
                 }
             }
-            if local_max > 0.0 {
+            if local_max > 0.0 && global_max_is_sync_outlier(&scores, local_max) {
                 let local_thr = local_max * mc_opts.peak_rel_threshold;
                 // Time-axis local maxima within this frequency.
                 let mut local_peaks: Vec<(usize, f32)> = scores
