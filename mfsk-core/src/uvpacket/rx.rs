@@ -1394,6 +1394,29 @@ pub fn decode_multichannel(
     mc_opts: &MultiChannelOpts,
     fec_opts: &FecOpts,
 ) -> Vec<(f32, DecodedFrame)> {
+    let full = full_layout_grid();
+    decode_multichannel_inner(audio, mc_opts, fec_opts, &full)
+}
+
+/// Same as [`decode_multichannel`] but bounds the per-peak LDPC
+/// sweep to a caller-supplied layout list, matching
+/// [`decode_with_layouts`] for the FM path. See that function's
+/// docs for the rationale.
+pub fn decode_multichannel_with_layouts(
+    audio: &[f32],
+    mc_opts: &MultiChannelOpts,
+    fec_opts: &FecOpts,
+    layouts: &[(Mode, u8)],
+) -> Vec<(f32, DecodedFrame)> {
+    decode_multichannel_inner(audio, mc_opts, fec_opts, layouts)
+}
+
+fn decode_multichannel_inner(
+    audio: &[f32],
+    mc_opts: &MultiChannelOpts,
+    fec_opts: &FecOpts,
+    layouts: &[(Mode, u8)],
+) -> Vec<(f32, DecodedFrame)> {
     if audio.len() < PREAMBLE_LEN * NSPS + RRC_LEN {
         return Vec::new();
     }
@@ -1405,13 +1428,19 @@ pub fn decode_multichannel(
         let mf_out = downconvert_and_matched_filter(audio, f);
         let max_off = mf_out.len().saturating_sub((PREAMBLE_LEN - 1) * NSPS + 1);
         if max_off > 0 {
+            // Coherence ratio per offset, same as the FM `decode` path —
+            // bounded above by `PREAMBLE_LEN = 31`, saturates only on a
+            // real BPSK preamble. Replaces `|acc|²`, which let single
+            // mic-impulse spikes give `max/median = 2200+` per coarse-
+            // grid step and bypass the sync gate, exactly the runaway
+            // class the FM path was hardened against.
             let mut local_max: f32 = 0.0;
             let mut scores: Vec<f32> = Vec::with_capacity(max_off);
             for offset in 0..max_off {
-                let m2 = preamble_correlation(&mf_out, offset).norm_sqr();
-                scores.push(m2);
-                if m2 > local_max {
-                    local_max = m2;
+                let s = preamble_coherence_score(&mf_out, offset);
+                scores.push(s);
+                if s > local_max {
+                    local_max = s;
                 }
             }
             if local_max > 0.0 && global_max_is_sync_outlier(&scores, local_max) {
@@ -1464,18 +1493,16 @@ pub fn decode_multichannel(
         let Some(audio_off) = mf_off.checked_sub(SYM_PEAK_OFFSET) else {
             continue;
         };
-        'modes: for mode in [Mode::Robust, Mode::Standard, Mode::Fast, Mode::Express] {
-            for n_blocks in (1u8..=32).rev() {
-                let needed = needed_samples_for(mode, n_blocks);
-                if audio_off + needed > audio.len() {
-                    continue;
-                }
-                if let Ok(frame) =
-                    decode_known_layout_with_opts(audio, audio_off, cf, mode, n_blocks, fec_opts)
-                {
-                    frames.push((cf, frame));
-                    break 'modes;
-                }
+        for &(mode, n_blocks) in layouts {
+            let needed = needed_samples_for(mode, n_blocks);
+            if audio_off + needed > audio.len() {
+                continue;
+            }
+            if let Ok(frame) =
+                decode_known_layout_with_opts(audio, audio_off, cf, mode, n_blocks, fec_opts)
+            {
+                frames.push((cf, frame));
+                break;
             }
         }
     }
