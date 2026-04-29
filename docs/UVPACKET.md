@@ -2,44 +2,132 @@
 
 > **日本語版:** [UVPACKET.ja.md](UVPACKET.ja.md)
 
-`uvpacket` is an in-tree applied example of how `mfsk-core`'s FEC
-infrastructure (`Ldpc240_101`, belief propagation, OSD-2/3) can be
-reused outside the WSJT-X family. It is **not** a member of that
-family. It targets a different design point — narrow-FM voice
-channels (HT/mobile, ~3 kHz audio passband) intended for private-
-group amateur-radio messaging (signed QSL exchange, short text,
-position reports).
+`uvpacket` is an in-tree **applied example** of how `mfsk-core`'s
+FEC infrastructure (`Ldpc240_101`, belief propagation, OSD-2/3)
+can be reused outside the WSJT-X family. It targets NFM voice
+channels (HT/mobile, ~3 kHz audio passband) and — with the
+0.3.2 AFC — SSB carriers as well.
 
-This document covers the design choices, the characterisation
-results, and the known modem implementation loss. For the API
-surface see the in-source rustdoc.
+This document covers the modem itself. Application semantics
+(signed QSL exchange, position beacons, short text) are
+**not** part of `mfsk-core`; see §1.4 for the intended layering.
 
 ## 1. Scope
 
-### 1.1 What this is
+### 1.1 What this is — a modem, layered alongside the WSJT family
 
-A **four-mode packet modem** that fits inside an NFM voice
-passband, layered on a hand-tuned irregular LDPC mother code from
-FST4. Designed for **private groups** running the same software on
-both ends — not a public protocol replacement, not interoperable
-with anything else.
+`mfsk-core`'s primary scope is the WSJT-X family of digital
+modes (FT8/FT4/FST4/WSPR/JT9/JT65/Q65). uvpacket is **not** a
+member of that family — it has its own modulation, sync, demod,
+and message conventions, and it bypasses the generic mfsk-core
+TX/RX pipeline. It lives in-tree because it reuses the FEC
+layer (`Ldpc240_101` from FST4 + the BP/OSD machinery), and
+spinning it out as a sibling crate would add maintenance cost
+disproportionate to the deliverable.
+
+The trade-off: the `Protocol::ID = ProtocolId::UvPacket` and
+several `ModulationParams` constants (`NTONES = 4`, `GFSK_BT`,
+`TONE_SPACING_HZ`, `GFSK_HMOD`) are decorative for uvpacket —
+they exist only to satisfy the trait signature and the
+`protocol_invariants` test, and are never consulted by
+[`tx::encode`] or `rx::decode_*`. This is documented at
+[`mfsk-core/src/uvpacket/protocol.rs`](../mfsk-core/src/uvpacket/protocol.rs)
+and [`docs/LIBRARY.md`](LIBRARY.md) §10.1 as a scope-boundary
+trade-off rather than disguised.
+
+The crate ships **only the modem**: `tx::encode(header, payload,
+audio_centre_hz) -> Vec<f32>` and `rx::decode_known_layout` /
+`decode_known_layout_with_opts` / `decode_known_layout_with_afc`.
+Frame composition, application-level dispatch, key management
+etc. are the embedder's job.
 
 ### 1.2 What this is not
 
-- Not an interoperable mode. No standardisation, no TNC support.
+- Not a peer WSJT mode. The layering above is not coincidence —
+  WSJT modes share callsign-message conventions, slot-aligned
+  framing, structured message codecs; uvpacket shares none of
+  that.
+- Not an interoperable packet mode. No standardisation, no TNC
+  support — designed for private groups running the same
+  software on both ends.
 - Not a voice mode. Data only.
-- Not a wideband mode. Fits in NFM voice (~3 kHz), nominal 1–1.8
-  kbps net throughput. Different design point from M17 / D-STAR /
+- Not a wideband mode. Fits in a 3 kHz audio passband, nominal
+  1008–1800 net bps. Different design point from M17 / D-STAR /
   DMR / VARA FM.
-- Not a weak-signal mode. Aimed at the operating envelope above the
-  FM threshold (CNR ≥ +9–10 dB), which is the channel's own
-  irreducible floor for any FM-detected mode.
+- Not a signed-QSL implementation. See §1.4.
 
 ### 1.3 Where it sits
 
-uvpacket fills an open-source niche: an LDPC-coded data-only NFM
-modem with a coherent QPSK physical layer, sub-second burst
-duration, and graceful rate ladder for opportunistic throughput.
+A factual peer comparison for U/VHF private-group messaging at
+~1 kbps in a 3 kHz audio passband:
+
+| | Channel | FEC | Net bps | 50 % PER threshold | Open source |
+|---|---|---|---:|---:|:-:|
+| AX.25 / AFSK 1200 | NFM | none | 1200 | +10 dB SNR_3kHz | ✓ |
+| PSK31 | SSB | none | ~50 | −10 dB SNR_2.5kHz | ✓ |
+| Olivia 4/250 | SSB | conv + interleave | ~50 | −13 dB SNR_500Hz | ✓ |
+| **uvpacket Robust** | **NFM or SSB** | **LDPC + OSD** | **1008** | **−3.7 dB SNR_3kHz** | ✓ |
+| uvpacket Express | NFM or SSB | LDPC + OSD | 1800 | ~ −1 dB SNR_3kHz | ✓ |
+| M17 4-FSK | 9 kHz | conv | 4800 | +5–7 dB SNR | ✓ |
+| VARA FM | 12.5 kHz | proprietary | ~25000 | +10 dB SNR | ✗ |
+| VARA HF | 2.4 kHz SSB | proprietary | 5000–25000 | varies | ✗ |
+| D-STAR DV | 6.25 kHz | Golay | 4800 voice + 1200 data | ~+10 dB CNR | partial |
+| DMR / NXDN | 6.25–12.5 kHz | BCH | 4-FSK voice + data | ~+7–8 dB CNR | (commercial) |
+
+The closest peers in design space (open-source, FEC-coded,
+audio-passband data on NFM/SSB) are AX.25 and PSK31; everything
+to the right of the bold rows is in a different design space
+(wider channels, voice-primary, or proprietary).
+
+Versus AX.25 in NFM: 16 % less raw throughput, ~14 dB better
+SNR threshold, real FEC and block-interleaver against fade
+bursts. Versus PSK31 in SSB: 20 × more throughput at ~6 dB
+worse threshold — different niche of the same passband.
+
+uvpacket does not compete with VARA / M17 / D-STAR-class
+protocols on speed; those use wider channels and / or carry
+voice as well. It does not compete with FT8 / JS8 / Olivia on
+extreme weak signals; those run at orders-of-magnitude lower
+throughput.
+
+The deliverable: an open-source, FEC-coded, modern packet modem
+that fits the **3 kHz NFM / SSB voice passband** and works
+across both, at sub-second burst duration with a four-step
+opportunistic-throughput rate ladder.
+
+### 1.4 Application architecture — modem here, apps elsewhere
+
+The flagship application uvpacket was conceived for is **signed
+QSL exchange between private groups**. The intended layering:
+
+```text
+┌─────────────────────────────────────────┐
+│  Application (signed QSL, position,     │  app-layer repo,
+│  short text, ARQ-ACK …)                 │  separate from
+│  e.g. browser-WASM PWA via wasm-bindgen │  mfsk-core
+├─────────────────────────────────────────┤
+│  mfsk-core::uvpacket  (this crate)      │  modem only:
+│  — tx::encode / rx::decode_*            │  bytes ↔ audio
+│                                         │  with FEC
+└─────────────────────────────────────────┘
+              ↕  (audio over the air, via the radio)
+```
+
+The modem deliberately exposes a **byte-pipe API** with a 4-bit
+`app_type` dispatch tag. Callers pick a meaning per `app_type`;
+the modem is opaque to it. The suggested allocation in §2.5 is
+a convention, not a contract.
+
+For the signed-QSL flagship, the planned application crate is a
+**browser-WASM PWA** (sibling repo, distinct from `mfsk-core`):
+Web Audio for I/O, Web Crypto for signing, IndexedDB / OPFS for
+key + log storage, `mfsk-core` linked via `wasm-bindgen` (with
+`--features uvpacket`). Keeping the signed-QSL surface out of
+this crate avoids coupling the modem's release cadence to UX
+iteration and keeps the published artefact small.
+
+Native (non-browser) embedders use the same byte-pipe API — the
+application layer is whatever protocol you bolt on top.
 
 ## 2. Design
 
@@ -229,7 +317,7 @@ kind decodes.
 The FM threshold is the binding constraint for NFM voice
 channels.
 
-### 3.5 SSB compatibility
+### 3.5 SSB compatibility — and AFC
 
 The modem is an audio-domain QPSK + RRC processor (signal
 occupies ~1200–1800 Hz around the 1500 Hz centre, well inside a
@@ -237,17 +325,67 @@ typical SSB passband). On SSB the FM-threshold floor goes away
 and the modem operates at its true ~−3.7 dB SNR_3kHz Robust
 threshold — a useful weak-signal data envelope, especially on HF.
 
-What's missing for production SSB use is **automatic frequency
-control (AFC)**: the current rx assumes `audio_centre_hz` is known
-exactly, while real SSB receivers see a ±50–100 Hz centre offset
-from VFO-dial mismatches between TX and RX. Adding AFC is a
-~50–100-line change (frequency-search the preamble correlator over
-a configurable window, then track the offset through the LMS
-phase fit) — planned for a follow-up cycle, not 0.3.1.
+**AFC ships in 0.3.2.** Use
+[`decode_known_layout_with_afc(audio, .., &AfcOpts)`](https://docs.rs/mfsk-core/latest/mfsk_core/uvpacket/rx/fn.decode_known_layout_with_afc.html)
+for SSB use; the default `decode_known_layout` continues to
+assume `audio_centre_hz` is exact (right for NFM where TX/RX
+share the same audio centre).
 
-Until AFC lands, SSB usage requires both ends to dial in the same
-frequency to within ~10 Hz. With a digital VFO and CAT control
-that's straightforward; with a manual dial it's not.
+The AFC algorithm sweeps `audio_centre_hz + Δf_test` in 25 Hz
+steps across `[−search_hz, +search_hz]` (default ±200 Hz),
+runs the matched filter at each candidate, and picks the Δf
+where the preamble-correlation magnitude peaks. Parabolic
+refinement of the 3-point coarse-grid magnitudes drives the
+final Δf to within a fraction of the grid spacing. Cost is
+~17× single-decode cost (~50–100 ms in release mode); the
+existing LMS phase fit downstream absorbs the sub-grid
+residual without trouble.
+
+The naive FFT-over-chip-rate-samples approach (cheap but wrong)
+fails because the integer-sample preamble correlator that picks
+`best_off` itself rolls off as `sinc(δ · 31 / 1200)`, landing on
+noise samples for `|δ| ≳ 20 Hz`. The frequency-grid search
+sidesteps this — the correlator magnitude itself peaks at the
+correct Δf.
+
+NFM users can keep using `decode_known_layout` (AFC is pure
+overhead on a static-VFO channel).
+
+### 3.6 Multi-channel SSB headroom (0.3.3 candidate)
+
+A single uvpacket signal occupies `R_s · (1+α) = 1200 · 1.5 =
+1800 Hz` end-to-end (RRC roll-off included; the −3 dB main
+lobe is ~600 Hz). Practical adjacent-channel separation for
+< −20 dB inter-channel interference is ~1.2 kHz: at that
+spacing one signal's spectrum lands within the next signal's
+roll-off zero.
+
+In a 2.4 kHz SSB passband that's room for **two** simultaneous
+uvpacket frames at different audio centres (e.g., 800 Hz and
+2000 Hz). In a 2.7–3 kHz SSB passband, two with margin.
+
+The 0.3.2 AFC `decode_known_layout_with_afc` is the building
+block: it's exactly a frequency-axis preamble-correlation peak
+search, just narrowed to one peak in the configured ±search_hz
+window. Extending it to **return all local peaks** above a
+threshold across an arbitrary search window is the natural
+0.3.3 deliverable (`decode_multichannel(audio, band_lo_hz,
+band_hi_hz, &afc_opts, &fec_opts) -> Vec<DecodedFrame>`):
+
+- RX side: iterate the AFC's frequency-grid magnitudes across
+  the full SSB passband, pick local maxima ≥ a confidence
+  threshold, dispatch each to `decode_known_layout_with_afc`
+  at its detected centre.
+- TX side: an LBT (listen-before-talk) primitive — scan the
+  passband, find the lowest-energy 1.2 kHz slot, transmit there.
+  Equivalent to **CSMA/CA** in the audio-frequency dimension
+  rather than the usual time dimension. Multi-station private-
+  group messaging on a single SSB channel.
+
+CSMA/CD proper isn't applicable to half-duplex SSB radio
+(can't reliably listen while transmitting), but CSMA/CA with
+short uvpacket bursts (~270 ms Express, ~440 ms Robust)
+collides rarely if stations re-scan between TX attempts.
 
 ## 4. Modem implementation loss
 

@@ -146,6 +146,198 @@ pub fn decode_known_layout(
     )
 }
 
+/// AFC (automatic frequency control) options for SSB use.
+///
+/// On NFM the TX/RX share the same audio centre exactly so AFC
+/// is unnecessary. On SSB, VFO-dial mismatches shift the audio
+/// centre by ±50–100 Hz typically. AFC searches for the offset
+/// via FFT-based preamble-magnitude maximisation, then re-runs
+/// the demod at the corrected centre frequency.
+#[derive(Clone, Copy, Debug)]
+pub struct AfcOpts {
+    /// One-sided search range in Hz (so the total search window
+    /// is `±search_hz`). 200 Hz covers typical SSB VFO mismatch
+    /// worst-case without a meaningful CPU cost.
+    pub search_hz: f32,
+}
+
+impl Default for AfcOpts {
+    fn default() -> Self {
+        Self { search_hz: 200.0 }
+    }
+}
+
+/// Decode a uvpacket frame at a known location, with AFC and
+/// caller-supplied LDPC options.
+///
+/// 1. Sweep `Δf_test` in 25 Hz steps across `[−search_hz,
+///    +search_hz]`. At each step, down-convert + matched-filter
+///    at `audio_centre_hz + Δf_test` and take the best
+///    preamble-correlation magnitude over the ±NSPS jitter
+///    window.
+/// 2. Pick the coarse-grid winner and parabolic-fit the three
+///    adjacent magnitudes for sub-grid resolution.
+/// 3. Re-run [`decode_known_layout_with_opts`] at
+///    `audio_centre_hz + Δf`.
+///
+/// Returns the decoded frame on success; otherwise the same
+/// `DecodeError` variants as `decode_known_layout_with_opts`. If
+/// AFC mis-estimates Δf (preamble below threshold), the FEC stage
+/// will surface as `FecFailed` / `Crc` / `LayoutMismatch` rather
+/// than a wrong-frame.
+pub fn decode_known_layout_with_afc(
+    audio: &[f32],
+    sample_offset: usize,
+    audio_centre_hz: f32,
+    mode: Mode,
+    n_blocks: u8,
+    fec_opts: &FecOpts,
+    afc_opts: &AfcOpts,
+) -> Result<DecodedFrame, DecodeError> {
+    let n_blocks_u = n_blocks as usize;
+    let block_ch_bits = mode.ch_bits_per_block();
+    debug_assert!(block_ch_bits.is_multiple_of(2));
+    let n_data_syms = n_blocks_u * block_ch_bits / 2;
+    let n_pilots = n_data_syms.div_ceil(PILOT_SYMBOL_INTERVAL - 1);
+    let total_syms = PREAMBLE_LEN + n_pilots + n_data_syms;
+    let needed_samples = total_syms * NSPS + RRC_LEN;
+
+    if sample_offset + needed_samples > audio.len() {
+        return Err(DecodeError::Truncated);
+    }
+
+    // Frequency-grid AFC: find Δf at which the matched-filter
+    // preamble correlator peaks. Refine the 25-Hz coarse winner
+    // by parabolic fit on its three neighbours.
+    let delta_hz = estimate_freq_offset(
+        audio,
+        sample_offset,
+        needed_samples,
+        audio_centre_hz,
+        afc_opts,
+    );
+
+    // Re-run the full decoder at the corrected centre frequency.
+    decode_known_layout_with_opts(
+        audio,
+        sample_offset,
+        audio_centre_hz + delta_hz,
+        mode,
+        n_blocks,
+        fec_opts,
+    )
+}
+
+/// Best-preamble-correlation magnitude squared at any of the
+/// integer-sample offsets within the standard ±NSPS jitter window.
+/// Used by the AFC frequency-grid search.
+fn best_preamble_mag2_around_anchor(mf_out: &[Complex32]) -> f32 {
+    let radius = NSPS as isize;
+    let base = SYM_PEAK_OFFSET as isize;
+    let mut best = -1.0_f32;
+    for jitter in -radius..=radius {
+        let off = base + jitter;
+        if off < 0 {
+            continue;
+        }
+        let off = off as usize;
+        if off + (PREAMBLE_LEN - 1) * NSPS >= mf_out.len() {
+            continue;
+        }
+        let m2 = preamble_correlation(mf_out, off).norm_sqr();
+        if m2 > best {
+            best = m2;
+        }
+    }
+    best
+}
+
+/// Carrier-frequency-offset search by **frequency-grid preamble
+/// correlation**: try each candidate `audio_centre_hz + Δf_test` in
+/// a coarse grid, run the matched filter and integer-sample
+/// preamble correlator, pick the Δf that gives the strongest
+/// preamble peak. Refines the winner by fitting a parabola to the
+/// magnitude over the three adjacent coarse-grid points.
+///
+/// Why this and not an FFT over the chip-rate samples: at a
+/// non-zero frequency offset, the integer-sample preamble
+/// correlator already has a sinc roll-off (`sinc(δ · 31 / 1200)`),
+/// so `best_off` is found at a noise sample for `|δ| ≳ 20 Hz`
+/// (sinc dives below 0.5). An FFT downstream of that wrong
+/// `best_off` operates on garbage. The frequency-grid search
+/// instead searches for the Δf at which the **preamble correlator
+/// magnitude itself peaks** — by construction, this is the Δf
+/// that makes the chip phases align.
+fn estimate_freq_offset(
+    audio: &[f32],
+    sample_offset: usize,
+    needed_samples: usize,
+    audio_centre_hz: f32,
+    afc_opts: &AfcOpts,
+) -> f32 {
+    let coarse_step_hz: f32 = 25.0; // rolls off ~3 dB at half-step worst-case
+    let n_coarse = (afc_opts.search_hz / coarse_step_hz).ceil() as i32;
+    let slice = &audio[sample_offset..sample_offset + needed_samples];
+
+    let mut grid_mags: Vec<(i32, f32)> = Vec::with_capacity(2 * n_coarse as usize + 1);
+    for k in -n_coarse..=n_coarse {
+        let f_test = audio_centre_hz + k as f32 * coarse_step_hz;
+        let mf_out = downconvert_and_matched_filter(slice, f_test);
+        let m2 = best_preamble_mag2_around_anchor(&mf_out);
+        grid_mags.push((k, m2));
+    }
+
+    // Pick coarse winner.
+    let (best_k_idx, _) = grid_mags
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.1.partial_cmp(&b.1.1).unwrap())
+        .map(|(idx, &(_, m))| (idx, m))
+        .unwrap_or((0, 0.0));
+    let best_k = grid_mags[best_k_idx].0;
+
+    // Parabolic refinement on the three points centred on best_k.
+    let frac = if best_k_idx > 0 && best_k_idx + 1 < grid_mags.len() {
+        let m_minus = grid_mags[best_k_idx - 1].1;
+        let m_zero = grid_mags[best_k_idx].1;
+        let m_plus = grid_mags[best_k_idx + 1].1;
+        let denom = 2.0 * (m_plus - 2.0 * m_zero + m_minus);
+        if denom.abs() > 1e-9 {
+            ((m_minus - m_plus) / denom).clamp(-0.5, 0.5)
+        } else {
+            0.0
+        }
+    } else {
+        0.0
+    };
+
+    (best_k as f32 + frac) * coarse_step_hz
+}
+
+/// Public diagnostic accessor for the AFC's frequency-offset
+/// estimate. Returns the same Δf that
+/// [`decode_known_layout_with_afc`] would derive from the same
+/// audio + offset + AFC settings, without running the full decode
+/// roundtrip. Intended for tests and characterisation harnesses.
+pub fn diag_estimate_freq_offset(
+    audio: &[f32],
+    sample_offset: usize,
+    audio_centre_hz: f32,
+    needed_samples: usize,
+    afc_opts: &AfcOpts,
+) -> Option<f32> {
+    if sample_offset + needed_samples > audio.len() {
+        return None;
+    }
+    Some(estimate_freq_offset(
+        audio,
+        sample_offset,
+        needed_samples,
+        audio_centre_hz,
+        afc_opts,
+    ))
+}
+
 /// Same as [`decode_known_layout`] but with caller-supplied LDPC
 /// options. Use this to opt into deeper OSD (~30× slower per
 /// decode but ~10–15 % better PER near threshold for the higher-

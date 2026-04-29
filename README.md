@@ -124,6 +124,11 @@ Phase 2 characterisation (post LMS phase tracker): 50 % PER at
 the NFM FM-threshold floor** at the Robust threshold — the channel
 binds before the modem.
 
+**SSB use** is supported via `decode_known_layout_with_afc` (0.3.2):
+±200 Hz frequency-grid AFC sidesteps the TX/RX VFO-mismatch problem
+and lets the modem operate to its true threshold on HF/microwave
+SSB channels.
+
 See [`docs/UVPACKET.md`](https://github.com/jl1nie/mfsk-core/blob/main/docs/UVPACKET.md)
 ([日本語](https://github.com/jl1nie/mfsk-core/blob/main/docs/UVPACKET.ja.md))
 for the full design narrative, the modulation-pivot history that

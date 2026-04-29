@@ -1,6 +1,6 @@
 [package]
 name        = "mfsk-core"
-version     = "0.3.1"
+version     = "0.3.2"
 edition     = "2024"
 license     = "GPL-3.0-or-later"
 description = "Pure-Rust library for WSJT-family digital amateur-radio modes (FT8/FT4/FST4/WSPR/JT9/JT65/Q65) plus the uvpacket NFM/SSB packet protocol: protocol traits, DSP, FEC codecs, message codecs, decoders and synthesisers — unified behind a zero-cost generic abstraction."
