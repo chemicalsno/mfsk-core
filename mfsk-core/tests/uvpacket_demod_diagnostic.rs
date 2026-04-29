@@ -10,7 +10,7 @@
 
 #![cfg(feature = "uvpacket")]
 
-use mfsk_core::core::{FecCodec, FecOpts};
+use mfsk_core::core::FecOpts;
 use mfsk_core::fec::Ldpc240_101;
 use mfsk_core::uvpacket::framing::{FrameHeader, INFO_BYTES_PER_BLOCK};
 use mfsk_core::uvpacket::{AUDIO_CENTRE_HZ, Mode, rx, tx};
