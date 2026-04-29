@@ -39,103 +39,101 @@ impl Awgn {
     }
 }
 
-/// Direct probe: feed various audio scenarios to `diag_sync_stats`
-/// and print the ratio. Theoretical max/median for `N≈30k`
-/// exponentially-distributed scores is `ln(N)/ln(2) ≈ 14.9`.
+// ── Score-distribution regression guards ─────────────────────────────
+//
+// The original sync detector used `|⟨preamble, mf_out⟩|²` directly,
+// which fails Cauchy-Schwarz the moment one sample dominates the
+// 31-tap correlation (a microphone click can give max/median = 2200
+// even though only one sample contributed coherently). The current
+// detector uses the normalised coherence ratio and is bounded above
+// by `PREAMBLE_LEN = 31`. The tests below pin both ends of the gate's
+// expected operating range so any future regression of the metric
+// itself is caught immediately.
+
+const SHOULD_REJECT_RATIO: f32 = 18.0; // gate is 20×; one σ of margin
+const SHOULD_ACCEPT_RATIO: f32 = 25.0; // real preamble well above 30
+
 #[test]
-fn noise_ratio_distribution() {
+fn coherence_white_noise_rejects() {
     use mfsk_core::uvpacket::rx::diag_sync_stats;
-    let n_samples = 30_000_usize;
+    let mut rng = Awgn::new(0xa1);
+    let audio: Vec<f32> = (0..30_000).map(|_| 0.05 * rng.gaussian()).collect();
+    let s = diag_sync_stats(&audio, 1500.0);
+    assert!(
+        s.ratio < SHOULD_REJECT_RATIO,
+        "white noise must produce ratio < {} (got {:.1}) — sync detector \
+         is letting noise through and the gate band-aid is the only thing \
+         standing between you and a CPU spin",
+        SHOULD_REJECT_RATIO,
+        s.ratio,
+    );
+}
+
+#[test]
+fn coherence_single_impulse_rejects() {
+    use mfsk_core::uvpacket::rx::diag_sync_stats;
+    // The pathological case from the field: tiny background noise
+    // plus one big sample. Old `|acc|²` detector: ratio = 2 209.
+    // New normalised detector: ratio ≈ 10.
+    let mut rng = Awgn::new(0xa4);
+    let mut audio: Vec<f32> = (0..30_000).map(|_| 0.001 * rng.gaussian()).collect();
+    audio[15_000] = 0.5;
+    let s = diag_sync_stats(&audio, 1500.0);
+    assert!(
+        s.ratio < SHOULD_REJECT_RATIO,
+        "single impulse + noise must produce ratio < {} (got {:.1}) — if \
+         this regresses, somebody removed the score normalisation and the \
+         field will see false-sync runaways on every mic click",
+        SHOULD_REJECT_RATIO,
+        s.ratio,
+    );
+}
+
+#[test]
+fn coherence_pure_tone_rejects() {
+    use mfsk_core::uvpacket::rx::diag_sync_stats;
+    // Tones (in or off-centre) have flat correlation magnitude
+    // across offsets — max ≈ median, ratio ≈ 1-9.
     let two_pi = 2.0 * std::f32::consts::PI;
-
-    // 1. Pure white noise — baseline.
-    {
-        let mut rng = Awgn::new(0xa1);
-        let audio: Vec<f32> = (0..n_samples).map(|_| 0.05 * rng.gaussian()).collect();
-        let s = diag_sync_stats(&audio, 1500.0);
-        eprintln!("[white]   ratio={:.1}", s.ratio);
-    }
-
-    // 2. Noise + tone at carrier (1500 Hz) — DC after downconvert.
-    {
-        let mut rng = Awgn::new(0xa2);
-        let audio: Vec<f32> = (0..n_samples)
+    for tone_hz in [800.0_f32, 1200.0, 1500.0, 2000.0] {
+        let audio: Vec<f32> = (0..30_000)
             .map(|i| {
                 let t = i as f32 / 12_000.0;
-                0.005 * (two_pi * 1500.0 * t).sin() + 0.001 * rng.gaussian()
+                0.5 * (two_pi * tone_hz * t).sin()
             })
             .collect();
         let s = diag_sync_stats(&audio, 1500.0);
-        eprintln!("[tone @ 1500Hz] ratio={:.1}", s.ratio);
+        assert!(
+            s.ratio < SHOULD_REJECT_RATIO,
+            "pure {tone_hz} Hz tone must produce ratio < {} (got {:.1})",
+            SHOULD_REJECT_RATIO,
+            s.ratio,
+        );
     }
+}
 
-    // 3. Noise + 1200 Hz offset tone — symbol-rate alignment.
-    {
-        let mut rng = Awgn::new(0xa3);
-        let audio: Vec<f32> = (0..n_samples)
-            .map(|i| {
-                let t = i as f32 / 12_000.0;
-                0.005 * (two_pi * 1200.0 * t).sin() + 0.001 * rng.gaussian()
-            })
-            .collect();
-        let s = diag_sync_stats(&audio, 1500.0);
-        eprintln!("[tone @ 1200Hz] ratio={:.1}", s.ratio);
-    }
+#[test]
+fn coherence_real_preamble_accepts() {
+    use mfsk_core::uvpacket::framing::FrameHeader;
+    use mfsk_core::uvpacket::puncture::Mode;
+    use mfsk_core::uvpacket::rx::diag_sync_stats;
+    use mfsk_core::uvpacket::tx;
 
-    // 4. Noise + a single impulse.
-    {
-        let mut rng = Awgn::new(0xa4);
-        let mut audio: Vec<f32> = (0..n_samples).map(|_| 0.001 * rng.gaussian()).collect();
-        audio[15_000] = 0.5; // single sample click
-        let s = diag_sync_stats(&audio, 1500.0);
-        eprintln!("[noise+click]  peak={:.3} ratio={:.1}", 0.5, s.ratio);
-    }
+    let header = FrameHeader {
+        mode: Mode::Standard,
+        block_count: 4,
+        app_type: 1,
+        sequence: 0,
+    };
+    let burst = tx::encode(&header, b"hello world", 1500.0).unwrap();
 
-    // 5. Noise + 1500 Hz tone gated at 1200 Hz (AM modulation by symbol rate).
-    //    This is what would happen if the user's mic picks up some uvpacket-
-    //    like or modem-like background.
-    {
-        let mut rng = Awgn::new(0xa5);
-        let audio: Vec<f32> = (0..n_samples)
-            .map(|i| {
-                let t = i as f32 / 12_000.0;
-                let envelope = 0.5 + 0.5 * (two_pi * 1200.0 * t).sin();
-                0.005 * envelope * (two_pi * 1500.0 * t).sin() + 0.001 * rng.gaussian()
-            })
-            .collect();
-        let s = diag_sync_stats(&audio, 1500.0);
-        eprintln!("[1500Hz AM 1200Hz] ratio={:.1}", s.ratio);
-    }
-
-    // 6. Pure signal at 1500 Hz, large amplitude — sanity check
-    {
-        let audio: Vec<f32> = (0..n_samples)
-            .map(|i| {
-                let t = i as f32 / 12_000.0;
-                0.5 * (two_pi * 1500.0 * t).sin()
-            })
-            .collect();
-        let s = diag_sync_stats(&audio, 1500.0);
-        eprintln!("[strong tone 1500Hz] ratio={:.1}", s.ratio);
-    }
-
-    // 7. Real preamble at moderate SNR — sanity check the gate's
-    //    accept-side. Ratio should be near `PREAMBLE_LEN = 31`.
-    {
-        use mfsk_core::uvpacket::framing::FrameHeader;
-        use mfsk_core::uvpacket::puncture::Mode;
-        use mfsk_core::uvpacket::tx;
-        let header = FrameHeader {
-            mode: Mode::Standard,
-            block_count: 4,
-            app_type: 1,
-            sequence: 0,
-        };
-        let payload = b"hello world";
-        let burst = tx::encode(&header, payload, 1500.0).unwrap();
+    // Sanity-check across moderate SNRs that the gate's accept side
+    // doesn't get squeezed by the detector change. uvpacket-web's
+    // listening regime is +10 dB or better; bracket from clean to
+    // +5 dB AWGN.
+    for sigma in [0.001_f32, 0.005, 0.01, 0.02] {
         let mut rng = Awgn::new(0xa7);
-        let sigma = 0.03_f32; // ~+10 dB SNR
-        let mut audio: Vec<f32> = vec![0.0; n_samples];
+        let mut audio: Vec<f32> = vec![0.0; 30_000];
         for (i, &b) in burst.iter().enumerate() {
             if i + 5_000 < audio.len() {
                 audio[i + 5_000] = b;
@@ -145,8 +143,51 @@ fn noise_ratio_distribution() {
             *s += sigma * rng.gaussian();
         }
         let s = diag_sync_stats(&audio, 1500.0);
-        eprintln!("[real preamble] ratio={:.1}", s.ratio);
+        assert!(
+            s.ratio > SHOULD_ACCEPT_RATIO,
+            "real preamble at σ={sigma} must produce ratio > {} (got {:.1})",
+            SHOULD_ACCEPT_RATIO,
+            s.ratio,
+        );
     }
+}
+
+#[test]
+fn coherence_real_preamble_decodes_after_gate() {
+    // End-to-end: after the gate accepts, the LDPC sweep actually
+    // reconstructs the frame. Guards against a bad gate threshold or
+    // a metric change that forgets to keep `decode` in sync with
+    // `diag_sync_stats`.
+    use mfsk_core::uvpacket::framing::FrameHeader;
+    use mfsk_core::uvpacket::puncture::Mode;
+    use mfsk_core::uvpacket::tx;
+
+    let header = FrameHeader {
+        mode: Mode::Standard,
+        block_count: 4,
+        app_type: 1,
+        sequence: 0,
+    };
+    let payload = b"hello world";
+    let burst = tx::encode(&header, payload, 1500.0).unwrap();
+    let mut rng = Awgn::new(0xa8);
+    let mut audio: Vec<f32> = vec![0.0; 30_000];
+    for (i, &b) in burst.iter().enumerate() {
+        if i + 5_000 < audio.len() {
+            audio[i + 5_000] = b;
+        }
+    }
+    for s in audio.iter_mut() {
+        *s += 0.005 * rng.gaussian();
+    }
+
+    let frames = rx::decode(&audio, 1500.0);
+    assert_eq!(
+        frames.len(),
+        1,
+        "expected exactly one frame from clean preamble"
+    );
+    assert_eq!(&frames[0].payload[..payload.len()], payload);
 }
 
 #[test]
