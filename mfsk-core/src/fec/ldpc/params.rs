@@ -19,7 +19,7 @@
 //!
 //! Adding a fourth WSJT-family LDPC code (e.g. a new FST4 sub-mode
 //! with a different generator matrix) means: define a new
-//! `XxxParams` ZST, implement [`sealed::Sealed`] and [`LdpcParams`]
+//! `XxxParams` ZST, implement `sealed::Sealed` and [`LdpcParams`]
 //! for it inside this crate, supply the table data, and add a
 //! `pub type Xxx = LdpcCodec<XxxParams>` alias in [`super`].
 
@@ -82,7 +82,8 @@ pub trait LdpcParams: sealed::Sealed + Copy + Default + 'static {
 // ────────────────────────────────────────────────────────────────────
 
 /// Parameters for the WSJT LDPC(174, 91) code (FT8 / FT4 / FT2).
-/// Tables come from [`super::tables`] and [`super::osd::GEN_PARITY`].
+/// Tables come from [`super::tables`] and the `GEN_PARITY` constant
+/// in [`super::osd`].
 #[derive(Copy, Clone, Debug, Default)]
 pub struct Ldpc174_91Params;
 

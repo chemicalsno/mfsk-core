@@ -2,16 +2,13 @@
 //!
 //! Originally ported from WSJT-X `bpdecode174_91.f90`. Phase 0c-B
 //! generalised the algorithm so [`Ldpc174_91`](super::Ldpc174_91) and
-//! [`Ldpc240_101`](super::Ldpc240_101) share a single implementation;
-//! the matrix shape comes from `P` at compile time.
+//! [`Ldpc240_101`](crate::fec::Ldpc240_101) share a single
+//! implementation; the matrix shape comes from `P` at compile time.
 //!
 //! For backward compatibility (FT8's bespoke decode path goes through
 //! [`bp_decode`] directly), this module also exposes a non-generic
 //! [`bp_decode`] that pins `P = Ldpc174_91Params` — same behaviour as
 //! before, just routed through the generic body.
-//!
-//! [`Ldpc174_91`]: super::Ldpc174_91
-//! [`Ldpc240_101`]: super::Ldpc240_101
 
 use super::params::{Ldpc174_91Params, LdpcParams};
 use super::{LDPC_K, LDPC_N};

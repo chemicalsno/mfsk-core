@@ -83,8 +83,8 @@ impl MessageCodec for PacketBytesMessage {
     /// final 7 bits are a CRC-7 over the head 84 bits.
     const PAYLOAD_BITS: u32 = 91;
     /// CRC-7 trailing the payload — `x^7 + x^3 + 1` over bits 0..84.
-    /// The 7-bit CRC sits at info bits 84..91. See [`crc7`] /
-    /// [`Self::verify_info`].
+    /// The 7-bit CRC sits at info bits 84..91. See the private
+    /// `crc7` helper in this module / [`Self::verify_info`].
     const CRC_BITS: u32 = 7;
 
     fn pack(&self, fields: &MessageFields) -> Option<Vec<u8>> {

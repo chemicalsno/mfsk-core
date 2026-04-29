@@ -2,8 +2,8 @@
 //!
 //! Originally ported from WSJT-X `osd174_91.f90`. Phase 0c-B
 //! generalised the algorithm so [`super::Ldpc174_91`] and
-//! [`super::Ldpc240_101`] share a single implementation; the matrix
-//! shape comes from `P` at compile time. The non-generic
+//! [`Ldpc240_101`](crate::fec::Ldpc240_101) share a single
+//! implementation; the matrix shape comes from `P` at compile time. The non-generic
 //! [`osd_decode`] / [`osd_decode_deep`] / [`osd_decode_deep4`]
 //! entry points pin `P = Ldpc174_91Params` for FT8's bespoke decode
 //! path which calls them directly via `super::ft8::ldpc`'s re-export
@@ -547,7 +547,7 @@ pub fn ldpc_encode_generic<P: LdpcParams>(info: &[u8], cw: &mut [u8]) {
 /// Encode 91 information bits into a 174-bit LDPC(174,91) codeword.
 ///
 /// Systematic: `codeword[0..91] = info`, parity bits `codeword[91..174]`
-/// from [`GEN_PARITY`]. Backward-compat wrapper around
+/// from `GEN_PARITY`. Backward-compat wrapper around
 /// [`ldpc_encode_generic`] pinned to [`Ldpc174_91Params`].
 pub fn ldpc_encode(info: &[u8; LDPC_K]) -> [u8; LDPC_N] {
     let mut cw = [0u8; LDPC_N];
