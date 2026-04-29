@@ -11,7 +11,7 @@ categories  = ["science", "encoding", "multimedia::audio"]
 
 [features]
 default      = ["ft8", "ft4", "parallel"]
-full         = ["ft8", "ft4", "fst4", "wspr", "jt9", "jt65", "q65", "packet-bytes"]
+full         = ["ft8", "ft4", "fst4", "wspr", "jt9", "jt65", "q65", "packet-bytes", "uvpacket"]
 ft8          = []
 ft4          = []
 fst4         = []
@@ -20,6 +20,10 @@ jt9          = []
 jt65         = []
 q65          = []
 packet-bytes = []
+# uvpacket pulls in fst4 because it reuses the Ldpc240_101 codec
+# whose `Wsjt77Message::verify_info` length-dispatch logic (CRC-24
+# vs CRC-14) is wired through fst4's path.
+uvpacket     = ["fst4"]
 parallel     = ["dep:rayon"]
 osd-deep     = []
 eq-fallback  = []
@@ -32,7 +36,7 @@ rayon       = { version = "1", optional = true }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = [
-    'cfg(feature, values("ft8","ft4","fst4","wspr","jt9","jt65","q65","packet-bytes","parallel","osd-deep","eq-fallback","full"))',
+    'cfg(feature, values("ft8","ft4","fst4","wspr","jt9","jt65","q65","packet-bytes","uvpacket","parallel","osd-deep","eq-fallback","full"))',
 ] }
 
 # Build docs.rs with every protocol feature enabled so users browsing
