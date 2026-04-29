@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Protocol markers + trait wiring for the four uvpacket modes.
+//! Protocol markers + trait wiring for the three uvpacket modes.
 //!
-//! All four modes share the same modem (4-GFSK at 1200 baud,
+//! All three modes share the same modem (4-GFSK at 1200 baud,
 //! 600 Hz tone spacing, h=0.5, BT=0.5), the same FEC mother code
 //! (`Ldpc240_101`), the same Costas-4 head sync, and the same
 //! per-LDPC-block frame layout at the [`Protocol`] trait level. They
@@ -9,23 +9,26 @@
 //! which lives outside the trait constants in
 //! [`crate::uvpacket::puncture`].
 //!
-//! | ZST              | rate  | net bps (at 4-GFSK 2400 ch bps) | use |
-//! |------------------|------:|--------------------------------:|-----|
-//! | [`UvUltraRobust`] | 0.42  | 1008  | mountain / weak signal / deep fading |
-//! | [`UvRobust`]     | 0.50  | 1200  | typical NFM with fading              |
-//! | [`UvStandard`]   | 0.67  | 1600  | good signal                          |
-//! | [`UvFast`]       | 0.75  | 1800  | strong signal                        |
+//! | ZST            | rate | net bps (at 4-GFSK 2400 ch bps) | use |
+//! |----------------|-----:|--------------------------------:|-----|
+//! | [`UvRobust`]   | 0.42 | 1008 | mountain / weak signal / deep fading |
+//! | [`UvStandard`] | 0.50 | 1200 | typical NFM with fading             |
+//! | [`UvFast`]     | 0.66 | 1600 | strong-signal mode (rate-2/3, requires empirical convergence validation) |
 //!
-//! Adding a new uvpacket sub-mode (e.g. a higher-rate "Express" at
-//! rate 5/6) means defining a new ZST through the `uvpacket_submode!`
-//! macro and adding a [`Mode`] variant in `puncture.rs`. Almost no
-//! code change is needed; the macro covers the trait wiring.
+//! `UvFast` punctures 88 of the mother code's 139 parity bits
+//! (≈ 63 %) — well above the 30 % rule-of-thumb where uniform-spread
+//! puncturing of an irregular LDPC starts to lose ground. Whether
+//! it actually decodes is an empirical question gated by the test
+//! [`crate::uvpacket::puncture::tests`] runs.
 //!
-//! Note: at the [`Protocol`] level, all four ZSTs claim the same
+//! A rate-3/4 mode existed in earlier drafts but was dropped before
+//! implementation; see `puncture.rs` for the rationale.
+//!
+//! Note: at the [`Protocol`] level, all three ZSTs claim the same
 //! `N_DATA = 120` (= unpunctured codeword 240 ch bits / 2 bits/sym).
 //! The actual on-air block length post-puncture is shorter for
-//! Robust / Standard / Fast and is handled by the bespoke TX/RX
-//! paths in [`crate::uvpacket::tx`] / [`crate::uvpacket::rx`]. The
+//! Standard / Fast and is handled by the bespoke TX/RX paths in
+//! [`crate::uvpacket::tx`] / [`crate::uvpacket::rx`]. The
 //! Protocol-level constants describe the *unpunctured* codeword so
 //! the standard mfsk-core invariants (FEC fits in N_DATA × bits/sym)
 //! hold.
@@ -114,27 +117,25 @@ macro_rules! uvpacket_submode {
 }
 
 uvpacket_submode! {
-    /// **UltraRobust** — rate 0.42 (unpunctured `Ldpc240_101`).
+    /// **Robust** — rate 0.42 (unpunctured `Ldpc240_101`).
     /// 1008 net bps. For mountain / weak-signal / deep-fading
     /// channels where AFSK 1200 cannot deliver. AFSK has no
     /// equivalent mode — this is the design's headline value-prop.
-    UvUltraRobust, mode = Mode::UltraRobust,
-}
-
-uvpacket_submode! {
-    /// **Robust** — punctured to rate 1/2. 1200 net bps. Throughput
-    /// parity with AFSK 1200 plus FEC for typical NFM channels.
     UvRobust, mode = Mode::Robust,
 }
 
 uvpacket_submode! {
-    /// **Standard** — punctured to rate 2/3. 1600 net bps (+33 % vs
-    /// AFSK 1200). Good-signal default.
+    /// **Standard** — punctured to rate 1/2. 1200 net bps.
+    /// Throughput parity with AFSK 1200 plus FEC for typical NFM
+    /// channels.
     UvStandard, mode = Mode::Standard,
 }
 
 uvpacket_submode! {
-    /// **Fast** — punctured to rate 3/4. 1800 net bps (+50 % vs
-    /// AFSK 1200). Strong-signal mode.
+    /// **Fast** — punctured to rate 2/3. 1600 net bps (+33 % vs
+    /// AFSK 1200). Strong-signal mode. Aggressive puncturing
+    /// (63 % of parity bits dropped); decoder convergence is
+    /// gated on the `puncture::tests::fast_decodes_at_high_snr`
+    /// empirical test.
     UvFast, mode = Mode::Fast,
 }

@@ -9,12 +9,13 @@
 //!
 //! ## Sub-modes (all share modem + sync + FEC mother code)
 //!
-//! - [`UvUltraRobust`] — `Ldpc240_101` native rate 0.42, 1008 net bps.
+//! - [`UvRobust`] — `Ldpc240_101` native rate 0.42, 1008 net bps.
 //!   No AFSK equivalent; design's headline value-prop.
-//! - [`UvRobust`] — punctured to rate 1/2, 1200 net bps. AFSK 1200
+//! - [`UvStandard`] — punctured to rate 1/2, 1200 net bps. AFSK 1200
 //!   throughput parity plus FEC.
-//! - [`UvStandard`] — punctured to rate 2/3, 1600 net bps (+33 %).
-//! - [`UvFast`] — punctured to rate 3/4, 1800 net bps (+50 %).
+//! - [`UvFast`] — punctured to rate 2/3, 1600 net bps (+33 %).
+//!   Aggressive 63 % parity puncturing — empirical convergence
+//!   gated.
 //!
 //! ## Modulation
 //!
@@ -68,5 +69,5 @@ pub mod sync_pattern;
 pub mod tx;
 
 pub use message::UvPacketRawMessage;
-pub use protocol::{AUDIO_CENTRE_HZ, UvFast, UvRobust, UvStandard, UvUltraRobust};
+pub use protocol::{AUDIO_CENTRE_HZ, UvFast, UvRobust, UvStandard};
 pub use puncture::Mode;

@@ -158,8 +158,6 @@ pub static PROTOCOLS: &[ProtocolMeta] = &[
     #[cfg(feature = "q65")]
     protocol_meta!("Q65-60E", crate::q65::Q65e60),
     #[cfg(feature = "uvpacket")]
-    protocol_meta!("UvUltraRobust", crate::UvUltraRobust),
-    #[cfg(feature = "uvpacket")]
     protocol_meta!("UvRobust", crate::UvRobust),
     #[cfg(feature = "uvpacket")]
     protocol_meta!("UvStandard", crate::UvStandard),

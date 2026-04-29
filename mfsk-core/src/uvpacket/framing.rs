@@ -8,7 +8,7 @@
 //! Field: ┌mode┐└── blocks ──┘└── app ──┘└── seq ──────┘
 //! ```
 //!
-//! - `mode` (2 bits) — 0=UltraRobust, 1=Robust, 2=Standard, 3=Fast.
+//! - `mode` (2 bits) — 0=Robust, 1=Standard, 2=Fast, 3=reserved.
 //! - `blocks` (5 bits) — LDPC block count, encoded as `count - 1`
 //!   so `0b00000` means 1 block and `0b11111` means 32 blocks.
 //! - `app` (4 bits) — application-layer dispatch tag, 0..=15.
@@ -236,7 +236,7 @@ mod tests {
 
     #[test]
     fn pack_unpack_roundtrip_all_modes() {
-        for mode in [Mode::UltraRobust, Mode::Robust, Mode::Standard, Mode::Fast] {
+        for mode in [Mode::Robust, Mode::Standard, Mode::Fast] {
             let h = FrameHeader {
                 mode,
                 block_count: 1,
@@ -265,7 +265,7 @@ mod tests {
 
         // Min values.
         let h = FrameHeader {
-            mode: Mode::UltraRobust,
+            mode: Mode::Robust,
             block_count: 1,
             app_type: 0,
             sequence: 0,
@@ -389,10 +389,10 @@ mod tests {
         // and confirm the resulting bytes match the documented bit
         // layout.
         let h = FrameHeader {
-            mode: Mode::Standard, // 0b10
-            block_count: 1,       // 0b00000 (encoded as count-1)
-            app_type: 0b1010,     // 0xA
-            sequence: 0b10101,    // 0x15
+            mode: Mode::Fast,  // header_code = 2 = 0b10
+            block_count: 1,    // 0b00000 (encoded as count-1)
+            app_type: 0b1010,  // 0xA
+            sequence: 0b10101, // 0x15
         };
         let bytes = pack(&h, &[]).unwrap();
         // Header word, MSB on the left:
