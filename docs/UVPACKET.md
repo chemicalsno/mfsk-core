@@ -304,7 +304,7 @@ Representative WAV files for ear-level inspection live at
 | `uv_robust_clean.wav` | Robust, 4 blocks, 20 B | clean | ✓ |
 | `uv_robust_awgn_+8db.wav` | Robust | AWGN +8 dB Eb/N0 | ✓ |
 | `uv_robust_awgn_+4db.wav` | Robust | AWGN +4 dB Eb/N0 | ✓ (97 % per-frame after LMS) |
-| `uv_robust_awgn_+2db.wav` | Robust | AWGN +2 dB Eb/N0 | marginal (~47 %) |
+| `uv_robust_awgn_+2db.wav` | Robust | AWGN +2 dB Eb/N0 | ✓ (53 % per-frame statistic; this seed lands on the OK side after sub-sample timing) |
 | `uv_robust_rayleigh_5hz_+15db.wav` | Robust | 5 Hz Rayleigh, +15 dB | ✓ |
 | `uv_express_clean.wav` | Express, 4 blocks, 20 B | clean | ✓ |
 

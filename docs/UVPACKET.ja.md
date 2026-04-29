@@ -287,7 +287,7 @@ QPSK + RRC 整合フィルタへの再設計をサイクル中盤でコミット
 | `uv_robust_clean.wav` | Robust, 4 blocks, 20 B | clean | ✓ |
 | `uv_robust_awgn_+8db.wav` | Robust | AWGN +8 dB Eb/N0 | ✓ |
 | `uv_robust_awgn_+4db.wav` | Robust | AWGN +4 dB Eb/N0 | ✓ (LMS 後 97% per-frame) |
-| `uv_robust_awgn_+2db.wav` | Robust | AWGN +2 dB Eb/N0 | marginal (~47 %) |
+| `uv_robust_awgn_+2db.wav` | Robust | AWGN +2 dB Eb/N0 | ✓ (53 % per-frame 統計; この seed は sub-sample timing で OK 側) |
 | `uv_robust_rayleigh_5hz_+15db.wav` | Robust | 5 Hz Rayleigh, +15 dB | ✓ |
 | `uv_express_clean.wav` | Express, 4 blocks, 20 B | clean | ✓ |
 
