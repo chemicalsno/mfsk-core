@@ -1138,7 +1138,17 @@ fn decode_inner(
     }
     let threshold = global_max * PREAMBLE_PEAK_REL_THRESHOLD;
 
-    // Pick local maxima above threshold, ±NSPS-NMS.
+    // Pick local maxima above threshold, ±NSPS-NMS, then keep at most
+    // `MAX_PICKED_PEAKS_FM` of them (sorted by score). The sync gate
+    // is a coarse filter — even after it, weak false peaks (noise that
+    // happened to survive the gate by extreme-value chance, or
+    // bursts of structured-but-not-preamble interference) consume the
+    // full layout LDPC sweep per peak with ~80 ms per attempt in
+    // WASM. Capping at a small number keeps the worst-case CPU bound
+    // tight while still letting the receiver handle a small number of
+    // overlapping signals at the same audio centre (the original
+    // motivation for picking multiple peaks).
+    const MAX_PICKED_PEAKS_FM: usize = 3;
     let mut peaks: Vec<(usize, f32)> = scores
         .iter()
         .enumerate()
@@ -1150,6 +1160,9 @@ fn decode_inner(
     for (offset, _) in peaks {
         if picked.iter().all(|&p| offset.abs_diff(p) > NSPS) {
             picked.push(offset);
+            if picked.len() >= MAX_PICKED_PEAKS_FM {
+                break;
+            }
         }
     }
     picked.sort_unstable();
@@ -1497,7 +1510,11 @@ fn decode_multichannel_inner(
     }
 
     // 2. Frequency-axis NMS — drop duplicate detections of the
-    //    same signal at adjacent grid points.
+    //    same signal at adjacent grid points. Capped at
+    //    `MAX_KEPT_PEAKS_SSB` so a noise-pass-the-gate burst at
+    //    multiple grid points doesn't compound into a many-second
+    //    LDPC sweep (each kept peak runs the full layouts list).
+    const MAX_KEPT_PEAKS_SSB: usize = 5;
     all_peaks.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
     let mut kept: Vec<(f32, usize, f32)> = Vec::new();
     for (cf, off, mag) in all_peaks {
@@ -1506,6 +1523,9 @@ fn decode_multichannel_inner(
         });
         if !collides {
             kept.push((cf, off, mag));
+            if kept.len() >= MAX_KEPT_PEAKS_SSB {
+                break;
+            }
         }
     }
 
