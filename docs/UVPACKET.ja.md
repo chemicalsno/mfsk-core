@@ -254,8 +254,12 @@ FM 閾値が NFM 音声チャンネルの拘束条件。これより下に行く
   なる）。
 - 有限長 RRC マッチング損失 (~0.05 dB) と LDPC ブロックを通じた
   有限精度演算の積み重ね。
-- 整数サンプル粒度のタイミング (sub-sample timing recovery で
-  最悪ケース 0.05–0.1 dB 削れる)。
+- 整数サンプル粒度だったタイミング — sub-sample timing recovery
+  を実装済み (preamble 相関 magnitude の三点放物線フィットで
+  fractional offset を解析的に取得、その offset で MF 出力を
+  線形補間でサンプリング)。閾値での実測ゲインは ~0.1 dB、予想
+  範囲の下端。高 SNR の Rayleigh で ±1 trial / 30 程度ばらつく
+  が統計ノイズ範囲内。
 
 これらは構造的バグではなく sub-1-dB クラスの調整項目。閉じる
 作業は Phase 3+ で、現状の modem は閾値で意味のある Robust >

@@ -199,15 +199,54 @@ pub fn decode_known_layout_with_opts(
         }
     }
 
+    // 2b. Sub-sample timing refinement via parabolic peak fit on
+    //     `|C(off)|²` at the three integer offsets `{best_off−1,
+    //     best_off, best_off+1}`. Integer-sample preamble
+    //     correlation lands within ±0.5 sample of the true peak;
+    //     parabolic refinement narrows that to a few percent of a
+    //     sample. The remaining timing offset (≤ ~0.05 sample at
+    //     low SNR) shaves a final 0.05–0.1 dB off the worst-case
+    //     symbol-amplitude loss from `g(t)` mismatch.
+    let frac_off: f32 = {
+        let need_minus = best_off > 0
+            && (best_off - 1) + (PREAMBLE_LEN - 1) * NSPS < mf_out.len();
+        let need_plus = (best_off + 1) + (PREAMBLE_LEN - 1) * NSPS < mf_out.len();
+        if need_minus && need_plus {
+            let m_minus = preamble_correlation(&mf_out, best_off - 1).norm_sqr();
+            let m_plus = preamble_correlation(&mf_out, best_off + 1).norm_sqr();
+            let m_zero = best_mag2;
+            let denom = 2.0 * (m_plus - 2.0 * m_zero + m_minus);
+            if denom.abs() > 1e-9 {
+                ((m_minus - m_plus) / denom).clamp(-0.5, 0.5)
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        }
+    };
+
+    // Re-evaluate preamble correlation at the refined fractional
+    // offset, so `best_corr.arg()` gives the carrier phase at the
+    // true symbol-centre rather than at the integer-snapped offset.
+    if frac_off.abs() > 1e-3 {
+        let mut acc = Complex32::new(0.0, 0.0);
+        for (i, &b) in UVPACKET_PREAMBLE_BPSK_BITS.iter().enumerate() {
+            let s = if b { -1.0_f32 } else { 1.0 };
+            acc += sample_mf_lerp(&mf_out, best_off as f32 + frac_off + (i * NSPS) as f32) * s;
+        }
+        best_corr = acc;
+    }
+
     // 3. Extract the full transmitted-symbol stream at the refined
-    //    offset (preamble + pilot/data interleave).
+    //    sub-sample offset (preamble + pilot/data interleave).
     let mut symbols: Vec<Complex32> = Vec::with_capacity(total_syms);
     for i in 0..total_syms {
-        let pos = best_off + i * NSPS;
-        if pos >= mf_out.len() {
+        let pos = best_off as f32 + frac_off + (i * NSPS) as f32;
+        if pos < 0.0 || pos as usize + 1 >= mf_out.len() {
             return Err(DecodeError::Truncated);
         }
-        symbols.push(mf_out[pos]);
+        symbols.push(sample_mf_lerp(&mf_out, pos));
     }
 
     // 4. Build a per-symbol phase reference. Anchors:
@@ -686,6 +725,15 @@ fn unwrap_phase(prev: f32, new: f32) -> f32 {
         delta += 2.0 * PI;
     }
     prev + delta
+}
+
+/// Linear interpolation of the matched-filter output at a fractional
+/// sample position. The position must lie within `[0,
+/// mf_out.len() − 1)`; callers are responsible for the bounds check.
+fn sample_mf_lerp(mf_out: &[Complex32], pos: f32) -> Complex32 {
+    let p_int = pos.floor() as usize;
+    let alpha = pos - p_int as f32;
+    mf_out[p_int] * (1.0 - alpha) + mf_out[p_int + 1] * alpha
 }
 
 /// Solve a 3×3 linear system `A·x = b` by Cramer's rule. Returns

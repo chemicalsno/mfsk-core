@@ -268,8 +268,13 @@ The remaining 0.5–2 dB loss is dominated by:
   the true variance at threshold-level SNR).
 - Finite-span RRC matching loss (~0.05 dB) plus finite-precision
   arithmetic accumulating over the LDPC block.
-- Sample-timing rounded to integer samples (sub-sample timing
-  recovery would shave 0.05–0.1 dB worst-case).
+- Sample-timing rounded to integer samples — addressed by the
+  sub-sample timing recovery (parabolic peak fit on the preamble
+  correlation magnitude → fractional offset applied via linear
+  interpolation of the matched-filter output). Empirical gain at
+  the threshold is ~0.1 dB, at the lower end of the predicted
+  range. Mixed at higher SNR (Rayleigh fading sometimes shows ±1
+  trial of 30, well within statistical noise).
 
 These are sub-1-dB-each engineering knobs rather than structural
 bugs. Closing them is Phase 3+ work; the current modem already
