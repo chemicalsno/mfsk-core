@@ -1170,6 +1170,7 @@ fn decode_inner(
         }
     };
 
+    let afc_opts = AfcOpts::default();
     for mf_off in picked {
         let Some(audio_off) = mf_off.checked_sub(SYM_PEAK_OFFSET) else {
             continue;
@@ -1177,6 +1178,30 @@ fn decode_inner(
         if audio_off < consumed_until {
             continue;
         }
+        // 1-shot AFC at this peak. The acoustic-loopback path on the
+        // uvpacket-web PWA shows ~5 Hz of residual offset between
+        // independent AudioContext output and capture clocks even
+        // when both are forced to 12 kHz, which drops the preamble
+        // coherence to ~65 % saturation and degrades the BP path
+        // enough to fail downstream decode. Same `estimate_freq_offset`
+        // grid that `decode_known_layout_with_afc` uses, but applied
+        // ONCE per peak before the layout sweep — we re-use the
+        // corrected centre across every (mode, n_blocks) try below.
+        let afc_window = (PREAMBLE_LEN - 1) * NSPS + 1 + RRC_LEN;
+        let corrected_centre = if audio_off + afc_window <= audio.len() {
+            audio_centre_hz
+                + diag_estimate_freq_offset(
+                    audio,
+                    audio_off,
+                    audio_centre_hz,
+                    afc_window,
+                    &afc_opts,
+                )
+                .unwrap_or(0.0)
+        } else {
+            audio_centre_hz
+        };
+
         // Try each (mode, n_blocks) — first success wins. To keep
         // cost bounded for the unconstrained sweep, the default order
         // iterates n_blocks descending so a successful decode of the
@@ -1189,7 +1214,7 @@ fn decode_inner(
             if audio_off + needed > audio.len() {
                 continue;
             }
-            if let Ok(f) = decode_known_layout(audio, audio_off, audio_centre_hz, mode, n_blocks) {
+            if let Ok(f) = decode_known_layout(audio, audio_off, corrected_centre, mode, n_blocks) {
                 decoded = Some(f);
                 consumed_end = audio_off + needed;
                 break;
