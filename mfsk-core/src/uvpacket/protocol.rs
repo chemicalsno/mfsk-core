@@ -1,13 +1,29 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Protocol markers + trait wiring for the four uvpacket modes.
 //!
-//! All four modes share the same modem (4-GFSK at 1200 baud,
-//! 600 Hz tone spacing, h=0.5, BT=0.5), the same FEC mother code
-//! (`Ldpc240_101`), the same Costas-4 head sync, and the same
-//! per-LDPC-block frame layout at the [`Protocol`] trait level. They
-//! differ only in the puncturing applied to the FEC parity bits,
-//! which lives outside the trait constants in
+//! Phase 2 modulation pivot (see `docs/0.3.1_PLAN.md`): the modem
+//! is **single-carrier coherent QPSK at 1200 baud + RRC pulse + 31-
+//! bit m-sequence preamble + periodic pilots**. The first 0.3.1
+//! attempt with non-coherent 4-FSK at h=0.5 broke down on tone
+//! orthogonality; QPSK's I/Q axes are orthogonal by construction.
+//!
+//! All four modes share the same modem (1200 baud QPSK, 1500 Hz
+//! audio centre, RRC α=0.5), the same FEC mother code
+//! (`Ldpc240_101`), the same preamble + pilot scheme, and the same
+//! per-LDPC-block frame layout at the [`Protocol`] trait level.
+//! They differ only in the puncturing applied to the FEC parity
+//! bits, which lives outside the trait constants in
 //! [`crate::uvpacket::puncture`].
+//!
+//! ## Decorative trait constants
+//!
+//! [`ModulationParams`]'s `NTONES`, `TONE_SPACING_HZ`, `GFSK_BT`,
+//! and `GFSK_HMOD` are FSK-specific. uvpacket bypasses the
+//! generic mfsk-core pipeline (it has its own bespoke TX / RX
+//! paths) so these constants are only there to satisfy the trait
+//! signature and the `protocol_invariants` test. They are **not**
+//! consulted by [`crate::uvpacket::tx::encode`] or
+//! [`crate::uvpacket::rx::decode_known_layout`].
 //!
 //! | ZST            | rate | net bps (at 4-GFSK 2400 ch bps) | use |
 //! |----------------|-----:|--------------------------------:|-----|
