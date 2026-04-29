@@ -1109,6 +1109,221 @@ fn needed_samples_for(mode: Mode, n_blocks: u8) -> usize {
 }
 
 // ────────────────────────────────────────────────────────────────────
+// Multi-channel SSB: decode_multichannel + slot-survey helpers
+// ────────────────────────────────────────────────────────────────────
+
+/// Configuration for [`decode_multichannel`] and
+/// [`measure_slot_energies`].
+///
+/// On a shared SSB channel (e.g., 430.090 MHz USB) carrying
+/// multiple uvpacket users in the audio passband, this struct
+/// describes the search window and the coarse-grid step used to
+/// scan for preamble peaks.
+#[derive(Clone, Copy, Debug)]
+pub struct MultiChannelOpts {
+    /// Low edge of the search band (Hz). Typical SSB:
+    /// 300 Hz to clear the analog HPF.
+    pub band_lo_hz: f32,
+    /// High edge of the search band (Hz). Typical SSB:
+    /// 2700 Hz for a 2.4 kHz passband.
+    pub band_hi_hz: f32,
+    /// Coarse-grid step (Hz). 25 Hz matches the AFC search.
+    pub coarse_step_hz: f32,
+    /// Frequency-axis NMS radius (Hz). Peaks closer than this
+    /// in frequency are merged. 600 Hz = half slot spacing for
+    /// the typical 1200 Hz slot grid.
+    pub nms_radius_hz: f32,
+    /// Magnitude threshold for the preamble correlator,
+    /// expressed as a fraction of the global maximum across the
+    /// scan. 0.5 picks any local peak ≥ 50 % of the strongest.
+    pub peak_rel_threshold: f32,
+}
+
+impl Default for MultiChannelOpts {
+    fn default() -> Self {
+        Self {
+            band_lo_hz: 300.0,
+            band_hi_hz: 2700.0,
+            coarse_step_hz: 25.0,
+            nms_radius_hz: 600.0,
+            peak_rel_threshold: 0.5,
+        }
+    }
+}
+
+/// Per-slot energy report from [`measure_slot_energies`].
+#[derive(Clone, Copy, Debug)]
+pub struct SlotEnergy {
+    /// Slot centre frequency (Hz).
+    pub audio_centre_hz: f32,
+    /// Mean matched-filter |output|² over the audio body, after
+    /// down-conversion at this slot's centre. Higher = more
+    /// uvpacket-like signal at this slot. Policy-free: callers
+    /// pick a free-vs-busy threshold themselves.
+    pub mean_mf_magnitude: f32,
+}
+
+/// Decode every uvpacket frame found in `audio` whose audio
+/// centre lies in `[mc_opts.band_lo_hz, mc_opts.band_hi_hz]`.
+/// Returns `(detected_audio_centre_hz, frame)` pairs.
+///
+/// The algorithm is a coarse-grid frequency sweep at
+/// `coarse_step_hz` (default 25 Hz), running matched-filter +
+/// preamble-correlation peak detection at each candidate centre,
+/// then frequency-axis NMS to drop adjacent-grid duplicates of
+/// the same signal, and finally per-peak `(mode × n_blocks)`
+/// decode. The returned `f32` is the picked grid centre — the
+/// LMS phase fit inside the per-peak decoder absorbs the
+/// ≤ 12.5 Hz residual.
+///
+/// Cost is dominated by the coarse-grid scan: ~one matched-filter
+/// pass over `audio` per grid step (~70 ms for a 1-second buffer
+/// at the default 25 Hz step over the default 300–2700 Hz band).
+pub fn decode_multichannel(
+    audio: &[f32],
+    mc_opts: &MultiChannelOpts,
+    fec_opts: &FecOpts,
+) -> Vec<(f32, DecodedFrame)> {
+    if audio.len() < PREAMBLE_LEN * NSPS + RRC_LEN {
+        return Vec::new();
+    }
+    let mut all_peaks: Vec<(f32, usize, f32)> = Vec::new(); // (f, mf_off, mag2)
+
+    // 1. Coarse-grid scan.
+    let mut f = mc_opts.band_lo_hz;
+    while f <= mc_opts.band_hi_hz {
+        let mf_out = downconvert_and_matched_filter(audio, f);
+        let max_off = mf_out.len().saturating_sub((PREAMBLE_LEN - 1) * NSPS + 1);
+        if max_off > 0 {
+            let mut local_max: f32 = 0.0;
+            let mut scores: Vec<f32> = Vec::with_capacity(max_off);
+            for offset in 0..max_off {
+                let m2 = preamble_correlation(&mf_out, offset).norm_sqr();
+                scores.push(m2);
+                if m2 > local_max {
+                    local_max = m2;
+                }
+            }
+            if local_max > 0.0 {
+                let local_thr = local_max * mc_opts.peak_rel_threshold;
+                // Time-axis local maxima within this frequency.
+                let mut local_peaks: Vec<(usize, f32)> = scores
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| **s >= local_thr)
+                    .map(|(i, &s)| (i, s))
+                    .collect();
+                local_peaks.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                let mut local_picked: Vec<usize> = Vec::new();
+                for (off, _) in &local_peaks {
+                    if local_picked.iter().all(|&p| off.abs_diff(p) > NSPS) {
+                        local_picked.push(*off);
+                    }
+                }
+                for off in local_picked {
+                    all_peaks.push((f, off, scores[off]));
+                }
+            }
+        }
+        f += mc_opts.coarse_step_hz;
+    }
+
+    if all_peaks.is_empty() {
+        return Vec::new();
+    }
+
+    // 2. Frequency-axis NMS — drop duplicate detections of the
+    //    same signal at adjacent grid points.
+    all_peaks.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
+    let mut kept: Vec<(f32, usize, f32)> = Vec::new();
+    for (cf, off, mag) in all_peaks {
+        let collides = kept.iter().any(|(kf, koff, _)| {
+            (cf - *kf).abs() < mc_opts.nms_radius_hz && off.abs_diff(*koff) < NSPS * 4
+        });
+        if !collides {
+            kept.push((cf, off, mag));
+        }
+    }
+
+    // 3. Per-peak decode. The coarse grid leaves ≤ 12.5 Hz
+    //    residual at the picked centre; the LMS phase fit inside
+    //    `decode_known_layout_with_opts` absorbs that, so we use
+    //    the non-AFC entry point.
+    let mut frames: Vec<(f32, DecodedFrame)> = Vec::new();
+    for (cf, mf_off, _) in kept {
+        let Some(audio_off) = mf_off.checked_sub(SYM_PEAK_OFFSET) else {
+            continue;
+        };
+        'modes: for mode in [Mode::Robust, Mode::Standard, Mode::Fast, Mode::Express] {
+            for n_blocks in (1u8..=32).rev() {
+                let needed = needed_samples_for(mode, n_blocks);
+                if audio_off + needed > audio.len() {
+                    continue;
+                }
+                if let Ok(frame) =
+                    decode_known_layout_with_opts(audio, audio_off, cf, mode, n_blocks, fec_opts)
+                {
+                    frames.push((cf, frame));
+                    break 'modes;
+                }
+            }
+        }
+    }
+
+    frames
+}
+
+/// Measure the per-slot received-signal energy across the band
+/// configured by `mc_opts`, using slot centres at
+/// `band_lo_hz + 0.5·slot_spacing`, `band_lo_hz + 1.5·slot_spacing`,
+/// … up to `band_hi_hz`. Used by applications as the LBT step
+/// before a slotted-ALOHA TX.
+///
+/// Energy is measured by matched-filtering `audio` at each slot
+/// centre and averaging |mf|² over the body. Policy-free: the
+/// helper just reports energies. Typical caller pattern:
+///
+/// ```ignore
+/// let slots = measure_slot_energies(&audio, &mc, 1200.0);
+/// // band median:
+/// let mut mags: Vec<f32> = slots.iter().map(|s| s.mean_mf_magnitude).collect();
+/// mags.sort_by(|a, b| a.partial_cmp(b).unwrap());
+/// let median = mags[mags.len() / 2];
+/// // free if ≤ 3 dB above median:
+/// let free: Vec<f32> = slots.iter()
+///     .filter(|s| s.mean_mf_magnitude < median * 2.0)
+///     .map(|s| s.audio_centre_hz)
+///     .collect();
+/// ```
+///
+/// Cost: one matched-filter pass over `audio` per slot. For a
+/// 2-slot grid that's effectively free.
+pub fn measure_slot_energies(
+    audio: &[f32],
+    mc_opts: &MultiChannelOpts,
+    slot_spacing_hz: f32,
+) -> Vec<SlotEnergy> {
+    let mut centres: Vec<f32> = Vec::new();
+    let mut f = mc_opts.band_lo_hz + slot_spacing_hz / 2.0;
+    while f + slot_spacing_hz / 2.0 <= mc_opts.band_hi_hz {
+        centres.push(f);
+        f += slot_spacing_hz;
+    }
+    centres
+        .into_iter()
+        .map(|f| {
+            let mf_out = downconvert_and_matched_filter(audio, f);
+            let n = mf_out.len().max(1) as f32;
+            let mean_sq: f32 = mf_out.iter().map(|c| c.norm_sqr()).sum::<f32>() / n;
+            SlotEnergy {
+                audio_centre_hz: f,
+                mean_mf_magnitude: mean_sq,
+            }
+        })
+        .collect()
+}
+
+// ────────────────────────────────────────────────────────────────────
 // Tests
 // ────────────────────────────────────────────────────────────────────
 
