@@ -1,5 +1,72 @@
 # Changelog
 
+## 0.3.5 (continued) — 2026-04-29
+
+uvpacket sync detector rewrite — replaces `|⟨preamble, mf_out⟩|²` as
+the per-offset score with the **normalised coherence ratio**
+`|⟨preamble, mf_out⟩|² / Σ|sᵢ|²`, fixing a structural false-sync
+class that the 0.3.4 / 0.3.5 sync gate band-aids couldn't reach.
+
+(In-place 0.3.5 update — no version bump to keep the published-crate
+history clean. The earlier 0.3.5 entry below describes the
+non-zero-median fix that this commit completes.)
+
+### Background
+
+The old detector summed `±sᵢ` for the 31 BPSK preamble bits and used
+`|sum|²` as the match score. By Cauchy-Schwarz that magnitude is
+bounded by `N·Σ|sᵢ|²`, but the bound is reached **only** when `sᵢ ∝
+b̄ᵢ` for all i (the actual coherent-preamble signature). For a single
+dominant sample (microphone click, USB plug-event, fan tick, …) the
+sum is nearly as large as if the whole preamble had aligned, yet
+*only one* sample contributed coherently. The old detector saw
+"large magnitude" and accepted; the LDPC sweep then ran on noise.
+
+uvpacket-web field reports showed `max/median = 139` from a single
+field-amplitude impulse, vs `≤ 17` for proper noise. New direct
+measurement: an isolated single-sample spike of 0.5 amplitude in
+30 k samples of noise gives `max/median = 2209` under the old
+detector — false sync every snapshot in environments with any
+impulsive interference.
+
+### Fixed
+
+- New `preamble_coherence_score(mf_out, offset) -> f32` returns the
+  normalised ratio. Bounded above by `PREAMBLE_LEN = 31`; saturates
+  at 31 for a coherent BPSK preamble; collapses to ~1 for any
+  single-sample dominance or random uncorrelated content.
+- `rx::decode` and `rx::diag_sync_stats` now generate scores via
+  `preamble_coherence_score` instead of `preamble_correlation(...).
+  norm_sqr()`. The downstream `SYNC_PEAK_REL_TO_MEDIAN = 20×` gate
+  and the threshold-relative-NMS peak picking are unchanged — only
+  the *scoring metric* changed.
+
+### Empirical (release, 30 000-sample buffers)
+
+| scenario               | old detector | new detector |
+|------------------------|--------------|--------------|
+| pure white noise       | 13.5         | 12.3         |
+| 1500 Hz tone           | 6.3          | 6.2          |
+| 1200 Hz tone           | 2.5          | 2.8          |
+| **noise + 0.5 click**  | **2 209**    | **10.6**     |
+| AM(1500 Hz, 1200 Hz)   | 8.4          | 8.9          |
+| strong tone @ 1500 Hz  | 6.2          | 7.1          |
+| **real preamble +10 dB**| (varies)    | **46.5**     |
+
+The impulse case dropped from 2 209 to 10.6 (well below the 20×
+gate); the real-preamble case climbed to 46.5 (well above). Clean
+separation, while every other point on the table is roughly
+unchanged. All 271 existing uvpacket tests pass byte-identically —
+the metric is mathematically equivalent for actual preambles.
+
+### Roadmap note
+
+A longer preamble (127 or 255 bits) would push the real-signal
+saturation ratio higher (linear in `N`) without affecting the
+noise floor, giving more headroom. That's a wire-format break and
+deferred for now; the 31-bit + coherence-score combination already
+restores the gate's intended noise rejection.
+
 ## 0.3.5 — 2026-04-29
 
 uvpacket sync-gate hardening: 0.3.4's `max/median ≥ 20` rejection

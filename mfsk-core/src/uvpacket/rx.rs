@@ -921,6 +921,42 @@ fn preamble_correlation(mf_out: &[Complex32], offset: usize) -> Complex32 {
     acc
 }
 
+/// **Normalised** correlation score, used for sync detection: the
+/// ratio of the coherent sum's squared magnitude to the sum of
+/// per-sample energies.
+///
+/// `score = |Σ sᵢ·bᵢ|² / Σ|sᵢ|²`
+///
+/// By Cauchy-Schwarz, this ratio is bounded above by `PREAMBLE_LEN
+/// = 31`. The bound is saturated **only** when `sᵢ ∝ b̄ᵢ` for all i
+/// — the defining signature of a coherent BPSK preamble. For pure
+/// noise or for a single dominant sample (impulsive interference),
+/// the ratio collapses to `~1`, regardless of the absolute magnitude
+/// of the dominant sample.
+///
+/// This is the discriminator that separates a real 31-bit preamble
+/// from a microphone click (the latter has |·|² huge but coherence
+/// ratio = 1). Replacing `|acc|²` as the sync score eliminates the
+/// false-sync class observed in uvpacket-web field reports
+/// (`max/median = 139` from a single mic impulse vs theoretical
+/// `≤ 17` for noise).
+fn preamble_coherence_score(mf_out: &[Complex32], offset: usize) -> f32 {
+    let mut acc = Complex32::new(0.0, 0.0);
+    let mut energy = 0.0_f32;
+    for (i, &b) in UVPACKET_PREAMBLE_BPSK_BITS.iter().enumerate() {
+        let pos = offset + i * NSPS;
+        let s = mf_out[pos];
+        let sign = if b { -1.0_f32 } else { 1.0_f32 };
+        acc += s * sign;
+        energy += s.norm_sqr();
+    }
+    if energy <= 0.0 {
+        0.0
+    } else {
+        acc.norm_sqr() / energy
+    }
+}
+
 /// Unwrap `new` to lie within ±π of `prev`.
 fn unwrap_phase(prev: f32, new: f32) -> f32 {
     let mut delta = new - prev;
@@ -1053,10 +1089,13 @@ pub fn decode(audio: &[f32], audio_centre_hz: f32) -> Vec<DecodedFrame> {
     if max_corr_offset == 0 {
         return Vec::new();
     }
+    // Coherence score per offset — bounded by `PREAMBLE_LEN = 31`,
+    // saturated only by a true BPSK preamble. Replaces the raw `|acc|²`
+    // score that was vulnerable to single-impulse mic noise (one
+    // dominant sample → ratio = 2200+ false sync).
     let mut scores = vec![0.0f32; max_corr_offset];
     for (offset, slot) in scores.iter_mut().enumerate() {
-        let c = preamble_correlation(&mf_out, offset);
-        *slot = c.norm_sqr();
+        *slot = preamble_coherence_score(&mf_out, offset);
     }
     let global_max = scores.iter().cloned().fold(0.0f32, f32::max);
     if global_max <= 0.0 {
@@ -1166,7 +1205,7 @@ pub fn diag_sync_stats(audio: &[f32], audio_centre_hz: f32) -> SyncStats {
     }
     let mut scores = vec![0.0f32; max_corr_offset];
     for (offset, slot) in scores.iter_mut().enumerate() {
-        *slot = preamble_correlation(&mf_out, offset).norm_sqr();
+        *slot = preamble_coherence_score(&mf_out, offset);
     }
     let global_max = scores.iter().cloned().fold(0.0f32, f32::max);
     // Median over non-zero scores only (see `global_max_is_sync_outlier`).

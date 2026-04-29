@@ -39,6 +39,116 @@ impl Awgn {
     }
 }
 
+/// Direct probe: feed various audio scenarios to `diag_sync_stats`
+/// and print the ratio. Theoretical max/median for `N≈30k`
+/// exponentially-distributed scores is `ln(N)/ln(2) ≈ 14.9`.
+#[test]
+fn noise_ratio_distribution() {
+    use mfsk_core::uvpacket::rx::diag_sync_stats;
+    let n_samples = 30_000_usize;
+    let two_pi = 2.0 * std::f32::consts::PI;
+
+    // 1. Pure white noise — baseline.
+    {
+        let mut rng = Awgn::new(0xa1);
+        let audio: Vec<f32> = (0..n_samples).map(|_| 0.05 * rng.gaussian()).collect();
+        let s = diag_sync_stats(&audio, 1500.0);
+        eprintln!("[white]   ratio={:.1}", s.ratio);
+    }
+
+    // 2. Noise + tone at carrier (1500 Hz) — DC after downconvert.
+    {
+        let mut rng = Awgn::new(0xa2);
+        let audio: Vec<f32> = (0..n_samples)
+            .map(|i| {
+                let t = i as f32 / 12_000.0;
+                0.005 * (two_pi * 1500.0 * t).sin() + 0.001 * rng.gaussian()
+            })
+            .collect();
+        let s = diag_sync_stats(&audio, 1500.0);
+        eprintln!("[tone @ 1500Hz] ratio={:.1}", s.ratio);
+    }
+
+    // 3. Noise + 1200 Hz offset tone — symbol-rate alignment.
+    {
+        let mut rng = Awgn::new(0xa3);
+        let audio: Vec<f32> = (0..n_samples)
+            .map(|i| {
+                let t = i as f32 / 12_000.0;
+                0.005 * (two_pi * 1200.0 * t).sin() + 0.001 * rng.gaussian()
+            })
+            .collect();
+        let s = diag_sync_stats(&audio, 1500.0);
+        eprintln!("[tone @ 1200Hz] ratio={:.1}", s.ratio);
+    }
+
+    // 4. Noise + a single impulse.
+    {
+        let mut rng = Awgn::new(0xa4);
+        let mut audio: Vec<f32> = (0..n_samples).map(|_| 0.001 * rng.gaussian()).collect();
+        audio[15_000] = 0.5; // single sample click
+        let s = diag_sync_stats(&audio, 1500.0);
+        eprintln!("[noise+click]  peak={:.3} ratio={:.1}", 0.5, s.ratio);
+    }
+
+    // 5. Noise + 1500 Hz tone gated at 1200 Hz (AM modulation by symbol rate).
+    //    This is what would happen if the user's mic picks up some uvpacket-
+    //    like or modem-like background.
+    {
+        let mut rng = Awgn::new(0xa5);
+        let audio: Vec<f32> = (0..n_samples)
+            .map(|i| {
+                let t = i as f32 / 12_000.0;
+                let envelope = 0.5 + 0.5 * (two_pi * 1200.0 * t).sin();
+                0.005 * envelope * (two_pi * 1500.0 * t).sin() + 0.001 * rng.gaussian()
+            })
+            .collect();
+        let s = diag_sync_stats(&audio, 1500.0);
+        eprintln!("[1500Hz AM 1200Hz] ratio={:.1}", s.ratio);
+    }
+
+    // 6. Pure signal at 1500 Hz, large amplitude — sanity check
+    {
+        let audio: Vec<f32> = (0..n_samples)
+            .map(|i| {
+                let t = i as f32 / 12_000.0;
+                0.5 * (two_pi * 1500.0 * t).sin()
+            })
+            .collect();
+        let s = diag_sync_stats(&audio, 1500.0);
+        eprintln!("[strong tone 1500Hz] ratio={:.1}", s.ratio);
+    }
+
+    // 7. Real preamble at moderate SNR — sanity check the gate's
+    //    accept-side. Ratio should be near `PREAMBLE_LEN = 31`.
+    {
+        use mfsk_core::uvpacket::framing::FrameHeader;
+        use mfsk_core::uvpacket::puncture::Mode;
+        use mfsk_core::uvpacket::tx;
+        let header = FrameHeader {
+            mode: Mode::Standard,
+            block_count: 4,
+            app_type: 1,
+            sequence: 0,
+        };
+        let payload = b"hello world";
+        let burst = tx::encode(&header, payload, 1500.0).unwrap();
+        let mut rng = Awgn::new(0xa7);
+        let sigma = 0.03_f32; // ~+10 dB SNR
+        let mut audio: Vec<f32> = vec![0.0; n_samples];
+        for (i, &b) in burst.iter().enumerate() {
+            if i + 5_000 < audio.len() {
+                audio[i + 5_000] = b;
+            }
+        }
+        for s in audio.iter_mut() {
+            *s += sigma * rng.gaussian();
+        }
+        let s = diag_sync_stats(&audio, 1500.0);
+        eprintln!("[real preamble] ratio={:.1}", s.ratio);
+    }
+}
+
 #[test]
 fn noise_floor_short_buffer() {
     let n_samples = 12_000; // 1 s at 12 kHz
