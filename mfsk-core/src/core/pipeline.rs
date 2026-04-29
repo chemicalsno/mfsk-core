@@ -301,7 +301,11 @@ fn deinterleave_llr_set<P: Protocol>(set: &mut crate::core::llr::LlrSet) {
 /// permutation. Allocates one temporary `Vec<f32>` per call (per LLR
 /// variant); the cost is tiny next to BP/OSD.
 fn deinterleave_llr_vec(llr: &mut [f32], table: &[u16]) {
-    debug_assert_eq!(llr.len(), table.len(), "interleave table length must match LLR length");
+    debug_assert_eq!(
+        llr.len(),
+        table.len(),
+        "interleave table length must match LLR length"
+    );
     let original: Vec<f32> = llr.to_vec();
     for j in 0..llr.len() {
         llr[table[j] as usize] = original[j];
