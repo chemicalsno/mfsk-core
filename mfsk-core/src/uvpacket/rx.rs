@@ -146,6 +146,233 @@ pub fn decode_known_layout(
     )
 }
 
+/// AFC (automatic frequency control) options for SSB use.
+///
+/// On NFM the TX/RX share the same audio centre exactly so AFC
+/// is unnecessary. On SSB, VFO-dial mismatches shift the audio
+/// centre by ±50–100 Hz typically. AFC searches for the offset
+/// via FFT-based preamble-magnitude maximisation, then re-runs
+/// the demod at the corrected centre frequency.
+#[derive(Clone, Copy, Debug)]
+pub struct AfcOpts {
+    /// One-sided search range in Hz (so the total search window
+    /// is `±search_hz`). 200 Hz covers typical SSB VFO mismatch
+    /// worst-case without a meaningful CPU cost.
+    pub search_hz: f32,
+    /// FFT zero-pad length. 256 → 1200 / 256 = 4.69 Hz bin width.
+    pub fft_n: usize,
+}
+
+impl Default for AfcOpts {
+    fn default() -> Self {
+        Self {
+            search_hz: 200.0,
+            fft_n: 256,
+        }
+    }
+}
+
+/// Decode a uvpacket frame at a known location, with AFC and
+/// caller-supplied LDPC options.
+///
+/// Two-pass operation:
+///
+/// 1. Down-convert + matched-filter at the nominal
+///    `audio_centre_hz`. Find the best integer-sample preamble
+///    offset.
+/// 2. Compute an FFT over the 31 preamble-correlated samples
+///    (zero-padded to `afc_opts.fft_n`). The bin index maximising
+///    `|FFT[k]|²` within the `±search_hz` window gives the
+///    estimated frequency offset Δf. Parabolic peak refinement
+///    narrows Δf to within a fraction of a bin.
+/// 3. Re-run [`decode_known_layout_with_opts`] at
+///    `audio_centre_hz + Δf`.
+///
+/// Returns the decoded frame on success; otherwise the same
+/// `DecodeError` variants as `decode_known_layout_with_opts`. If
+/// AFC mis-estimates Δf (preamble below threshold), the FEC stage
+/// will surface as `FecFailed` / `Crc` / `LayoutMismatch` rather
+/// than a wrong-frame.
+pub fn decode_known_layout_with_afc(
+    audio: &[f32],
+    sample_offset: usize,
+    audio_centre_hz: f32,
+    mode: Mode,
+    n_blocks: u8,
+    fec_opts: &FecOpts,
+    afc_opts: &AfcOpts,
+) -> Result<DecodedFrame, DecodeError> {
+    let n_blocks_u = n_blocks as usize;
+    let block_ch_bits = mode.ch_bits_per_block();
+    debug_assert!(block_ch_bits.is_multiple_of(2));
+    let n_data_syms = n_blocks_u * block_ch_bits / 2;
+    let n_pilots = n_data_syms.div_ceil(PILOT_SYMBOL_INTERVAL - 1);
+    let total_syms = PREAMBLE_LEN + n_pilots + n_data_syms;
+    let needed_samples = total_syms * NSPS + RRC_LEN;
+
+    if sample_offset + needed_samples > audio.len() {
+        return Err(DecodeError::Truncated);
+    }
+
+    // Pass 1: down-convert + MF at nominal centre, find preamble.
+    let slice = &audio[sample_offset..sample_offset + needed_samples];
+    let mf_out = downconvert_and_matched_filter(slice, audio_centre_hz);
+
+    let radius = NSPS as isize;
+    let base = SYM_PEAK_OFFSET as isize;
+    let mut best_off = SYM_PEAK_OFFSET;
+    let mut best_mag2 = -1.0_f32;
+    for jitter in -radius..=radius {
+        let off = base + jitter;
+        if off < 0 {
+            continue;
+        }
+        let off = off as usize;
+        if off + (PREAMBLE_LEN - 1) * NSPS >= mf_out.len() {
+            continue;
+        }
+        let c = preamble_correlation(&mf_out, off);
+        let mag2 = c.norm_sqr();
+        if mag2 > best_mag2 {
+            best_mag2 = mag2;
+            best_off = off;
+        }
+    }
+
+    // FFT-based frequency-offset estimate. x_i = preamble-bit-
+    // corrected MF samples at chip positions. The peak of |FFT(x)|²
+    // sits at bin `k = round(Δf · fft_n / fs_sym)`.
+    let delta_hz = estimate_freq_offset_fft(&mf_out, best_off, afc_opts);
+
+    // Pass 2: redo full decode at corrected frequency.
+    decode_known_layout_with_opts(
+        audio,
+        sample_offset,
+        audio_centre_hz + delta_hz,
+        mode,
+        n_blocks,
+        fec_opts,
+    )
+}
+
+/// Public diagnostic version of [`estimate_freq_offset_fft`].
+/// Down-converts + matched-filters at `audio_centre_hz`, then
+/// returns the FFT-based Δf estimate. For tests only.
+pub fn diag_estimate_freq_offset(
+    audio: &[f32],
+    sample_offset: usize,
+    audio_centre_hz: f32,
+    needed_samples: usize,
+    afc_opts: &AfcOpts,
+) -> Option<f32> {
+    if sample_offset + needed_samples > audio.len() {
+        return None;
+    }
+    let slice = &audio[sample_offset..sample_offset + needed_samples];
+    let mf_out = downconvert_and_matched_filter(slice, audio_centre_hz);
+    let radius = NSPS as isize;
+    let base = SYM_PEAK_OFFSET as isize;
+    let mut best_off = SYM_PEAK_OFFSET;
+    let mut best_mag2 = -1.0_f32;
+    for jitter in -radius..=radius {
+        let off = base + jitter;
+        if off < 0 {
+            continue;
+        }
+        let off = off as usize;
+        if off + (PREAMBLE_LEN - 1) * NSPS >= mf_out.len() {
+            continue;
+        }
+        let c = preamble_correlation(&mf_out, off);
+        let mag2 = c.norm_sqr();
+        if mag2 > best_mag2 {
+            best_mag2 = mag2;
+            best_off = off;
+        }
+    }
+    Some(estimate_freq_offset_fft(&mf_out, best_off, afc_opts))
+}
+
+/// Estimate the carrier-frequency offset (in Hz) from the preamble.
+/// Returns 0.0 if FFT is not feasible (insufficient samples) or if
+/// the peak lies outside the `±search_hz` window.
+fn estimate_freq_offset_fft(mf_out: &[Complex32], best_off: usize, afc_opts: &AfcOpts) -> f32 {
+    use rustfft::FftPlanner;
+
+    if best_off + (PREAMBLE_LEN - 1) * NSPS >= mf_out.len() {
+        return 0.0;
+    }
+    let n = afc_opts.fft_n.max(PREAMBLE_LEN.next_power_of_two());
+
+    // Build the chip-rate sequence x_i = mf[best_off + i·NSPS] · s_i^*
+    // where s_i is the BPSK preamble symbol (±1, real). For a clean
+    // signal at frequency offset Δf, the x_i sequence has the form
+    // `A · e^{j·2π·Δf·i·T_sym} + noise`, so its DFT peaks at the
+    // bin nearest to Δf.
+    let mut buf: Vec<Complex32> = Vec::with_capacity(n);
+    for i in 0..PREAMBLE_LEN {
+        let pos = best_off + i * NSPS;
+        let s = if UVPACKET_PREAMBLE_BPSK_BITS[i] {
+            -1.0_f32
+        } else {
+            1.0
+        };
+        buf.push(mf_out[pos] * s);
+    }
+    buf.resize(n, Complex32::new(0.0, 0.0));
+
+    let mut planner = FftPlanner::<f32>::new();
+    let fft = planner.plan_fft_forward(n);
+    fft.process(&mut buf);
+
+    // Each bin k (in [0, n)) maps to frequency `k · fs_sym / n` (Hz)
+    // for k ≤ n/2, or `(k − n) · fs_sym / n` (negative) for k > n/2.
+    // Restrict the search to bins within ±search_hz.
+    let fs_sym = SAMPLE_RATE_HZ / NSPS as f32; // 1200 Hz
+    let bin_hz = fs_sym / n as f32;
+    let search_bins = (afc_opts.search_hz / bin_hz).floor() as usize;
+    let max_bin = search_bins.min(n / 2);
+
+    let mut best_k: i32 = 0;
+    let mut best_pow = -1.0_f32;
+    for k in 0..=max_bin {
+        let p = buf[k].norm_sqr();
+        if p > best_pow {
+            best_pow = p;
+            best_k = k as i32;
+        }
+        // Negative-frequency bin: n - k
+        if k > 0 {
+            let kn = n - k;
+            let p = buf[kn].norm_sqr();
+            if p > best_pow {
+                best_pow = p;
+                best_k = -(k as i32);
+            }
+        }
+    }
+
+    // Parabolic peak refinement on |FFT|² in the bin domain.
+    let k_idx = if best_k >= 0 {
+        best_k as usize
+    } else {
+        n - (-best_k) as usize
+    };
+    let k_minus = (k_idx + n - 1) % n;
+    let k_plus = (k_idx + 1) % n;
+    let m_minus = buf[k_minus].norm_sqr();
+    let m_zero = buf[k_idx].norm_sqr();
+    let m_plus = buf[k_plus].norm_sqr();
+    let denom = 2.0 * (m_plus - 2.0 * m_zero + m_minus);
+    let frac = if denom.abs() > 1e-9 {
+        ((m_minus - m_plus) / denom).clamp(-0.5, 0.5)
+    } else {
+        0.0
+    };
+
+    (best_k as f32 + frac) * bin_hz
+}
+
 /// Same as [`decode_known_layout`] but with caller-supplied LDPC
 /// options. Use this to opt into deeper OSD (~30× slower per
 /// decode but ~10–15 % better PER near threshold for the higher-
