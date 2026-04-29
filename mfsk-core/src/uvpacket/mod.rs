@@ -1,35 +1,66 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! # `uvpacket` — U/VHF NFM packet protocol family
+//! # `uvpacket` — applied example: a NFM-voice-channel packet protocol
 //!
-//! Four-mode 4-GFSK packet protocol designed for narrow-FM voice
-//! channels with private-group ham-radio messaging in mind. Targets
-//! channel conditions where AX.25 / AFSK 1200 fails (Rayleigh fading,
-//! weak signals, mountain operation), while matching or beating AFSK
-//! airtime in cleaner conditions.
+//! **Scope note.** This module is **not** a member of the WSJT-X
+//! mode family that the rest of `mfsk-core` ports. It is an in-tree
+//! *applied example* of how the FEC infrastructure
+//! ([`crate::fec::Ldpc240_101`], BP, OSD-2) can be reused outside
+//! that family. It targets a different design point — narrow-FM
+//! voice channels (HT/mobile, ~3 kHz audio passband) with private-
+//! group amateur-radio messaging — and consequently diverges from
+//! WSJT-X assumptions in almost every layer above the FEC:
 //!
-//! ## Sub-modes (all share modem + sync + FEC mother code)
+//! | Layer | WSJT-X family | uvpacket |
+//! |---|---|---|
+//! | Modulation | M-ary tone FSK / GFSK | single-carrier coherent **QPSK** + RRC |
+//! | Demod | non-coherent symbol-power detect | matched-filter + pilot-aided phase track |
+//! | Slot | 7.5 / 15 / 60 / 120 s | variable-length burst |
+//! | Sync | tone-index Costas blocks | 31-bit BPSK m-sequence preamble |
+//! | Message | structured (callsign + grid) | byte-pipe (`app_type` tag) |
+//! | TX/RX path | generic `mfsk-core` pipeline | bespoke ([`tx::encode`] / [`rx::decode`]) |
+//!
+//! What is **shared**: the LDPC mother code (`Ldpc240_101`, ported
+//! from FST4), the `FecCodec`/`FecOpts` API surface, and OSD-2
+//! soft-decoding. Everything else is uvpacket-local.
+//!
+//! ## Why this lives in-tree
+//!
+//! Splitting it into a sibling crate would add maintenance overhead
+//! disproportionate to the deliverable. Keeping it here lets the
+//! LDPC reuse story be demonstrated end-to-end without crate-
+//! boundary friction. The cost is that `Protocol::ID =
+//! ProtocolId::UvPacket` and the `ModulationParams` trait constants
+//! (`NTONES = 4`, `GFSK_BT`, `TONE_SPACING_HZ`, …) are
+//! **decorative** for this module — they exist only to satisfy the
+//! trait signature and the `protocol_invariants` checker, and are
+//! never consulted by the bespoke TX/RX paths. See
+//! [`mod@protocol`] for the explicit list.
+//!
+//! ## Sub-modes (all share modem + preamble + FEC mother code)
 //!
 //! - [`UvRobust`] — `Ldpc240_101` native rate 0.42, 1008 net bps.
-//!   Mountain / weak-signal mode; AFSK has no equivalent.
-//! - [`UvStandard`] — punctured to rate 1/2, 1200 net bps. AFSK 1200
-//!   throughput parity plus FEC.
-//! - [`UvFast`] — punctured to rate 2/3, 1600 net bps (+33 %).
-//! - [`UvExpress`] — punctured to rate 3/4, 1800 net bps (+50 %).
-//!   Headline-fast strong-signal mode; OSD-2 essentially mandatory.
+//!   Mountain / weak-signal posture.
+//! - [`UvStandard`] — punctured to rate 1/2, 1200 net bps. Throughput
+//!   parity with AFSK 1200, with FEC.
+//! - [`UvFast`] — rate 2/3, 1600 net bps (+33 %).
+//! - [`UvExpress`] — rate 3/4, 1800 net bps (+50 %). OSD-2 is
+//!   essentially mandatory at the BP threshold; viable only thanks to
+//!   kSR-greedy puncture-set selection.
 //!
 //! ## Modulation
 //!
-//! 4-GFSK at 1200 baud (10 samples/symbol at 12 kHz), tone spacing
-//! 600 Hz (h = 0.5), Gaussian shaping BT = 0.5, audio centre 1700 Hz.
-//! Tones land at 800 / 1400 / 2000 / 2600 Hz, fitting an NFM voice
-//! passband while clearing the 300–500 Hz HPF on cheap handhelds.
+//! Single-carrier coherent QPSK at 1200 baud (10 samples/symbol at
+//! 12 kHz), root-raised-cosine pulse (α = 0.5, span 6 sym), audio
+//! centre 1500 Hz. The QPSK constellation is Gray-mapped and the
+//! TX/RX paths use a 31-bit BPSK m-sequence preamble + periodic QPSK
+//! pilot symbols (one every 32 sym, ≈ 3 % overhead) for symbol
+//! timing, frame detection and decision-directed phase tracking.
 //!
 //! ## FEC
 //!
-//! Reuses the WSJT-X FST4 hand-tuned irregular `Ldpc240_101`
-//! ([`crate::fec::Ldpc240_101`]) as the rate-0.42 mother code. The
-//! three higher-rate sub-modes apply puncturing to the 139 parity
-//! bits.
+//! Reuses the WSJT-X FST4 hand-tuned irregular [`Ldpc240_101`] as
+//! the rate-0.42 mother code. The three higher-rate sub-modes apply
+//! kSR-greedy puncturing to the 139 parity bits.
 //!
 //! ## Frame structure
 //!
@@ -40,9 +71,6 @@
 //!   (4b) + sequence (5b) + CRC-16 (16b).
 //! - Block-interleaver across all codewords in the frame spreads
 //!   fade-burst erasures across every codeword.
-//! - Costas-4 sync (`[0, 1, 3, 2]`, FT4 reuse) prefixes each LDPC
-//!   block; the bespoke RX path stitches consecutive Costas-prefixed
-//!   blocks into a multi-block frame.
 //!
 //! ## Application API
 //!
@@ -52,12 +80,29 @@
 //!
 //! ```ignore
 //! use mfsk_core::uvpacket;
-//! let audio = uvpacket::tx::encode(&header, payload, 1700.0);
-//! let frames = uvpacket::rx::decode(&audio);
-//! for (app_type, bytes) in frames {
-//!     /* dispatch on app_type */
-//! }
+//! let audio = uvpacket::tx::encode(&header, payload, 1500.0);
+//! let frames = uvpacket::rx::decode(&audio, 1500.0);
+//! for f in frames { /* dispatch on f.app_type */ }
 //! ```
+//!
+//! ## Characterisation
+//!
+//! Phase 2'a / 2'b sweeps (commit `f590adf`, σ formula calibrated
+//! from per-burst signal power):
+//!
+//! - **AWGN**: 100 % PER at +8 dB Eb/N0_info across all four modes;
+//!   50 % PER at +4 dB. Matches QPSK + LDPC theory (~1–2 dB code
+//!   gain over uncoded QPSK).
+//! - **Rayleigh** (4-block, 20-byte payload, ≥ 90 % PER):
+//!   Robust/Standard at +12 dB / 1–5 Hz, +15 dB / 10 Hz Doppler;
+//!   Fast/Express at +15 dB across all Doppler.
+//!
+//! Representative WAV samples for ear-level inspection live at
+//! `audio_samples/uvpacket/` in the repository.
+//!
+//! See [`docs/UVPACKET.md`](https://github.com/jl1nie/mfsk-core/blob/main/docs/UVPACKET.md)
+//! for the full positioning narrative, AX.25 comparison, and
+//! rationale for the QPSK pivot.
 
 pub mod framing;
 pub mod interleaver;

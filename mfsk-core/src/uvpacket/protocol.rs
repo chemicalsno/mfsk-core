@@ -15,15 +15,25 @@
 //! bits, which lives outside the trait constants in
 //! [`crate::uvpacket::puncture`].
 //!
-//! ## Decorative trait constants
+//! ## Scope boundary: decorative trait constants
 //!
-//! [`ModulationParams`]'s `NTONES`, `TONE_SPACING_HZ`, `GFSK_BT`,
-//! and `GFSK_HMOD` are FSK-specific. uvpacket bypasses the
-//! generic mfsk-core pipeline (it has its own bespoke TX / RX
-//! paths) so these constants are only there to satisfy the trait
-//! signature and the `protocol_invariants` test. They are **not**
-//! consulted by [`crate::uvpacket::tx::encode`] or
+//! The `mfsk-core` `Protocol` trait surface was designed to express
+//! the WSJT-X family of M-ary tone-FSK modes. uvpacket lives at
+//! the boundary of that abstraction: it reuses the FEC layer but
+//! its modulation (single-carrier coherent QPSK + RRC) and demod
+//! (matched filter + pilot-aided phase track) bypass the generic
+//! mfsk-core TX / RX pipeline entirely. The natural consequence is
+//! that several `ModulationParams` constants — `NTONES = 4`,
+//! `TONE_SPACING_HZ`, `GFSK_BT`, `GFSK_HMOD` — are **decorative**
+//! for this module: they exist solely to satisfy the trait signature
+//! and the `protocol_invariants` test. They are **not** consulted
+//! by [`crate::uvpacket::tx::encode`] or
 //! [`crate::uvpacket::rx::decode_known_layout`].
+//!
+//! See [`crate::uvpacket`]'s module docs for the full scope-note
+//! table and the rationale for keeping uvpacket in-tree as an
+//! "applied example of FEC reuse" rather than a peer WSJT-family
+//! mode.
 //!
 //! | ZST            | rate | net bps (at 4-GFSK 2400 ch bps) | use |
 //! |----------------|-----:|--------------------------------:|-----|
