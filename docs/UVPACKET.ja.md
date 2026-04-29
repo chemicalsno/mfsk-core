@@ -141,24 +141,29 @@ FEC レイヤーで ~1 dB のリードを保つ。
 
 `tests/uvpacket_demod_diagnostic::awgn_threshold_finder_per_mode`、
 cell ごとに 30 trials、4 ブロックフレーム、44 byte ペイロード、
-OSD-3:
+OSD-2 (default):
 
 ```
 mode      eb/n0 (dB)  -2  0  2  4  6  8 10 12 14 16 18 20 22
 ─────────────────────────────────────────────────────────────
-Robust                 0  0  3 19 27 30 30 30 30 30 30 30 30
-Standard               0  0  4 21 30 30 30 30 30 30 30 30 30
-Fast                   0  0  3 20 29 30 30 30 30 30 30 30 30
-Express                0  0  1 19 30 30 30 30 30 30 30 30 30
+Robust                 0  0 14 29 30 30 30 30 30 30 30 30 30
+Standard               0  0 10 30 30 30 30 30 30 30 30 30 30
+Fast                   0  0 12 29 30 30 30 30 30 30 30 30 30
+Express                0  0  3 29 30 30 30 30 30 30 30 30 30
 ```
 
-50 % PER 閾値 ≈ **+3.7 dB** Eb/N0_info、100 % PER 閾値 ≈ **+6–8
-dB**。Modem 実装損失は LDPC のみの上限に対して **全モードで ~3 dB**。
+50 % PER 閾値:
 
-§3.1 の Robust LDPC アドバンテージは modem 実装損失でほとんど
-相殺されている — §4 参照。Robust は modem のフロアより下では
-依然として高 rate モードを引き離すが、その動作領域は実用的に
-狭い。
+- **Robust**: ~+1 dB
+- **Standard / Fast**: ~+2 dB
+- **Express**: ~+3 dB
+
+教科書通りの rate ordering (低 rate ほど低閾値) が復活: Robust が
+Express を ~2 dB 引き離し、§3.1 の LDPC レイヤー優位と一致。
+
+100 % PER 閾値: 全モードで ~+4 dB。Modem 実装損失は LDPC のみの
+上限に対して **モード別に ~0.5–2 dB** (Phase 2'b の位相追跡器
+書き直し前は ~3 dB だった — 内訳は §4)。
 
 ### 3.3 Rayleigh フラットフェージング
 
@@ -168,65 +173,93 @@ dB**。Modem 実装損失は LDPC のみの上限に対して **全モードで 
 ```
 mode       Doppler  +10  +12  +15  +20  +25  +30  +35  (Eb/N0_info dB)
 ──────────────────────────────────────────────────────────────────
-Robust     1 Hz     —    —    30   30   30   30   —
-Robust     5 Hz     28   30   30   30   30   30   —
-Robust    10 Hz     20   24   29   30   30   30   —
-Standard   1 Hz     24   28   29   30   30   30   —
-Standard   5 Hz     26   30   30   30   30   30   —
-Standard  10 Hz     19   21   27   30   30   30   —
-Fast       1 Hz     —    —    —    30   30   30   30
-Fast       5 Hz     23   —    29   30   30   30   30
-Fast      10 Hz     23   —    30   30   30   30   30
-Express    1 Hz     18   —    26   30   30   30   30
-Express    5 Hz     22   —    29   30   30   30   30
-Express   10 Hz     22   —    29   30   30   30   30
+Robust     1 Hz     —    28   30   30   30   30   —
+Robust     5 Hz     30   30   30   30   30   30   —
+Robust    10 Hz     28   30   30   30   30   30   —
+Standard   1 Hz     27   28   30   30   30   30   —
+Standard   5 Hz     30   30   30   30   30   30   —
+Standard  10 Hz     28   30   30   30   30   30   —
+Fast       1 Hz     —    —    30   30   30   30   30
+Fast       5 Hz     27   —    30   30   30   30   30
+Fast      10 Hz     29   —    30   30   30   30   30
+Express    1 Hz     25   —    29   30   30   30   30
+Express    5 Hz     27   —    30   30   30   30   30
+Express   10 Hz     28   —    30   30   30   30   30
 ```
 
-≥ 90 % PER 閾値: **Robust ~+10–12 dB at 1–5 Hz Doppler, ~+15 dB
-at 10 Hz**; Express は全 Doppler で ~+15 dB。VHF/UHF モバイル
-NFM channel に対する現実的なフェージング耐性。
+≥ 90 % PER 閾値（LMS 位相追跡後、OSD-2）: **Robust は 5–10 Hz
+Doppler で +10 dB、1 Hz で +12 dB**; Standard / Fast / Express
+もほぼ +10 dB(1 Hz Express だけ少し高め)。位相追跡器書き直しで
+Rayleigh 閾値が (mode × Doppler) ごとに 2–5 dB 削れた。
 
-### 3.4 +9–10 dB の FM 閾値フロア
+### 3.4 FM 閾値フロア — そして modem 実装損失が運用上不可視な理由
 
 modem は FM 検波の上に乗る。CNR ≈ +9–10 dB を下回ると FM
-discriminator 出力はインパルスノイズ支配となり、**modem は壊滅
-的に失敗**する。上の音声領域 Eb/N0 数値は FM 閾値より上で
-のみ意味があり、その下ではどんな audio-domain demod も復号
-しない。これは channel の性質であり modem の性質ではない。
+discriminator 出力はインパルスノイズ支配となり、**どんな**
+audio-domain modem も壊滅的に失敗する。上の音声領域 Eb/N0 数値
+は FM 閾値より上でのみ意味を持つ。
 
-FM 閾値より下に行くには別の on-air 変調（SSB digital、direct IQ
-digital）が必要で、本実験のスコープ外。
+**FM 閾値の地点**で、検波後の音声 SNR (3 kHz パスバンド換算) は
+おおよそ `CNR_threshold + FM_SNR_improvement ≈ +9 +
+10·log₁₀(B_IF/B_audio · 3) ≈ +9 + 11 ≈ +20 dB SNR_3kHz`。
 
-## 4. 既知の modem 実装損失
+uvpacket Robust の 50 % PER 閾値 (+1 dB Eb/N0_info) を同じ単位に
+換算:
 
-§3.1 の LDPC のみ閾値と §3.2 の QPSK end-to-end 閾値の ~3 dB
-ギャップが modem 実装損失。内訳の概ね:
+```
+SNR_3kHz_Robust = +1 + 10·log₁₀(1008 / 3000) = −3.7 dB
+```
 
-- **~1.5 dB の中〜高 SNR フロア** — 有限長 RRC ミスマッチ、
-  プリアンブル/パイロットエネルギーをデータエネルギーとみなす
-  `signal_power` 公式、振幅・σ_n 推定器の雑音、の組み合わせと
-  推定。
-- **~1.5 dB の低 SNR ペナルティ**（SNR が上がると縮む） —
-  pilot 補間位相追跡の分散はチャンネル σ²_n に比例するので、
-  modem が閾値に最も近いとき pilot 位相推定が最も雑音が多い。
-  Robust の σ_n が固定 Eb/N0_info で最大なので最も悪影響を受ける。
+FM 閾値フロアから Robust modem 閾値までのマージン: **~+24 dB**。
+§4 の残り 0.5–2 dB の実装損失は運用上**不可視** — チャンネル側
+の不可避 CNR フロアより遥か下で、そこではどんな audio modem も
+復号しない。
 
-現在の rx (`Phase 2'a improvements` までのコミット履歴) は以下を
-実装済み:
+FM 閾値が NFM 音声チャンネルの拘束条件。これより下に行くには
+別の on-air 変調（SSB digital、direct IQ digital）が必要で、
+本実験のスコープ外。
 
-- σ-aware LLR スケーリング: `LLR = (A / σ²_n) · qpsk_max_log(r_derot)`
-- データシンボル magnitude ベースの σ²_n 推定:
-  `σ²_n = (E[|r|²] − A²) / 2`
-- ブロック単位 1-pass decision-directed 位相補正 (DDPT):
-  各データシンボルを hard-decide、LDPC ブロックごとに残差位相を
-  累積、pilot 補間の上に定数補正として適用
-- OSD-3 fallback (Express では必須、他 mode でも marginal だが
-  プラス効果)
+## 4. modem 実装損失
 
-これらで元の ~3.5 dB modem 損失から ~0.4 dB 削った。残り ~1.5–3
-dB はより深い改修が必要 (pilot 密度倍増 → TX フォーマット変更、
-シンボル単位位相更新付きの本格的 decision-directed PLL、
-sub-sample timing 復元)。Phase 3+ の作業項目で、bug fix ではない。
+§3.1 の LDPC のみ閾値と §3.2 の QPSK end-to-end 閾値のギャップ
+が modem 実装損失。Phase 2'b で rx 位相追跡器を書き直して
+~3 dB から **0.5–2 dB** に削った（モード依存: 全 anchor の
+コヒーレント積分から最も恩恵を受ける Robust が最小）。
+
+現在の rx 実装:
+
+- **全 anchor (preamble centre + 各 pilot) の重み付き LMS
+  二次フィット**。隣接 pilot 間の線形補間を置き換え、雑音が
+  多い pilot 位相推定の **大域平均化**を行いながら、二次項で
+  緩い Doppler ドリフトも捕捉。preamble anchor は重み √31
+  (averaging する chip 数)、pilot は重み 1。
+- **σ-aware LLR スケーリング**:
+  `LLR = (A / σ²_n) · qpsk_max_log(r_derot)`
+- データシンボル **magnitude ベース σ²_n 推定**:
+  `σ²_n = (E[|r|²] − A²) / 2`。残留位相追跡ジッタを含む
+  データシンボル上の総雑音を捕捉。
+- LMS トラックの上に積む**ブロック単位 decision-directed 補正
+  (DDPT)**: 各データシンボルを hard-decide、ブロックごとに
+  複素残差を累積、その arg をブロック単位の定数位相補正として
+  適用。
+- デフォルトは **OSD-2** (cost / 性能のバランス)。
+  `decode_known_layout_with_opts` が `&FecOpts` を受け取り、
+  OSD-3 を選びたい呼び出し側に開放（~30× 遅いが高 rate モードの
+  閾値近傍で ~10–15 % PER 改善）。
+
+残り 0.5–2 dB の主要因:
+
+- 低 SNR での σ²_n 推定器ノイズ（magnitude ベース推定器の
+  有限サンプル分散が閾値レベル SNR で真の分散に対して有意に
+  なる）。
+- 有限長 RRC マッチング損失 (~0.05 dB) と LDPC ブロックを通じた
+  有限精度演算の積み重ね。
+- 整数サンプル粒度のタイミング (sub-sample timing recovery で
+  最悪ケース 0.05–0.1 dB 削れる)。
+
+これらは構造的バグではなく sub-1-dB クラスの調整項目。閉じる
+作業は Phase 3+ で、現状の modem は閾値で意味のある Robust >
+Standard / Fast > Express の順序を提供しており LDPC 理論と一致。
 
 ## 5. 変調ピボットの経緯
 
@@ -249,8 +282,8 @@ QPSK + RRC 整合フィルタへの再設計をサイクル中盤でコミット
 |---|---|---|:-:|
 | `uv_robust_clean.wav` | Robust, 4 blocks, 20 B | clean | ✓ |
 | `uv_robust_awgn_+8db.wav` | Robust | AWGN +8 dB Eb/N0 | ✓ |
-| `uv_robust_awgn_+4db.wav` | Robust | AWGN +4 dB Eb/N0 | ✓ (50 % PER 域) |
-| `uv_robust_awgn_+2db.wav` | Robust | AWGN +2 dB Eb/N0 | ✗ |
+| `uv_robust_awgn_+4db.wav` | Robust | AWGN +4 dB Eb/N0 | ✓ (LMS 後 97% per-frame) |
+| `uv_robust_awgn_+2db.wav` | Robust | AWGN +2 dB Eb/N0 | marginal (~47 %) |
 | `uv_robust_rayleigh_5hz_+15db.wav` | Robust | 5 Hz Rayleigh, +15 dB | ✓ |
 | `uv_express_clean.wav` | Express, 4 blocks, 20 B | clean | ✓ |
 

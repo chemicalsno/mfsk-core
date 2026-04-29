@@ -102,17 +102,55 @@ pub struct DecodedFrame {
     pub payload: Vec<u8>,
 }
 
+/// Default LDPC decode options for uvpacket.
+///
+/// `osd_depth = 2` gives a good cost / threshold-margin trade-off
+/// for the Robust / Standard / Fast modes. Express needs OSD-3 to
+/// hit its rated threshold reliably (the rate-3/4 puncturing pushes
+/// BP-only into the saturation region), so callers driving Express
+/// in fading channels may want to override via
+/// [`decode_known_layout_with_opts`].
+fn default_fec_opts() -> FecOpts<'static> {
+    FecOpts {
+        bp_max_iter: 50,
+        osd_depth: 2,
+        ap_mask: None,
+        verify_info: None,
+    }
+}
+
 /// Decode a uvpacket frame at a known location with known layout.
 ///
 /// `audio` is 12 kHz f32 PCM. `sample_offset` is the audio sample
 /// index of the *first* preamble sample (= start of TX burst).
 /// `audio_centre_hz` is the modem audio centre (typically 1500 Hz).
+///
+/// Uses [`default_fec_opts`] for the LDPC decode (BP 50 iter,
+/// OSD-2). Use [`decode_known_layout_with_opts`] to override —
+/// e.g. for Express in fading channels where OSD-3 helps, or for
+/// applications-specific verify hooks.
 pub fn decode_known_layout(
     audio: &[f32],
     sample_offset: usize,
     audio_centre_hz: f32,
     mode: Mode,
     n_blocks: u8,
+) -> Result<DecodedFrame, DecodeError> {
+    decode_known_layout_with_opts(audio, sample_offset, audio_centre_hz, mode, n_blocks, &default_fec_opts())
+}
+
+/// Same as [`decode_known_layout`] but with caller-supplied LDPC
+/// options. Use this to opt into deeper OSD (~30× slower per
+/// decode but ~10–15 % better PER near threshold for the higher-
+/// rate modes), to add `ap_mask` priors, or to plug in a
+/// `verify_info` hook.
+pub fn decode_known_layout_with_opts(
+    audio: &[f32],
+    sample_offset: usize,
+    audio_centre_hz: f32,
+    mode: Mode,
+    n_blocks: u8,
+    fec_opts: &FecOpts,
 ) -> Result<DecodedFrame, DecodeError> {
     let n_blocks_u = n_blocks as usize;
     let block_ch_bits = mode.ch_bits_per_block();
@@ -205,10 +243,57 @@ pub fn decode_known_layout(
         anchor_phase.push(unwrapped);
     }
 
+    // 4a-LMS. Replace the per-segment linear interp with a global
+    //        weighted least-squares quadratic fit over all anchors
+    //        (preamble centre + each pilot). The motivation is that
+    //        linear-interp-between-adjacent-pilots gives no global
+    //        averaging — each segment's phase is set by 2 noisy
+    //        pilots only. With ~16+ anchors per Robust 4-block burst
+    //        and a 3-coefficient quadratic, LSE delivers variance
+    //        reduction proportional to the number of anchors after
+    //        accounting for the basis dimension.
+    //
+    //        Fit: φ(t̂) ≈ c₀ + c₁·t̂ + c₂·t̂² where t̂ ∈ [0, 1]
+    //        is the symbol-index normalised to total_syms. The
+    //        preamble centre anchor is given high weight (31, the
+    //        number of chips it averages); each pilot has weight 1.
+    //
+    //        For pure AWGN the true phase is constant and the fit
+    //        absorbs the noise into c₀. For Doppler / Rayleigh the
+    //        quadratic captures slow drift; for fast Doppler the
+    //        per-block DDPT below adds the residual correction.
+    let lms_coeffs: Option<[f32; 3]> = if anchor_idx.len() >= 3 {
+        let n_total = total_syms.max(1) as f32;
+        let mut a_mat = [[0.0_f32; 3]; 3];
+        let mut a_vec = [0.0_f32; 3];
+        let weights: Vec<f32> = (0..anchor_idx.len())
+            .map(|k| if k == 0 { (PREAMBLE_LEN as f32).sqrt() } else { 1.0 })
+            .collect();
+        for k in 0..anchor_idx.len() {
+            let t = anchor_idx[k] as f32 / n_total;
+            let w = weights[k];
+            let row = [1.0, t, t * t];
+            for i in 0..3 {
+                for j in 0..3 {
+                    a_mat[i][j] += w * row[i] * row[j];
+                }
+                a_vec[i] += w * row[i] * anchor_phase[k];
+            }
+        }
+        solve_3x3(&a_mat, &a_vec)
+    } else {
+        None
+    };
+
+    // Effective phase function: use LMS fit if available, else fall
+    // back to linear interpolation. For numerical stability the LMS
+    // fit is evaluated on normalised t = idx / total_syms.
+    let total_syms_f = total_syms.max(1) as f32;
+
     // 4b. Decision-directed phase refinement. The pilot grid (every
-    //     32 sym) leaves significant phase-tracking residual on data
-    //     symbols at low SNR — that residual is the dominant modem
-    //     implementation loss (~1–2 dB at the threshold).
+    //     32 sym) leaves residual phase-tracking error on data
+    //     symbols even after LMS smoothing — DDPT collapses that
+    //     residual at the per-LDPC-block level.
     //
     //     One-pass DDPT: hard-decide each data symbol using the
     //     pilot-only phase track, then incorporate that decision as
@@ -240,7 +325,7 @@ pub fn decode_known_layout(
             if rel.is_multiple_of(PILOT_SYMBOL_INTERVAL) {
                 continue;
             }
-            let phase = interp_phase(&anchor_idx, &anchor_phase, i);
+            let phase = lms_phase(lms_coeffs, total_syms_f, &anchor_idx, &anchor_phase, i);
             let derot = symbols[i] * Complex32::from_polar(1.0, -phase);
             // Hard decide closest constellation point at amplitude 1
             // (we don't have `amplitude` yet; use unit constellation
@@ -316,7 +401,7 @@ pub fn decode_known_layout(
     // Preamble:
     for (i, &b) in UVPACKET_PREAMBLE_BPSK_BITS.iter().enumerate() {
         let expected = Complex32::new(if b { -1.0 } else { 1.0 }, 0.0);
-        let phase = interp_phase(&anchor_idx, &anchor_phase, i);
+        let phase = lms_phase(lms_coeffs, total_syms_f, &anchor_idx, &anchor_phase, i);
         let derot = symbols[i] * Complex32::from_polar(1.0, -phase);
         a_acc += derot.re * expected.re + derot.im * expected.im;
         a_norm += expected.norm_sqr();
@@ -327,7 +412,7 @@ pub fn decode_known_layout(
         if sym_pos >= total_syms {
             break;
         }
-        let phase = interp_phase(&anchor_idx, &anchor_phase, sym_pos);
+        let phase = lms_phase(lms_coeffs, total_syms_f, &anchor_idx, &anchor_phase, sym_pos);
         let derot = symbols[sym_pos] * Complex32::from_polar(1.0, -phase);
         a_acc += derot.re * pilot_ref.re + derot.im * pilot_ref.im;
         a_norm += pilot_ref.norm_sqr();
@@ -365,7 +450,7 @@ pub fn decode_known_layout(
                 continue;
             }
             let block_idx = data_running / block_data_syms;
-            let phase = interp_phase(&anchor_idx, &anchor_phase, i)
+            let phase = lms_phase(lms_coeffs, total_syms_f, &anchor_idx, &anchor_phase, i)
                 + block_dd_correction.get(block_idx).copied().unwrap_or(0.0);
             let derot = symbols[i] * Complex32::from_polar(1.0, -phase);
             data_mag_sq += derot.norm_sqr();
@@ -416,7 +501,7 @@ pub fn decode_known_layout(
             continue;
         }
         let block_idx = data_running / block_data_syms;
-        let phase = interp_phase(&anchor_idx, &anchor_phase, i)
+        let phase = lms_phase(lms_coeffs, total_syms_f, &anchor_idx, &anchor_phase, i)
             + block_dd_correction.get(block_idx).copied().unwrap_or(0.0);
         let derot = symbols[i] * Complex32::from_polar(1.0, -phase);
         let (llr_b1, llr_b0) = qpsk_llrs(derot);
@@ -435,17 +520,11 @@ pub fn decode_known_layout(
 
     // 7. De-puncture and LDPC-decode each block.
     let fec = Ldpc240_101;
-    let opts = FecOpts {
-        bp_max_iter: 50,
-        osd_depth: 3,
-        ap_mask: None,
-        verify_info: None,
-    };
     let mut decoded_info: Vec<Vec<u8>> = Vec::with_capacity(n_blocks_u);
     for block_llrs in &llrs_per_block {
         let full_llrs = de_puncture_llr(block_llrs, mode);
         let result = fec
-            .decode_soft(&full_llrs, &opts)
+            .decode_soft(&full_llrs, fec_opts)
             .ok_or(DecodeError::FecFailed)?;
         decoded_info.push(result.info);
     }
@@ -607,6 +686,46 @@ fn unwrap_phase(prev: f32, new: f32) -> f32 {
         delta += 2.0 * PI;
     }
     prev + delta
+}
+
+/// Solve a 3×3 linear system `A·x = b` by Cramer's rule. Returns
+/// `None` if the determinant is too close to zero (degenerate or
+/// near-degenerate anchor distribution).
+fn solve_3x3(a: &[[f32; 3]; 3], b: &[f32; 3]) -> Option<[f32; 3]> {
+    let det = a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1])
+        - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0])
+        + a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0]);
+    if det.abs() < 1e-9 {
+        return None;
+    }
+    let det_x = b[0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1])
+        - a[0][1] * (b[1] * a[2][2] - a[1][2] * b[2])
+        + a[0][2] * (b[1] * a[2][1] - a[1][1] * b[2]);
+    let det_y = a[0][0] * (b[1] * a[2][2] - a[1][2] * b[2])
+        - b[0] * (a[1][0] * a[2][2] - a[1][2] * a[2][0])
+        + a[0][2] * (a[1][0] * b[2] - b[1] * a[2][0]);
+    let det_z = a[0][0] * (a[1][1] * b[2] - b[1] * a[2][1])
+        - a[0][1] * (a[1][0] * b[2] - b[1] * a[2][0])
+        + b[0] * (a[1][0] * a[2][1] - a[1][1] * a[2][0]);
+    Some([det_x / det, det_y / det, det_z / det])
+}
+
+/// Evaluate the LMS-fitted quadratic phase at symbol index `sym_idx`,
+/// or fall back to linear interpolation if the LMS fit was not
+/// available (too few anchors).
+fn lms_phase(
+    coeffs: Option<[f32; 3]>,
+    total_syms_f: f32,
+    anchor_idx: &[usize],
+    anchor_phase: &[f32],
+    sym_idx: usize,
+) -> f32 {
+    if let Some(c) = coeffs {
+        let t = sym_idx as f32 / total_syms_f;
+        c[0] + c[1] * t + c[2] * t * t
+    } else {
+        interp_phase(anchor_idx, anchor_phase, sym_idx)
+    }
 }
 
 /// Linearly interpolate the per-symbol phase between phase anchors.

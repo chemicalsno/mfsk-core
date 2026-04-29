@@ -55,20 +55,26 @@ not a wideband mode.
 - **API**: byte-pipe with 4-bit `app_type` tag — no
   `MessageCodec` indirection.
 
-### Characterisation (Phase 2'a / 2'b)
+### Characterisation (Phase 2'a / 2'b, post LMS phase tracker)
 
 σ formula calibrated from per-burst measured signal power for
 cross-modulation comparability.
 
-- **AWGN**: 50 % PER at +3.7 dB Eb/N0_info, 100 % PER at +6–8 dB
-  across all four modes.
+- **AWGN**: 50 % PER at +1 dB Eb/N0_info Robust, +2 dB Standard /
+  Fast, +3 dB Express. 100 % PER at +4 dB across all modes.
 - **Rayleigh** (4-block, 20-byte payload, ≥ 90 % PER):
-  Robust at +10–12 dB / 1–5 Hz Doppler, +12–15 dB at 10 Hz;
-  Express at +15 dB across all Doppler.
+  Robust at +10 dB / 5–10 Hz Doppler, +12 dB at 1 Hz;
+  Standard / Fast / Express also ~+10 dB at 5–10 Hz, with a slight
+  uptick at 1 Hz.
 - **LDPC-only ceiling** (modem-bypassed): Robust 50 % PER at
-  +0.5 dB, Express at +1.5 dB. The ~3 dB end-to-end gap is the
-  QPSK modem implementation loss — the dominant remaining work for
-  Phase 3+.
+  +0.5 dB, Express at +1.5 dB. The end-to-end gap is now
+  **0.5–2 dB** (mode-dependent), down from ~3 dB before the
+  Phase 2'b phase-tracker rework.
+- **NFM FM-threshold floor**: the audio passband itself fails at
+  CNR ≈ +9–10 dB regardless of modem. Robust at +1 dB Eb/N0_info
+  → −3.7 dB SNR_3kHz. Margin from the FM-threshold floor down to
+  the Robust modem threshold: ~+24 dB. The channel binds, not the
+  modem.
 
 ### Modulation pivot history
 

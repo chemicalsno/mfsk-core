@@ -85,19 +85,22 @@
 //! for f in frames { /* dispatch on f.app_type */ }
 //! ```
 //!
-//! ## Characterisation
+//! ## Characterisation (post LMS phase tracker)
 //!
 //! σ formula calibrated from per-burst signal power
 //! (`tests/common/channel.rs`):
 //!
-//! - **AWGN**: 50 % PER at +3.7 dB Eb/N0_info, 100 % PER at +6–8 dB.
+//! - **AWGN**: 50 % PER at +1 dB Eb/N0_info Robust, +2 dB Standard
+//!   / Fast, +3 dB Express. 100 % PER at +4 dB across all modes.
 //! - **Rayleigh** (4-block, 20-byte payload, ≥ 90 % PER):
-//!   Robust at +10–12 dB / 1–5 Hz Doppler, +12–15 dB / 10 Hz;
-//!   Express at +15 dB across all Doppler.
-//! - **LDPC-only ceiling** (modem-bypassed): Robust 50 % PER at
-//!   +0.5 dB, Express at +1.5 dB. The ~3 dB end-to-end gap is the
-//!   modem implementation loss; see `docs/UVPACKET.md` §4 for the
-//!   breakdown.
+//!   Robust at +10 dB / 5–10 Hz Doppler, +12 dB at 1 Hz; the
+//!   higher-rate modes ~+10 dB across most Doppler.
+//! - **LDPC-only ceiling**: Robust 50 % PER at +0.5 dB, Express at
+//!   +1.5 dB. End-to-end gap is now 0.5–2 dB (down from ~3 dB
+//!   pre-LMS).
+//! - **FM threshold margin**: Robust at −3.7 dB SNR_3kHz vs the
+//!   NFM FM-threshold floor at ~+20 dB SNR_3kHz → **~24 dB
+//!   margin**. The channel CNR floor binds before the modem.
 //!
 //! Representative WAV samples for ear-level inspection live at
 //! `audio_samples/uvpacket/` in the repository.

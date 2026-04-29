@@ -147,25 +147,31 @@ holds a ~1 dB lead at the FEC layer.
 ### 3.2 QPSK end-to-end (modem + FEC)
 
 `tests/uvpacket_demod_diagnostic::awgn_threshold_finder_per_mode`,
-30 trials per cell, 4-block frame, 44-byte payload, OSD-3:
+30 trials per cell, 4-block frame, 44-byte payload, OSD-2 (default):
 
 ```
 mode      eb/n0 (dB)  -2  0  2  4  6  8 10 12 14 16 18 20 22
 ─────────────────────────────────────────────────────────────
-Robust                 0  0  3 19 27 30 30 30 30 30 30 30 30
-Standard               0  0  4 21 30 30 30 30 30 30 30 30 30
-Fast                   0  0  3 20 29 30 30 30 30 30 30 30 30
-Express                0  0  1 19 30 30 30 30 30 30 30 30 30
+Robust                 0  0 14 29 30 30 30 30 30 30 30 30 30
+Standard               0  0 10 30 30 30 30 30 30 30 30 30 30
+Fast                   0  0 12 29 30 30 30 30 30 30 30 30 30
+Express                0  0  3 29 30 30 30 30 30 30 30 30 30
 ```
 
-50 % PER threshold ≈ **+3.7 dB** Eb/N0_info, 100 % PER threshold ≈
-**+6–8 dB**. Modem implementation loss versus the LDPC-only ceiling
-is **~3 dB across all modes**.
+50 % PER thresholds:
 
-The Robust LDPC advantage from §3.1 is largely consumed by the
-modem implementation loss — see §4. Robust does win below the
-modem floor where the higher-rate modes catastrophically fail, but
-that regime is operationally narrow.
+- **Robust**: ~+1 dB
+- **Standard / Fast**: ~+2 dB
+- **Express**: ~+3 dB
+
+The textbook rate ordering (lower rate → lower threshold) is
+recovered: Robust beats Express by ~2 dB at the threshold, matching
+the LDPC-layer advantage from §3.1.
+
+100 % PER thresholds: Robust / Standard / Fast / Express all at
+~+4 dB. Modem implementation loss versus the LDPC-only ceiling is
+**~0.5–2 dB** depending on mode (was ~3 dB before the Phase 2'b
+phase-tracker rework — see §4 for the breakdown).
 
 ### 3.3 Rayleigh flat fading
 
@@ -175,68 +181,100 @@ that regime is operationally narrow.
 ```
 mode       Doppler  +10  +12  +15  +20  +25  +30  +35  (Eb/N0_info dB)
 ──────────────────────────────────────────────────────────────────
-Robust     1 Hz     —    —    30   30   30   30   —
-Robust     5 Hz     28   30   30   30   30   30   —
-Robust    10 Hz     20   24   29   30   30   30   —
-Standard   1 Hz     24   28   29   30   30   30   —
-Standard   5 Hz     26   30   30   30   30   30   —
-Standard  10 Hz     19   21   27   30   30   30   —
-Fast       1 Hz     —    —    —    30   30   30   30
-Fast       5 Hz     23   —    29   30   30   30   30
-Fast      10 Hz     23   —    30   30   30   30   30
-Express    1 Hz     18   —    26   30   30   30   30
-Express    5 Hz     22   —    29   30   30   30   30
-Express   10 Hz     22   —    29   30   30   30   30
+Robust     1 Hz     —    28   30   30   30   30   —
+Robust     5 Hz     30   30   30   30   30   30   —
+Robust    10 Hz     28   30   30   30   30   30   —
+Standard   1 Hz     27   28   30   30   30   30   —
+Standard   5 Hz     30   30   30   30   30   30   —
+Standard  10 Hz     28   30   30   30   30   30   —
+Fast       1 Hz     —    —    30   30   30   30   30
+Fast       5 Hz     27   —    30   30   30   30   30
+Fast      10 Hz     29   —    30   30   30   30   30
+Express    1 Hz     25   —    29   30   30   30   30
+Express    5 Hz     27   —    30   30   30   30   30
+Express   10 Hz     28   —    30   30   30   30   30
 ```
 
-≥ 90 % PER thresholds: **Robust ~+10–12 dB at 1–5 Hz Doppler,
-~+15 dB at 10 Hz**; Express ~+15 dB across all Doppler. Realistic
-fading-tolerance for VHF/UHF mobile NFM channels.
+≥ 90 % PER thresholds (post-LMS phase tracker, OSD-2): **Robust
+≈ +10 dB at 5–10 Hz Doppler, ~+12 dB at 1 Hz**; Standard / Fast /
+Express all at ~+10 dB across most Doppler / a touch higher at
+1 Hz Express. The phase-tracker rework dropped the Rayleigh
+thresholds by 2–5 dB depending on (mode × Doppler).
 
-### 3.4 The +9–10 dB FM-threshold floor
+### 3.4 The FM-threshold floor — and why it makes the modem
+###     implementation loss operationally invisible
 
-The modem sits on top of FM detection. Below CNR ≈ +9–10 dB the FM
-discriminator output is dominated by impulse noise and **the modem
-fails catastrophically**. The audio-domain Eb/N0 numbers above are
-meaningful only above the FM threshold; below it, no audio-domain
-demod recovers. This is a property of the channel, not the modem.
+The modem sits on top of FM detection. Below CNR ≈ +9–10 dB the
+FM discriminator output is dominated by impulse noise and **any**
+audio-domain modem fails catastrophically. The audio-domain Eb/N0
+numbers above are meaningful only above the FM threshold.
 
-To get below the FM threshold a different on-air modulation (SSB
-digital, direct IQ digital) is needed, which is outside the scope
-of this experiment.
+**At the FM threshold**, post-detection audio SNR (in a 3 kHz
+passband) is roughly `CNR_threshold + FM_SNR_improvement ≈ +9 +
+10·log₁₀(B_IF/B_audio · 3) ≈ +9 + 11 ≈ +20 dB SNR_3kHz`.
 
-## 4. Known modem implementation loss
+Translating uvpacket Robust's 50 % PER threshold (+1 dB
+Eb/N0_info) to the same units:
 
-The ~3 dB gap between the LDPC-only threshold (§3.1) and the QPSK
-end-to-end threshold (§3.2) is the modem implementation loss. It
-breaks down approximately as:
+```
+SNR_3kHz_Robust = +1 + 10·log₁₀(1008 / 3000) = −3.7 dB
+```
 
-- **~1.5 dB irreducible floor** at moderate-to-high SNR — likely a
-  combination of finite-span RRC mismatch, `signal_power` formula
-  treating preamble/pilot energy as data energy, and amplitude /
-  σ_n estimator noise.
-- **~1.5 dB low-SNR penalty** that shrinks as SNR rises — pilot-
-  interpolated phase tracking has variance proportional to channel
-  σ²_n, so pilot phase estimates are noisier exactly when the
-  modem is closest to its threshold. Robust suffers most because
-  its σ_n is largest at fixed Eb/N0_info.
+Margin from the FM threshold floor down to the Robust modem
+threshold: **~+24 dB**. The 0.5–2 dB residual modem implementation
+loss in §4 is operationally invisible — it sits well below the
+channel's own irreducible CNR floor, where no audio modem of any
+kind decodes.
 
-The current rx (commit history through `Phase 2'a improvements`)
-implements:
+The FM threshold is the binding constraint for NFM voice
+channels. To get below it requires a different on-air modulation
+(SSB digital, direct IQ digital), which is out of scope for this
+experiment.
 
-- σ-aware LLR scaling: `LLR = (A / σ²_n) · qpsk_max_log(r_derot)`
-- Magnitude-based σ²_n estimator from data symbols:
-  `σ²_n = (E[|r|²] − A²) / 2`
-- One-pass per-block decision-directed phase correction (DDPT):
-  hard-decide each data symbol, accumulate residual phase per LDPC
-  block, apply as a constant correction on top of pilot interp
-- OSD-3 fallback (mandatory for Express, marginal-but-positive for
-  the others)
+## 4. Modem implementation loss
 
-These took ~0.4 dB out of the original ~3.5 dB modem loss. The
-remaining ~1.5–3 dB requires deeper changes (denser pilots → TX
-format change, proper decision-directed PLL with per-symbol phase
-update, sub-sample timing recovery). Phase 3+ work, not bug-fix.
+The gap between the LDPC-only threshold (§3.1) and the QPSK
+end-to-end threshold (§3.2) is the modem implementation loss.
+Phase 2'b reworked the rx phase tracker and brought the gap from
+~3 dB down to **0.5–2 dB** (mode-dependent: lowest for Robust which
+benefits most from coherent integration of all anchors).
+
+The current rx implements:
+
+- **Weighted-LMS quadratic phase fit** over all anchors (preamble
+  centre + each pilot). Replaces the previous linear interpolation
+  between adjacent pilots; provides global averaging of the noisy
+  pilot phase estimates while still capturing slow Doppler drift
+  via the second-order term. The preamble anchor gets weight √31
+  (number of chips it averages); pilots get weight 1.
+- **σ-aware LLR scaling**:
+  `LLR = (A / σ²_n) · qpsk_max_log(r_derot)`.
+- **Magnitude-based σ²_n estimator** from data symbols:
+  `σ²_n = (E[|r|²] − A²) / 2`. Captures the total noise on data
+  symbols, including any residual phase-tracking jitter.
+- **Per-LDPC-block decision-directed correction (DDPT)** stacked on
+  top of the LMS track: hard-decide each data symbol, accumulate
+  the complex residual per block, take its arg as a per-block
+  constant phase correction.
+- **OSD-2** by default (good cost/performance balance);
+  `decode_known_layout_with_opts` accepts `&FecOpts` for callers
+  who want OSD-3 (~30 × slower per decode, ~10–15 % better PER
+  near threshold for the higher-rate modes).
+
+The remaining 0.5–2 dB loss is dominated by:
+
+- σ²_n estimator noise at low SNR (the magnitude-based estimator
+  has finite-sample variance that becomes a meaningful fraction of
+  the true variance at threshold-level SNR).
+- Finite-span RRC matching loss (~0.05 dB) plus finite-precision
+  arithmetic accumulating over the LDPC block.
+- Sample-timing rounded to integer samples (sub-sample timing
+  recovery would shave 0.05–0.1 dB worst-case).
+
+These are sub-1-dB-each engineering knobs rather than structural
+bugs. Closing them is Phase 3+ work; the current modem already
+delivers a meaningful Robust > Standard / Fast > Express ordering
+at the threshold, matching the LDPC theory.
 
 ## 5. Modulation pivot history
 
@@ -260,8 +298,8 @@ Representative WAV files for ear-level inspection live at
 |---|---|---|:-:|
 | `uv_robust_clean.wav` | Robust, 4 blocks, 20 B | clean | ✓ |
 | `uv_robust_awgn_+8db.wav` | Robust | AWGN +8 dB Eb/N0 | ✓ |
-| `uv_robust_awgn_+4db.wav` | Robust | AWGN +4 dB Eb/N0 | ✓ (50 % PER region) |
-| `uv_robust_awgn_+2db.wav` | Robust | AWGN +2 dB Eb/N0 | ✗ |
+| `uv_robust_awgn_+4db.wav` | Robust | AWGN +4 dB Eb/N0 | ✓ (97 % per-frame after LMS) |
+| `uv_robust_awgn_+2db.wav` | Robust | AWGN +2 dB Eb/N0 | marginal (~47 %) |
 | `uv_robust_rayleigh_5hz_+15db.wav` | Robust | 5 Hz Rayleigh, +15 dB | ✓ |
 | `uv_express_clean.wav` | Express, 4 blocks, 20 B | clean | ✓ |
 

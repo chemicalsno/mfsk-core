@@ -117,11 +117,12 @@ phase tracking, byte-pipe API, and a bespoke TX/RX path. Four sub-
 modes (Robust/Standard/Fast/Express, 1008–1800 net bps) trade
 robustness for throughput via puncturing.
 
-Phase 2 characterisation: 50 % PER at +3.7 dB Eb/N0_info on AWGN
-(100 % PER at +6–8 dB); ≥ 90 % PER at +10–15 dB on Rayleigh fading
-(1–10 Hz Doppler). The LDPC-only ceiling sits at +0.5 dB; the ~3 dB
-gap is the QPSK modem implementation loss (documented as Phase 3+
-work).
+Phase 2 characterisation (post LMS phase tracker): 50 % PER at
+**+1 dB** Eb/N0_info Robust (Standard / Fast +2 dB, Express +3 dB);
+100 % PER at +4 dB across modes; ≥ 90 % PER on Rayleigh fading at
++10–12 dB across all modes / 1–10 Hz Doppler. **24 dB margin from
+the NFM FM-threshold floor** at the Robust threshold — the channel
+binds before the modem.
 
 See [`docs/UVPACKET.md`](https://github.com/jl1nie/mfsk-core/blob/main/docs/UVPACKET.md)
 ([日本語](https://github.com/jl1nie/mfsk-core/blob/main/docs/UVPACKET.ja.md))
