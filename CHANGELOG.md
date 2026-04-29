@@ -1,5 +1,85 @@
 # Changelog
 
+## 0.3.1 — 2026-04-29
+
+Additive release on top of 0.3.0. Headline: the new `uvpacket`
+applied-example module — a coherent QPSK + LDPC packet protocol
+that fits inside an NFM voice passband (or SSB) and reuses the
+WSJT FST4 LDPC mother code. Built end-to-end through a
+modulation-pivot mid-cycle (initial 4-GFSK design failed
+orthogonality at h=0.5, replaced by single-carrier QPSK + RRC +
+m-sequence preamble + pilot phase tracking).
+
+WSJT-family modes (FT8/FT4/FST4/WSPR/JT9/JT65/Q65) are
+**unchanged** in this release. No breaking API changes.
+
+### Added
+
+- `mfsk-core::uvpacket` module (feature-gated `uvpacket`, off by
+  default). Four-mode rate ladder (Robust/Standard/Fast/Express,
+  1008–1800 net bps) with kSR-greedy puncture-set selection
+  (Ha–McLaughlin) on the `Ldpc240_101` mother code's parity bits.
+  Byte-pipe API (`app_type` 4-bit dispatch tag); bypasses the
+  generic `MessageCodec` to fit non-WSJT use cases.
+- TX (`uvpacket::tx::encode`): 31-bit BPSK m-sequence preamble
+  → QPSK Gray-mapped data + pilots every 32 sym → RRC pulse
+  shaping (α=0.5, span 6) → upconvert to 1500 Hz audio centre at
+  12 kHz sample rate.
+- RX (`uvpacket::rx::decode_known_layout` /
+  `decode_known_layout_with_opts` / `decode`): 2× downconvert →
+  matched filter → preamble correlation with parabolic sub-sample
+  timing recovery → weighted LMS quadratic phase fit over all
+  anchors (preamble centre + pilots) → magnitude-based σ²_n
+  estimator from data symbols → σ-aware QPSK soft demap →
+  per-LDPC-block decision-directed phase correction → BP+OSD-2
+  decode (override via `&FecOpts` for OSD-3 etc.).
+- AWGN + Rayleigh-flat-fading harness in
+  `tests/common/channel.rs`. `awgn_sigma_for_eb_n0_info` now
+  takes per-burst measured `signal_power` for cross-modulation-
+  comparable Eb/N0_info numbers.
+- Diagnostic test suites: `tests/uvpacket_ldpc_direct.rs`
+  (modem-bypassed LDPC threshold sweep) and
+  `tests/uvpacket_modem_diag.rs` (TX power audit, rx estimator
+  audit, demod-only BER vs theory sweep).
+- `mfsk-core/examples/uvpacket_samples.rs` — generates
+  representative WAV files at `audio_samples/uvpacket/`
+  (clean / +8 / +4 / +2 dB AWGN / 5 Hz Rayleigh / Express clean).
+- `docs/UVPACKET.md` + `docs/UVPACKET.ja.md` — design narrative,
+  characterisation tables (LDPC ceiling vs end-to-end), SNR
+  calibration history, FM-threshold-margin analysis, SSB
+  compatibility note.
+- `docs/RELEASE_NOTES_0.3.1.md`.
+
+### Characterisation
+
+All numbers are Eb/N0 per **information bit** (WSJT cross-mode-
+fair convention).
+
+- **AWGN, 50 % PER**: Robust +1 dB, Standard / Fast +2 dB,
+  Express +3 dB. 100 % PER at +4 dB across all modes.
+- **AWGN, LDPC-only ceiling** (modem-bypassed): Robust 50 % PER
+  at +0.5 dB, Express at +1.5 dB. End-to-end gap (modem
+  implementation loss): 0.5–2 dB depending on mode.
+- **Rayleigh, ≥ 90 % PER** (4-block, 20-byte payload): Robust at
+  +10 dB / 5–10 Hz Doppler, +12 dB at 1 Hz; the higher-rate modes
+  mostly +10 dB across.
+- **Operating envelope**: Robust at −3.7 dB SNR_3kHz vs the NFM
+  FM-threshold floor at ~+20 dB SNR_3kHz → ~24 dB margin. The
+  channel CNR floor binds before the modem on NFM. On SSB the
+  modem operates to its true threshold.
+
+### Known limitations
+
+- No automatic frequency control yet. SSB use requires both ends
+  to agree on `audio_centre_hz` to within ~10 Hz. AFC is planned
+  for a follow-up cycle.
+- `Protocol::ID = ProtocolId::UvPacket` and several
+  `ModulationParams` trait constants are decorative for uvpacket
+  (the module bypasses the generic mfsk-core TX/RX pipeline).
+  Documented as a scope-boundary trade-off in
+  `mfsk-core/src/uvpacket/protocol.rs` and `docs/LIBRARY.md`
+  §10.1 rather than spinning uvpacket out as a sibling crate.
+
 ## 0.3.0 — 2026-04-29
 
 Internal cleanup release that closes long-standing abstraction

@@ -157,6 +157,14 @@ pub static PROTOCOLS: &[ProtocolMeta] = &[
     protocol_meta!("Q65-60D", crate::q65::Q65d60),
     #[cfg(feature = "q65")]
     protocol_meta!("Q65-60E", crate::q65::Q65e60),
+    #[cfg(feature = "uvpacket")]
+    protocol_meta!("UvRobust", crate::UvRobust),
+    #[cfg(feature = "uvpacket")]
+    protocol_meta!("UvStandard", crate::UvStandard),
+    #[cfg(feature = "uvpacket")]
+    protocol_meta!("UvFast", crate::UvFast),
+    #[cfg(feature = "uvpacket")]
+    protocol_meta!("UvExpress", crate::UvExpress),
 ];
 
 /// Iterator over every registry entry sharing `id`. For most

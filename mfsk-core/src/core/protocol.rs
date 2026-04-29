@@ -38,6 +38,10 @@ pub enum ProtocolId {
     /// Multiple T/R-period × tone-spacing variants share this tag at the
     /// FFI level; the protocol-layer ZST disambiguates.
     Q65 = 7,
+    /// uvpacket — 4-GFSK packet protocol for narrow-FM voice channels
+    /// at U/VHF (Rayleigh-fading-tolerant). 4 sub-modes share this
+    /// family ID; the protocol-layer ZST disambiguates.
+    UvPacket = 8,
 }
 
 /// Baseband modulation parameters (tones, symbol rate, Gray mapping, Gaussian
