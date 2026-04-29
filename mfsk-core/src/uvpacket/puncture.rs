@@ -22,8 +22,8 @@
 //! 76 % of the mother code's 139 parity bits, respectively) — the
 //! WSJT-X authors did not design `Ldpc240_101` for puncturing, so
 //! decoder convergence at these rates is not given. The empirical
-//! AWGN sweep in [`tests::modes_awgn_sweep_uniform_vs_kSR`] and
-//! [`tests::experimental_rate_3_4`] characterises the per-mode
+//! AWGN sweep in `tests::modes_awgn_sweep_uniform_vs_kSR` and
+//! `tests::experimental_rate_3_4` characterises the per-mode
 //! behaviour and motivates the kSR-greedy puncture-set selection.
 //!
 //! Empirical findings (200-trial AWGN sweep, OSD-2 fallback):

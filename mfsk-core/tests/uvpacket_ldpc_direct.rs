@@ -112,7 +112,10 @@ fn direct_ldpc_clean_channel_decodes_every_mode() {
     let n = 10;
     for mode in [Mode::Robust, Mode::Standard, Mode::Fast, Mode::Express] {
         let decoded = per(mode, 30.0, n, 0xCAFE_BABE);
-        assert_eq!(decoded, n, "{mode:?}: clean direct-LDPC failed {decoded}/{n}");
+        assert_eq!(
+            decoded, n,
+            "{mode:?}: clean direct-LDPC failed {decoded}/{n}"
+        );
     }
 }
 

@@ -34,7 +34,10 @@ fn audio_envelope_matches_qpsk_rrc_assumptions() {
     let mean_sq = signal_power(&audio);
     let rms = mean_sq.sqrt();
     eprintln!("audio diag: peak={peak:.4}, rms={rms:.4}, mean_sq={mean_sq:.4}");
-    assert!(peak <= 1.05, "peak {peak} > 1.05 (TX peak-normalisation broke)");
+    assert!(
+        peak <= 1.05,
+        "peak {peak} > 1.05 (TX peak-normalisation broke)"
+    );
     // QPSK + RRC + 1500 Hz upconvert: empirically RMS ≈ 0.2 — 0.5
     // depending on payload-driven peak distribution. Anything outside
     // that range signals a TX wiring change.
@@ -54,8 +57,9 @@ fn awgn_threshold_finder_per_mode() {
     let n_trials = 30;
     let n_blocks = 4u8;
     let payload_size = 44; // full frame capacity
-    let eb_n0_grid: [f32; 13] =
-        [-2.0, 0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0, 18.0, 20.0, 22.0];
+    let eb_n0_grid: [f32; 13] = [
+        -2.0, 0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0, 18.0, 20.0, 22.0,
+    ];
 
     eprintln!("mode,eb_n0_db,decoded,total");
     for mode in [Mode::Robust, Mode::Standard, Mode::Fast, Mode::Express] {
@@ -75,7 +79,8 @@ fn awgn_threshold_finder_per_mode() {
                 let sigma = awgn_sigma_for_eb_n0_info(mode, eb_n0, signal_power(&audio));
                 let mut chan = AwgnChannel::new(sigma, 0xC0FFEE + trial as u64);
                 chan.apply(&mut audio);
-                if let Ok(frame) = rx::decode_known_layout(&audio, 0, AUDIO_CENTRE_HZ, mode, n_blocks)
+                if let Ok(frame) =
+                    rx::decode_known_layout(&audio, 0, AUDIO_CENTRE_HZ, mode, n_blocks)
                     && frame.payload[..payload_size] == payload[..]
                 {
                     decoded += 1;

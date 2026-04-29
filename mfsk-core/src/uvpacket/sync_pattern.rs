@@ -101,10 +101,7 @@ mod tests {
     /// "almost balanced" property of maximum-length sequences.
     #[test]
     fn preamble_has_balanced_one_count() {
-        let ones = UVPACKET_PREAMBLE_BPSK_BITS
-            .iter()
-            .filter(|&&b| b)
-            .count();
+        let ones = UVPACKET_PREAMBLE_BPSK_BITS.iter().filter(|&&b| b).count();
         assert_eq!(ones, 16);
         assert_eq!(PREAMBLE_LEN - ones, 15);
     }

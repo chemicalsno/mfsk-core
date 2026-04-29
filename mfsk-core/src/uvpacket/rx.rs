@@ -125,10 +125,10 @@ fn default_fec_opts() -> FecOpts<'static> {
 /// index of the *first* preamble sample (= start of TX burst).
 /// `audio_centre_hz` is the modem audio centre (typically 1500 Hz).
 ///
-/// Uses [`default_fec_opts`] for the LDPC decode (BP 50 iter,
-/// OSD-2). Use [`decode_known_layout_with_opts`] to override —
-/// e.g. for Express in fading channels where OSD-3 helps, or for
-/// applications-specific verify hooks.
+/// Uses default LDPC options (BP 50 iter, OSD-2). Use
+/// [`decode_known_layout_with_opts`] to override — e.g. for Express
+/// in fading channels where OSD-3 helps, or for application-specific
+/// `verify_info` hooks.
 pub fn decode_known_layout(
     audio: &[f32],
     sample_offset: usize,
@@ -136,7 +136,14 @@ pub fn decode_known_layout(
     mode: Mode,
     n_blocks: u8,
 ) -> Result<DecodedFrame, DecodeError> {
-    decode_known_layout_with_opts(audio, sample_offset, audio_centre_hz, mode, n_blocks, &default_fec_opts())
+    decode_known_layout_with_opts(
+        audio,
+        sample_offset,
+        audio_centre_hz,
+        mode,
+        n_blocks,
+        &default_fec_opts(),
+    )
 }
 
 /// Same as [`decode_known_layout`] but with caller-supplied LDPC
@@ -208,8 +215,7 @@ pub fn decode_known_layout_with_opts(
     //     low SNR) shaves a final 0.05–0.1 dB off the worst-case
     //     symbol-amplitude loss from `g(t)` mismatch.
     let frac_off: f32 = {
-        let need_minus = best_off > 0
-            && (best_off - 1) + (PREAMBLE_LEN - 1) * NSPS < mf_out.len();
+        let need_minus = best_off > 0 && (best_off - 1) + (PREAMBLE_LEN - 1) * NSPS < mf_out.len();
         let need_plus = (best_off + 1) + (PREAMBLE_LEN - 1) * NSPS < mf_out.len();
         if need_minus && need_plus {
             let m_minus = preamble_correlation(&mf_out, best_off - 1).norm_sqr();
@@ -306,7 +312,13 @@ pub fn decode_known_layout_with_opts(
         let mut a_mat = [[0.0_f32; 3]; 3];
         let mut a_vec = [0.0_f32; 3];
         let weights: Vec<f32> = (0..anchor_idx.len())
-            .map(|k| if k == 0 { (PREAMBLE_LEN as f32).sqrt() } else { 1.0 })
+            .map(|k| {
+                if k == 0 {
+                    (PREAMBLE_LEN as f32).sqrt()
+                } else {
+                    1.0
+                }
+            })
             .collect();
         for k in 0..anchor_idx.len() {
             let t = anchor_idx[k] as f32 / n_total;
@@ -451,16 +463,18 @@ pub fn decode_known_layout_with_opts(
         if sym_pos >= total_syms {
             break;
         }
-        let phase = lms_phase(lms_coeffs, total_syms_f, &anchor_idx, &anchor_phase, sym_pos);
+        let phase = lms_phase(
+            lms_coeffs,
+            total_syms_f,
+            &anchor_idx,
+            &anchor_phase,
+            sym_pos,
+        );
         let derot = symbols[sym_pos] * Complex32::from_polar(1.0, -phase);
         a_acc += derot.re * pilot_ref.re + derot.im * pilot_ref.im;
         a_norm += pilot_ref.norm_sqr();
     }
-    let amplitude = if a_norm > 0.0 {
-        a_acc / a_norm
-    } else {
-        1.0
-    };
+    let amplitude = if a_norm > 0.0 { a_acc / a_norm } else { 1.0 };
     let amplitude = amplitude.max(1e-6); // guard against pathological cases
 
     // σ²_n estimation: use the **data-symbol magnitude variance**
@@ -821,9 +835,7 @@ pub fn decode(audio: &[f32], audio_centre_hz: f32) -> Vec<DecodedFrame> {
     let mf_out = downconvert_and_matched_filter(audio, audio_centre_hz);
     // Compute |⟨preamble, mf_out⟩|² across every starting offset that
     // can fit a full preamble correlation.
-    let max_corr_offset = mf_out
-        .len()
-        .saturating_sub((PREAMBLE_LEN - 1) * NSPS + 1);
+    let max_corr_offset = mf_out.len().saturating_sub((PREAMBLE_LEN - 1) * NSPS + 1);
     if max_corr_offset == 0 {
         return Vec::new();
     }
@@ -1000,9 +1012,7 @@ mod tests {
         assert!(
             matches!(
                 err,
-                DecodeError::FecFailed
-                    | DecodeError::Crc(_)
-                    | DecodeError::LayoutMismatch { .. }
+                DecodeError::FecFailed | DecodeError::Crc(_) | DecodeError::LayoutMismatch { .. }
             ),
             "expected FecFailed / Crc / LayoutMismatch, got {err:?}",
         );

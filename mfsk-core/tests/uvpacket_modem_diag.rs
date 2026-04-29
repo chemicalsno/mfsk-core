@@ -10,6 +10,11 @@
 //! at the FEC layer; the QPSK pipeline must be eating that gain.
 
 #![cfg(feature = "uvpacket")]
+// Diagnostic loops index `symbols[i]` deliberately — the algorithm
+// reasons in absolute symbol-index positions (preamble vs pilot vs
+// data, symbol-index → block-index mapping). enumerate() obscures
+// the intent here.
+#![allow(clippy::needless_range_loop)]
 
 use std::f32::consts::PI;
 
@@ -18,12 +23,12 @@ use num_complex::Complex32;
 use mfsk_core::core::FecCodec;
 use mfsk_core::fec::Ldpc240_101;
 use mfsk_core::uvpacket::framing::FrameHeader;
+use mfsk_core::uvpacket::framing::{HEADER_BYTES, INFO_BYTES_PER_BLOCK, pack_to_size};
 use mfsk_core::uvpacket::interleaver::interleave;
 use mfsk_core::uvpacket::puncture::puncture;
 use mfsk_core::uvpacket::sync_pattern::{
     PILOT_SYMBOL_INTERVAL, PREAMBLE_LEN, UVPACKET_PREAMBLE_BPSK_BITS,
 };
-use mfsk_core::uvpacket::framing::{HEADER_BYTES, INFO_BYTES_PER_BLOCK, pack_to_size};
 use mfsk_core::uvpacket::{AUDIO_CENTRE_HZ, Mode, tx};
 
 const N_LDPC: usize = 240;
@@ -54,7 +59,8 @@ fn expected_channel_bits(header: &FrameHeader, payload: &[u8]) -> Vec<u8> {
     let mut codeword_buf = vec![0u8; N_LDPC];
     let mut concat = Vec::with_capacity(n_blocks * N_LDPC);
     for block_idx in 0..n_blocks {
-        let chunk = &frame_data[block_idx * INFO_BYTES_PER_BLOCK..(block_idx + 1) * INFO_BYTES_PER_BLOCK];
+        let chunk =
+            &frame_data[block_idx * INFO_BYTES_PER_BLOCK..(block_idx + 1) * INFO_BYTES_PER_BLOCK];
         for (byte_idx, &byte) in chunk.iter().enumerate() {
             for bit_idx in 0..8 {
                 info_buf[byte_idx * 8 + bit_idx] = (byte >> (7 - bit_idx)) & 1;
@@ -63,7 +69,11 @@ fn expected_channel_bits(header: &FrameHeader, payload: &[u8]) -> Vec<u8> {
         let chunk_offset = HEADER_CHUNK_BITS * (block_idx % HEADER_SPREAD_PERIOD);
         for cb in 0..HEADER_CHUNK_BITS {
             let h_idx = chunk_offset + cb;
-            info_buf[PAYLOAD_BITS_PER_BLOCK + cb] = if h_idx < HEADER_BITS { header_bits[h_idx] } else { 0 };
+            info_buf[PAYLOAD_BITS_PER_BLOCK + cb] = if h_idx < HEADER_BITS {
+                header_bits[h_idx]
+            } else {
+                0
+            };
         }
         fec.encode(&info_buf, &mut codeword_buf);
         concat.extend_from_slice(&codeword_buf);
@@ -103,7 +113,12 @@ fn signal_power_per_data_symbol_audit() {
     );
     let mut e_per_sym: Vec<f32> = Vec::new();
     for mode in ALL_MODES {
-        let header = FrameHeader { mode, block_count: n_blocks, app_type: 0, sequence: 0 };
+        let header = FrameHeader {
+            mode,
+            block_count: n_blocks,
+            app_type: 0,
+            sequence: 0,
+        };
         let audio = tx::encode(&header, &payload, AUDIO_CENTRE_HZ).unwrap();
         let peak = audio.iter().map(|s| s.abs()).fold(0.0_f32, f32::max);
         let mean_sq = signal_power(&audio);
@@ -214,7 +229,12 @@ fn rx_estimator_audit_at_eb_n0_4db() {
         "mode", "sigma_in", "sigma_mf", "A_hat", "sn_hat", "sn_data", "ratio"
     );
     for mode in ALL_MODES {
-        let header = FrameHeader { mode, block_count: n_blocks, app_type: 0, sequence: 0 };
+        let header = FrameHeader {
+            mode,
+            block_count: n_blocks,
+            app_type: 0,
+            sequence: 0,
+        };
         let mut audio = tx::encode(&header, &payload, AUDIO_CENTRE_HZ).unwrap();
         let sp = signal_power(&audio);
         let sigma_in = awgn_sigma_for_eb_n0_info(mode, eb_n0, sp);
@@ -359,11 +379,7 @@ fn rx_estimator_audit_at_eb_n0_4db() {
                 .iter()
                 .map(|c| ((derot - c).norm_sqr(), *c))
                 .fold((f32::INFINITY, candidates[0]), |(b, bc), (d, c)| {
-                    if d < b {
-                        (d, c)
-                    } else {
-                        (b, bc)
-                    }
+                    if d < b { (d, c) } else { (b, bc) }
                 });
             let r = derot - best;
             data_sn_sq += r.norm_sqr();
@@ -417,7 +433,12 @@ fn demod_only_ber_per_mode() {
             let payload: Vec<u8> = (0..payload_size)
                 .map(|i| ((i + trial) ^ 0xA5) as u8)
                 .collect();
-            let header = FrameHeader { mode, block_count: n_blocks, app_type: 0, sequence: 0 };
+            let header = FrameHeader {
+                mode,
+                block_count: n_blocks,
+                app_type: 0,
+                sequence: 0,
+            };
             let truth_bits = expected_channel_bits(&header, &payload);
 
             let mut audio = tx::encode(&header, &payload, AUDIO_CENTRE_HZ).unwrap();
@@ -524,11 +545,7 @@ fn demod_only_ber_per_mode() {
                         .iter()
                         .map(|&c| ((derot - c).norm_sqr(), c))
                         .fold((f32::INFINITY, candidates[0]), |(b, bc), (d, c)| {
-                            if d < b {
-                                (d, c)
-                            } else {
-                                (b, bc)
-                            }
+                            if d < b { (d, c) } else { (b, bc) }
                         });
                     let block_idx = data_running / block_data_syms;
                     block_resid[block_idx] += derot * best_c.conj();
@@ -589,8 +606,15 @@ fn demod_only_ber_per_mode() {
         let q_arg = (2.0 * r_code * gamma).sqrt();
         // Q(x) = 0.5·erfc(x/√2)
         let ber_thy = 0.5 * erfc(q_arg / 2.0_f32.sqrt());
-        let ratio_db = if ber_thy > 0.0 { 10.0 * (ber / ber_thy).log10() } else { 0.0 };
-        eprintln!("{:>10?}  {:>10.4e}  {:>10.4e}  {:>+10.2}", mode, ber, ber_thy, ratio_db);
+        let ratio_db = if ber_thy > 0.0 {
+            10.0 * (ber / ber_thy).log10()
+        } else {
+            0.0
+        };
+        eprintln!(
+            "{:>10?}  {:>10.4e}  {:>10.4e}  {:>+10.2}",
+            mode, ber, ber_thy, ratio_db
+        );
     }
 }
 
@@ -604,14 +628,24 @@ fn demod_only_ber_sweep() {
     let payload_size = 44;
     let grid: [f32; 8] = [0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 14.0, 20.0];
 
-    eprintln!("{:>10} {:>6} {:>10} {:>10} {:>9}", "mode", "eb_n0", "ber_meas", "ber_thy", "loss_dB");
+    eprintln!(
+        "{:>10} {:>6} {:>10} {:>10} {:>9}",
+        "mode", "eb_n0", "ber_meas", "ber_thy", "loss_dB"
+    );
     for mode in ALL_MODES {
         for &eb_n0 in &grid {
             let mut total_bits: usize = 0;
             let mut bit_errors: usize = 0;
             for trial in 0..n_trials {
-                let payload: Vec<u8> = (0..payload_size).map(|i| ((i + trial) ^ 0xA5) as u8).collect();
-                let header = FrameHeader { mode, block_count: n_blocks, app_type: 0, sequence: 0 };
+                let payload: Vec<u8> = (0..payload_size)
+                    .map(|i| ((i + trial) ^ 0xA5) as u8)
+                    .collect();
+                let header = FrameHeader {
+                    mode,
+                    block_count: n_blocks,
+                    app_type: 0,
+                    sequence: 0,
+                };
                 let truth_bits = expected_channel_bits(&header, &payload);
                 let mut audio = tx::encode(&header, &payload, AUDIO_CENTRE_HZ).unwrap();
                 let sp = signal_power(&audio);
@@ -626,9 +660,13 @@ fn demod_only_ber_sweep() {
                 let mut best_m2 = -1.0_f32;
                 for j in -radius..=radius {
                     let off = base + j;
-                    if off < 0 { continue; }
+                    if off < 0 {
+                        continue;
+                    }
                     let off = off as usize;
-                    if off + (PREAMBLE_LEN - 1) * NSPS >= mf.len() { continue; }
+                    if off + (PREAMBLE_LEN - 1) * NSPS >= mf.len() {
+                        continue;
+                    }
                     let mut acc = Complex32::new(0.0, 0.0);
                     for (i, &b) in UVPACKET_PREAMBLE_BPSK_BITS.iter().enumerate() {
                         let s = if b { -1.0_f32 } else { 1.0 };
@@ -645,31 +683,47 @@ fn demod_only_ber_sweep() {
                 let n_pilots = n_data_syms.div_ceil(PILOT_SYMBOL_INTERVAL - 1);
                 let total_syms = PREAMBLE_LEN + n_pilots + n_data_syms;
                 let mut symbols: Vec<Complex32> = Vec::with_capacity(total_syms);
-                for i in 0..total_syms { symbols.push(mf[best_off + i * NSPS]); }
+                for i in 0..total_syms {
+                    symbols.push(mf[best_off + i * NSPS]);
+                }
                 let pilot_ref = Complex32::new(1.0, 0.0);
                 let preamble_centre = (PREAMBLE_LEN - 1) / 2;
                 let mut anchor_idx = vec![preamble_centre];
                 let mut anchor_phase = vec![best_corr.arg()];
                 for k in 0..n_pilots {
                     let pos = PREAMBLE_LEN + k * PILOT_SYMBOL_INTERVAL;
-                    if pos >= total_syms { break; }
+                    if pos >= total_syms {
+                        break;
+                    }
                     let r = symbols[pos];
                     let phase = (r * pilot_ref.conj()).arg();
                     let prev = *anchor_phase.last().unwrap();
                     let mut delta = phase - prev;
-                    while delta > PI { delta -= 2.0 * PI; }
-                    while delta < -PI { delta += 2.0 * PI; }
+                    while delta > PI {
+                        delta -= 2.0 * PI;
+                    }
+                    while delta < -PI {
+                        delta += 2.0 * PI;
+                    }
                     anchor_idx.push(pos);
                     anchor_phase.push(prev + delta);
                 }
                 let interp = |idx: usize| -> f32 {
-                    if idx <= anchor_idx[0] { return anchor_phase[0]; }
+                    if idx <= anchor_idx[0] {
+                        return anchor_phase[0];
+                    }
                     let last = anchor_idx.len() - 1;
-                    if idx >= anchor_idx[last] { return anchor_phase[last]; }
+                    if idx >= anchor_idx[last] {
+                        return anchor_phase[last];
+                    }
                     let mut k = 0;
-                    while k + 1 < anchor_idx.len() && anchor_idx[k + 1] < idx { k += 1; }
-                    let i0 = anchor_idx[k] as f32; let i1 = anchor_idx[k + 1] as f32;
-                    let p0 = anchor_phase[k]; let p1 = anchor_phase[k + 1];
+                    while k + 1 < anchor_idx.len() && anchor_idx[k + 1] < idx {
+                        k += 1;
+                    }
+                    let i0 = anchor_idx[k] as f32;
+                    let i1 = anchor_idx[k + 1] as f32;
+                    let p0 = anchor_phase[k];
+                    let p1 = anchor_phase[k + 1];
                     let t = (idx as f32 - i0) / (i1 - i0);
                     p0 + t * (p1 - p0)
                 };
@@ -678,17 +732,23 @@ fn demod_only_ber_sweep() {
                 let mut data_count = 0_usize;
                 for i in PREAMBLE_LEN..total_syms {
                     let rel = i - PREAMBLE_LEN;
-                    if rel.is_multiple_of(PILOT_SYMBOL_INTERVAL) { continue; }
+                    if rel.is_multiple_of(PILOT_SYMBOL_INTERVAL) {
+                        continue;
+                    }
                     let derot = symbols[i] * Complex32::from_polar(1.0, -interp(i));
                     let llr_b1 = -(derot.re + derot.im);
                     let llr_b0 = derot.im.max(-derot.re) - derot.re.max(-derot.im);
                     data_bits.push(if llr_b1 > 0.0 { 1 } else { 0 });
                     data_bits.push(if llr_b0 > 0.0 { 1 } else { 0 });
                     data_count += 1;
-                    if data_count >= n_data_syms { break; }
+                    if data_count >= n_data_syms {
+                        break;
+                    }
                 }
                 for (a, b) in truth_bits.iter().zip(data_bits.iter()) {
-                    if a != b { bit_errors += 1; }
+                    if a != b {
+                        bit_errors += 1;
+                    }
                     total_bits += 1;
                 }
             }
@@ -707,7 +767,10 @@ fn demod_only_ber_sweep() {
             } else {
                 0.0
             };
-            eprintln!("{:>10?} {:+6.1} {:>10.3e} {:>10.3e} {:+9.2}", mode, eb_n0, ber, ber_thy, loss_db);
+            eprintln!(
+                "{:>10?} {:+6.1} {:>10.3e} {:>10.3e} {:+9.2}",
+                mode, eb_n0, ber, ber_thy, loss_db
+            );
         }
     }
 }
@@ -722,7 +785,11 @@ fn qinv(p: f32) -> f32 {
     for _ in 0..40 {
         let mid = 0.5 * (lo + hi);
         let q = 0.5 * erfc(mid / 2.0_f32.sqrt());
-        if q > p { lo = mid; } else { hi = mid; }
+        if q > p {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
     }
     0.5 * (lo + hi)
 }
@@ -731,10 +798,10 @@ fn qinv(p: f32) -> f32 {
 fn erfc(x: f32) -> f32 {
     let sign = if x < 0.0 { -1.0 } else { 1.0 };
     let x = x.abs();
-    let t = 1.0 / (1.0 + 0.3275911 * x);
-    let y = 1.0
-        - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t
-            + 0.254829592)
+    let t = 1.0_f32 / (1.0 + 0.327_591_1 * x);
+    let y = 1.0_f32
+        - (((((1.061_405_4 * t - 1.453_152) * t) + 1.421_413_8) * t - 0.284_496_74) * t
+            + 0.254_829_6)
             * t
             * (-x * x).exp();
     1.0 - sign * y

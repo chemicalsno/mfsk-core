@@ -143,7 +143,10 @@ fn pad_with_silence(burst: &[f32]) -> Vec<f32> {
 fn write_wav(path: &Path, samples: &[f32]) -> std::io::Result<()> {
     // Normalise to peak ≤ 0.95 of full-scale i16 so noisy bursts
     // don't clip at ±1.0 envelope spikes.
-    let peak = samples.iter().fold(0.0_f32, |a, &s| a.max(s.abs())).max(1e-9);
+    let peak = samples
+        .iter()
+        .fold(0.0_f32, |a, &s| a.max(s.abs()))
+        .max(1e-9);
     let scale = 0.95 / peak * f32::from(i16::MAX);
     let pcm: Vec<i16> = samples
         .iter()
@@ -208,13 +211,19 @@ fn main() -> std::io::Result<()> {
         let audio = pad_with_silence(&burst);
         let path = out_dir.join("uv_robust_clean.wav");
         write_wav(&path, &audio)?;
-        eprintln!("  {} ({} samples, {:.2} s)", path.display(), audio.len(), audio.len() as f32 / SAMPLE_RATE as f32);
+        eprintln!(
+            "  {} ({} samples, {:.2} s)",
+            path.display(),
+            audio.len(),
+            audio.len() as f32 / SAMPLE_RATE as f32
+        );
     }
 
     // 2. Robust @ +8 dB AWGN (= clean-decode threshold per Phase 2'a).
     for eb_n0 in [8.0_f32, 4.0, 2.0] {
         let header = typical_header(Mode::Robust, n_blocks);
-        let mut burst = tx::encode(&header, &typical_payload(payload_size), AUDIO_CENTRE_HZ).unwrap();
+        let mut burst =
+            tx::encode(&header, &typical_payload(payload_size), AUDIO_CENTRE_HZ).unwrap();
         let sigma = awgn_sigma(Mode::Robust, eb_n0, signal_power(&burst));
         let mut chan = Awgn::new(sigma, 0xCAFE_BABE);
         chan.apply(&mut burst);
@@ -222,23 +231,50 @@ fn main() -> std::io::Result<()> {
         let label = format!("uv_robust_awgn_{:+02.0}db.wav", eb_n0);
         let path = out_dir.join(label);
         // Verify decode for the threshold reference:
-        let result = rx::decode_known_layout(&audio[((SILENCE_S * SAMPLE_RATE as f32) as usize)..], 0, AUDIO_CENTRE_HZ, Mode::Robust, n_blocks);
+        let result = rx::decode_known_layout(
+            &audio[((SILENCE_S * SAMPLE_RATE as f32) as usize)..],
+            0,
+            AUDIO_CENTRE_HZ,
+            Mode::Robust,
+            n_blocks,
+        );
         write_wav(&path, &audio)?;
-        eprintln!("  {} (decode: {})", path.display(), match result { Ok(_) => "ok", Err(_) => "fail" });
+        eprintln!(
+            "  {} (decode: {})",
+            path.display(),
+            match result {
+                Ok(_) => "ok",
+                Err(_) => "fail",
+            }
+        );
     }
 
     // 3. Robust + 5 Hz Rayleigh + +15 dB AWGN.
     {
         let header = typical_header(Mode::Robust, n_blocks);
-        let mut burst = tx::encode(&header, &typical_payload(payload_size), AUDIO_CENTRE_HZ).unwrap();
+        let mut burst =
+            tx::encode(&header, &typical_payload(payload_size), AUDIO_CENTRE_HZ).unwrap();
         let sigma = awgn_sigma(Mode::Robust, 15.0, signal_power(&burst));
         let mut chan = Rayleigh::new(5.0, sigma, 0xDEAD_BEEF);
         chan.apply(&mut burst);
         let audio = pad_with_silence(&burst);
         let path = out_dir.join("uv_robust_rayleigh_5hz_+15db.wav");
-        let result = rx::decode_known_layout(&audio[((SILENCE_S * SAMPLE_RATE as f32) as usize)..], 0, AUDIO_CENTRE_HZ, Mode::Robust, n_blocks);
+        let result = rx::decode_known_layout(
+            &audio[((SILENCE_S * SAMPLE_RATE as f32) as usize)..],
+            0,
+            AUDIO_CENTRE_HZ,
+            Mode::Robust,
+            n_blocks,
+        );
         write_wav(&path, &audio)?;
-        eprintln!("  {} (decode: {})", path.display(), match result { Ok(_) => "ok", Err(_) => "fail" });
+        eprintln!(
+            "  {} (decode: {})",
+            path.display(),
+            match result {
+                Ok(_) => "ok",
+                Err(_) => "fail",
+            }
+        );
     }
 
     // 4. Express clean — for envelope / spectral comparison.
@@ -248,7 +284,12 @@ fn main() -> std::io::Result<()> {
         let audio = pad_with_silence(&burst);
         let path = out_dir.join("uv_express_clean.wav");
         write_wav(&path, &audio)?;
-        eprintln!("  {} ({} samples, {:.2} s)", path.display(), audio.len(), audio.len() as f32 / SAMPLE_RATE as f32);
+        eprintln!(
+            "  {} ({} samples, {:.2} s)",
+            path.display(),
+            audio.len(),
+            audio.len() as f32 / SAMPLE_RATE as f32
+        );
     }
 
     eprintln!("done.");

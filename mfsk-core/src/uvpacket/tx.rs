@@ -43,9 +43,7 @@ use crate::fec::Ldpc240_101;
 use super::framing::{FrameHeader, HEADER_BYTES, INFO_BYTES_PER_BLOCK, PackError, pack_to_size};
 use super::interleaver::interleave;
 use super::puncture::puncture;
-use super::sync_pattern::{
-    PILOT_QPSK_POINT, PILOT_SYMBOL_INTERVAL, UVPACKET_PREAMBLE_BPSK_BITS,
-};
+use super::sync_pattern::{PILOT_QPSK_POINT, PILOT_SYMBOL_INTERVAL, UVPACKET_PREAMBLE_BPSK_BITS};
 
 /// LDPC mother-codeword length.
 const N_LDPC: usize = 240;
@@ -369,10 +367,17 @@ mod tests {
         let payload = vec![0_u8; 32];
         let lens: Vec<usize> = [Mode::Robust, Mode::Standard, Mode::Fast, Mode::Express]
             .iter()
-            .map(|&m| encode(&header_for(m, n_blocks), &payload, AUDIO_CENTRE_HZ).unwrap().len())
+            .map(|&m| {
+                encode(&header_for(m, n_blocks), &payload, AUDIO_CENTRE_HZ)
+                    .unwrap()
+                    .len()
+            })
             .collect();
         for w in lens.windows(2) {
-            assert!(w[0] >= w[1], "expected non-increasing audio lengths: {lens:?}");
+            assert!(
+                w[0] >= w[1],
+                "expected non-increasing audio lengths: {lens:?}"
+            );
         }
         // Robust strictly longer than Express (different ch_bits).
         assert!(lens[0] > lens[3]);

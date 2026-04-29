@@ -64,7 +64,10 @@ fn rayleigh_smoke_gate_zero_doppler_clean() {
     eprintln!("Rayleigh smoke Robust @ +30 dB / 0.001 Hz Doppler: {decoded}/{n}");
     // Even at ~zero Doppler the envelope can dip slightly during
     // a 270-ms frame, so allow one or two fades.
-    assert!(decoded >= n * 9 / 10, "Rayleigh smoke gate broke: {decoded}/{n}");
+    assert!(
+        decoded >= n * 9 / 10,
+        "Rayleigh smoke gate broke: {decoded}/{n}"
+    );
 }
 
 /// Headline test for Phase 2b: how does Robust hold up across

@@ -58,9 +58,10 @@
 //!
 //! ## FEC
 //!
-//! Reuses the WSJT-X FST4 hand-tuned irregular [`Ldpc240_101`] as
-//! the rate-0.42 mother code. The three higher-rate sub-modes apply
-//! kSR-greedy puncturing to the 139 parity bits.
+//! Reuses the WSJT-X FST4 hand-tuned irregular
+//! [`crate::fec::Ldpc240_101`] as the rate-0.42 mother code. The
+//! three higher-rate sub-modes apply kSR-greedy puncturing to the
+//! 139 parity bits.
 //!
 //! ## Frame structure
 //!

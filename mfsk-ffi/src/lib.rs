@@ -23,7 +23,7 @@
 //! - [`mfsk_decode_f32`] / [`mfsk_decode_i16`]: populate a caller-supplied
 //!   zero-initialised [`MfskMessageList`]. The callee owns the returned
 //!   buffer until [`mfsk_message_list_free`] is invoked.
-//! - [`mfsk_encode_*`]: populate a caller-supplied
+//! - `mfsk_encode_*`: populate a caller-supplied
 //!   zero-initialised [`MfskSamples`] with the synthesised f32 PCM.
 //!   Free with [`mfsk_samples_free`].
 //! - All strings are UTF-8, NUL-terminated, and owned by the
