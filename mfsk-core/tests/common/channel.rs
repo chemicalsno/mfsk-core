@@ -72,23 +72,37 @@ fn info_rate(mode: Mode) -> f32 {
     K_INFO / mode.ch_bits_per_block() as f32
 }
 
+/// Mean-square (= average power) of an audio buffer. Used to feed
+/// [`awgn_sigma_for_eb_n0_info`] from the actual transmitted burst.
+pub fn signal_power(audio: &[f32]) -> f32 {
+    if audio.is_empty() {
+        return 0.0;
+    }
+    audio.iter().map(|s| s * s).sum::<f32>() / audio.len() as f32
+}
+
 /// Compute the per-sample AWGN standard deviation that yields a
-/// target `Eb/N0` *per information bit* on uvpacket audio at unit
-/// peak amplitude.
+/// target `Eb/N0` *per information bit*, given the **measured**
+/// signal power of the burst about to be noised.
 ///
-/// Derivation (signal `A · sin(2πfn/fs)`, A = 1):
+/// Phase 2'a recalibration: the previous formula assumed a unit-
+/// envelope sinusoid (`P = 0.5`), which was approximately right for
+/// the old 4-FSK design but is ~10 dB off for the QPSK + RRC modem
+/// (peak-normalised burst has RMS ≈ 0.2 → P ≈ 0.04). To make
+/// stated Eb/N0 numbers comparable across modulations, callers now
+/// pass `signal_power = mean(audio²)` of the as-transmitted burst
+/// and the formula derives σ from that.
 ///
-/// - Average signal power      `P = A²/2 = 0.5`
-/// - Energy per channel bit    `Eb_ch = P / (R_s · b/sym)
-///   = 0.5 / (1200 · 2) ≈ 2.08 × 10⁻⁴ J`
-/// - Energy per info bit       `Eb_info = Eb_ch / r`  where
-///   `r = K / N_post-puncture`
-/// - Target ratio `linear = 10^(eb_n0_db / 10)`
+/// Derivation:
+///
+/// - Average signal power      `P = signal_power`         (caller-supplied)
+/// - Energy per channel bit    `Eb_ch = P / (R_s · b/sym)`
+/// - Energy per info bit       `Eb_info = Eb_ch / r_info` where
+///   `r_info = K / ch_bits_per_block`
+/// - Target ratio              `linear = 10^(eb_n0_db / 10)`
 /// - One-sided AWGN PSD        `N0 = Eb_info / linear`
 /// - Per-sample variance       `σ² = N0 · fs / 2`
-pub fn awgn_sigma_for_eb_n0_info(mode: Mode, eb_n0_db: f32) -> f32 {
-    let amplitude = 1.0f32;
-    let signal_power = amplitude * amplitude / 2.0;
+pub fn awgn_sigma_for_eb_n0_info(mode: Mode, eb_n0_db: f32, signal_power: f32) -> f32 {
     let e_b_ch = signal_power / (SYMBOL_RATE_HZ * BITS_PER_SYMBOL);
     let e_b_info = e_b_ch / info_rate(mode);
     let target_linear = 10f32.powf(eb_n0_db / 10.0);
@@ -225,12 +239,15 @@ mod tests {
 
     /// At a high Eb/N0 (= 100 dB) the σ for every mode should be
     /// vanishingly small; at 0 dB it should be a meaningful fraction
-    /// of the unit-amplitude signal.
+    /// of the signal envelope.
     #[test]
     fn sigma_decreases_with_eb_n0() {
+        // Use a representative 4-FSK-era signal power (P = 0.5) so
+        // the test bounds are absolute rather than measurement-tied.
+        let p = 0.5;
         for mode in [Mode::Robust, Mode::Standard, Mode::Fast, Mode::Express] {
-            let sigma_clean = awgn_sigma_for_eb_n0_info(mode, 100.0);
-            let sigma_zero = awgn_sigma_for_eb_n0_info(mode, 0.0);
+            let sigma_clean = awgn_sigma_for_eb_n0_info(mode, 100.0, p);
+            let sigma_zero = awgn_sigma_for_eb_n0_info(mode, 0.0, p);
             assert!(sigma_clean < 1e-3, "{mode:?}: clean σ {sigma_clean}");
             assert!(sigma_zero > 0.5, "{mode:?}: 0-dB σ {sigma_zero}");
             assert!(
@@ -246,9 +263,10 @@ mod tests {
     #[test]
     fn sigma_decreases_with_rate() {
         let eb_n0 = 0.0;
+        let p = 0.5;
         let sigmas: Vec<f32> = [Mode::Robust, Mode::Standard, Mode::Fast, Mode::Express]
             .iter()
-            .map(|&m| awgn_sigma_for_eb_n0_info(m, eb_n0))
+            .map(|&m| awgn_sigma_for_eb_n0_info(m, eb_n0, p))
             .collect();
         for w in sigmas.windows(2) {
             assert!(
@@ -256,6 +274,15 @@ mod tests {
                 "expected σ to decrease across rates: {sigmas:?}",
             );
         }
+    }
+
+    /// σ scales as `√P` (since variance scales as P at fixed Eb/N0).
+    #[test]
+    fn sigma_scales_with_signal_power() {
+        let s1 = awgn_sigma_for_eb_n0_info(Mode::Robust, 0.0, 1.0);
+        let s4 = awgn_sigma_for_eb_n0_info(Mode::Robust, 0.0, 4.0);
+        // 4× power → 2× σ (within float epsilon).
+        assert!((s4 / s1 - 2.0).abs() < 1e-3, "s1={s1}, s4={s4}");
     }
 
     /// Rayleigh envelope statistics: over a long buffer, the

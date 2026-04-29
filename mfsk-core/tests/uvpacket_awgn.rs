@@ -25,7 +25,7 @@ use mfsk_core::uvpacket::framing::FrameHeader;
 use mfsk_core::uvpacket::{AUDIO_CENTRE_HZ, Mode, rx, tx};
 
 mod common;
-use common::channel::{AwgnChannel, awgn_sigma_for_eb_n0_info};
+use common::channel::{AwgnChannel, awgn_sigma_for_eb_n0_info, signal_power};
 
 const ALL_MODES: [Mode; 4] = [Mode::Robust, Mode::Standard, Mode::Fast, Mode::Express];
 
@@ -46,13 +46,13 @@ fn awgn_per(
         app_type: 0,
         sequence: 0,
     };
-    let sigma = awgn_sigma_for_eb_n0_info(mode, eb_n0_db);
     let mut decoded = 0;
     for trial in 0..n_trials {
         let payload: Vec<u8> = (0..payload_size)
             .map(|i| ((i + trial) ^ 0xA5) as u8)
             .collect();
         let mut audio = tx::encode(&header, &payload, AUDIO_CENTRE_HZ).unwrap();
+        let sigma = awgn_sigma_for_eb_n0_info(mode, eb_n0_db, signal_power(&audio));
         let mut chan = AwgnChannel::new(sigma, base_seed.wrapping_add(trial as u64));
         chan.apply(&mut audio);
         if let Ok(frame) = rx::decode_known_layout(&audio, 0, AUDIO_CENTRE_HZ, mode, n_blocks)
