@@ -1075,10 +1075,41 @@ const PREAMBLE_PEAK_REL_THRESHOLD: f32 = 0.5;
 /// a 7 s window.
 const SYNC_PEAK_REL_TO_MEDIAN: f32 = 20.0;
 
+/// Auto-detecting receiver constrained to a caller-supplied set of
+/// (mode, n_blocks) layouts. Same sync logic as [`decode`], but the
+/// per-peak LDPC sweep tries only the layouts in `layouts` (in order),
+/// first success wins.
+///
+/// Application-aware bound: a uvpacket-web QSL-listening pass knows
+/// it's looking for Standard / Robust frames around `n_blocks ≈ 19`,
+/// so passing `&[(Standard, 19), (Standard, 22), (Robust, 19), …]`
+/// caps the worst-case decode work at `len(layouts) × per-attempt
+/// cost`. This avoids the runaway where the gate accepts a partially-
+/// coherent real signal whose data section is too corrupted to
+/// recover, and the unconstrained `4 × 32 = 128` layout sweep
+/// times out.
+///
+/// Empty `layouts` → empty result.
+pub fn decode_with_layouts(
+    audio: &[f32],
+    audio_centre_hz: f32,
+    layouts: &[(Mode, u8)],
+) -> Vec<DecodedFrame> {
+    decode_inner(audio, audio_centre_hz, Some(layouts))
+}
+
 /// Auto-detecting receiver: scan audio for preamble correlations,
-/// attempt [`decode_known_layout`] across the (mode × n_blocks) grid
-/// for each candidate head, return the successful frames.
+/// attempt [`decode_known_layout`] across the full (mode × n_blocks)
+/// grid for each candidate head, return the successful frames.
 pub fn decode(audio: &[f32], audio_centre_hz: f32) -> Vec<DecodedFrame> {
+    decode_inner(audio, audio_centre_hz, None)
+}
+
+fn decode_inner(
+    audio: &[f32],
+    audio_centre_hz: f32,
+    layouts: Option<&[(Mode, u8)]>,
+) -> Vec<DecodedFrame> {
     if audio.len() < PREAMBLE_LEN * NSPS + RRC_LEN {
         return Vec::new();
     }
@@ -1127,6 +1158,18 @@ pub fn decode(audio: &[f32], audio_centre_hz: f32) -> Vec<DecodedFrame> {
     // sample offset (start of the burst) is `mf_off − SYM_PEAK_OFFSET`.
     let mut frames: Vec<DecodedFrame> = Vec::new();
     let mut consumed_until: usize = 0;
+    // Iterate candidate layouts. If the caller supplied a list, use
+    // that in their priority order. Otherwise fall back to the full
+    // (4 modes × 32 n_blocks) sweep.
+    let owned_layouts;
+    let layouts_slice: &[(Mode, u8)] = match layouts {
+        Some(l) => l,
+        None => {
+            owned_layouts = full_layout_grid();
+            &owned_layouts
+        }
+    };
+
     for mf_off in picked {
         let Some(audio_off) = mf_off.checked_sub(SYM_PEAK_OFFSET) else {
             continue;
@@ -1134,24 +1177,22 @@ pub fn decode(audio: &[f32], audio_centre_hz: f32) -> Vec<DecodedFrame> {
         if audio_off < consumed_until {
             continue;
         }
-        // Try every (mode, n_blocks) — first success wins. To keep
-        // cost bounded, iterate n_blocks descending so a successful
-        // decode of the largest-fit frame consumes the whole burst.
+        // Try each (mode, n_blocks) — first success wins. To keep
+        // cost bounded for the unconstrained sweep, the default order
+        // iterates n_blocks descending so a successful decode of the
+        // largest-fit frame consumes the whole burst. Caller-supplied
+        // layouts pass in their own priority order.
         let mut decoded: Option<DecodedFrame> = None;
         let mut consumed_end = audio_off;
-        'outer: for mode in [Mode::Robust, Mode::Standard, Mode::Fast, Mode::Express] {
-            for n_blocks in (1u8..=32).rev() {
-                let needed = needed_samples_for(mode, n_blocks);
-                if audio_off + needed > audio.len() {
-                    continue;
-                }
-                if let Ok(f) =
-                    decode_known_layout(audio, audio_off, audio_centre_hz, mode, n_blocks)
-                {
-                    decoded = Some(f);
-                    consumed_end = audio_off + needed;
-                    break 'outer;
-                }
+        for &(mode, n_blocks) in layouts_slice {
+            let needed = needed_samples_for(mode, n_blocks);
+            if audio_off + needed > audio.len() {
+                continue;
+            }
+            if let Ok(f) = decode_known_layout(audio, audio_off, audio_centre_hz, mode, n_blocks) {
+                decoded = Some(f);
+                consumed_end = audio_off + needed;
+                break;
             }
         }
         if let Some(f) = decoded {
@@ -1251,6 +1292,20 @@ fn global_max_is_sync_outlier(scores: &[f32], global_max: f32) -> bool {
         return false;
     }
     global_max >= SYNC_PEAK_REL_TO_MEDIAN * median
+}
+
+/// Default unconstrained (mode × n_blocks) iteration order. Modes
+/// in fastest-acquire order (Robust first, since it's the most
+/// noise-tolerant), n_blocks descending so a successful decode of
+/// the largest-fit frame consumes the whole burst.
+fn full_layout_grid() -> Vec<(Mode, u8)> {
+    let mut out = Vec::with_capacity(4 * 32);
+    for mode in [Mode::Robust, Mode::Standard, Mode::Fast, Mode::Express] {
+        for n_blocks in (1u8..=32).rev() {
+            out.push((mode, n_blocks));
+        }
+    }
+    out
 }
 
 /// Compute the audio sample count required for a given (mode,
