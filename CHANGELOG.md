@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.3.5 — 2026-04-29
+
+uvpacket sync-gate hardening: 0.3.4's `max/median ≥ 20` rejection
+collapsed to a no-op when the input buffer was partially zero (e.g.
+the first few seconds of a fresh ring-buffer capture in uvpacket-web,
+where the unfilled portion of the worklet's ring buffer was being
+returned as zeros). With > 50 % of correlation scores at exactly 0,
+`median(scores) = 0` and the defensive `if median <= 0 { return true }`
+branch let noise through to the LDPC sweep — the very runaway 0.3.4
+was supposed to fix.
+
+### Fixed
+
+- `global_max_is_sync_outlier` and `diag_sync_stats` now compute the
+  median over **non-zero scores only**. An all-zero buffer (no audio
+  at all) trivially rejects; a partially-zero buffer (e.g. ring-buffer
+  pre-fill) produces a meaningful median from the real-audio portion.
+- Adds `tests/uvpacket_noise_floor.rs::noise_floor_half_zero_buffer`
+  as a regression test (7 s buffer, first half zeros, second half
+  σ=0.003 noise). Confirmed: 0 frames, 2.3 ms decode.
+
+No behaviour change for buffers without zero-padding artefacts (all
+271 existing uvpacket tests still pass byte-identically).
+
 ## 0.3.4 — 2026-04-29
 
 uvpacket RX: hard sync-rejection on the auto-detect path, fixing a

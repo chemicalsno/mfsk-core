@@ -104,6 +104,41 @@ fn noise_floor_mic_like() {
     );
 }
 
+/// Regression test for the bug uvpacket-web hit in production: a
+/// partial-fill ring buffer (front half = zeros from initial state,
+/// back half = real noise). The exact-zero scores in the front half
+/// pull the score median to 0, which previously bypassed the sync
+/// gate via the `median <= 0` defensive branch and let the LDPC sweep
+/// run on noise.
+#[test]
+fn noise_floor_half_zero_buffer() {
+    let n_samples = 7 * 12_000;
+    let half = n_samples / 2;
+    let mut rng = Awgn::new(0xfeedface);
+    let sigma = 0.003_f32;
+    let mut audio: Vec<f32> = vec![0.0; n_samples];
+    for s in &mut audio[half..] {
+        *s = sigma * rng.gaussian();
+    }
+    let peak = audio.iter().fold(0.0_f32, |m, &s| m.max(s.abs()));
+
+    let t0 = Instant::now();
+    let frames = rx::decode(&audio, 1500.0);
+    let elapsed = t0.elapsed();
+    eprintln!(
+        "[half-zero] 7 s (peak={:.4}, half pre-fill zeros): {} frames, decode took {:?}",
+        peak,
+        frames.len(),
+        elapsed
+    );
+    assert_eq!(frames.len(), 0);
+    assert!(
+        elapsed.as_millis() < 1500,
+        "half-zero buffer took {:?} — gate's median-of-non-zero rule isn't holding",
+        elapsed
+    );
+}
+
 /// Buffer with an *amplitude* peak that matches what uvpacket-web is
 /// reporting in the field (0.012). This is the operating regime where
 /// the sync gate must hold.

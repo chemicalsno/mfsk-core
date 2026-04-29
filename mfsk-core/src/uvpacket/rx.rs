@@ -1169,9 +1169,15 @@ pub fn diag_sync_stats(audio: &[f32], audio_centre_hz: f32) -> SyncStats {
         *slot = preamble_correlation(&mf_out, offset).norm_sqr();
     }
     let global_max = scores.iter().cloned().fold(0.0f32, f32::max);
-    let mid = scores.len() / 2;
-    scores.select_nth_unstable_by(mid, |a, b| a.partial_cmp(b).unwrap());
-    let median = scores[mid];
+    // Median over non-zero scores only (see `global_max_is_sync_outlier`).
+    let mut nz: Vec<f32> = scores.iter().copied().filter(|&s| s > 0.0).collect();
+    let median = if nz.is_empty() {
+        0.0
+    } else {
+        let mid = nz.len() / 2;
+        nz.select_nth_unstable_by(mid, |a, b| a.partial_cmp(b).unwrap());
+        nz[mid]
+    };
     let ratio = if median > 0.0 {
         global_max / median
     } else {
@@ -1189,21 +1195,21 @@ pub fn diag_sync_stats(audio: &[f32], audio_centre_hz: f32) -> SyncStats {
 /// — i.e. far enough above the score-distribution median that it can't
 /// be the natural extreme value of pure noise.
 ///
-/// Uses `select_nth_unstable` for O(N) median (no full sort).
+/// Uses `select_nth_unstable` for O(N) median (no full sort). Filters
+/// exact-zero scores out of the median input; otherwise a partial-fill
+/// ring buffer (e.g. the first few seconds after a fresh ▶ Listen)
+/// pulls the median to 0 and lets noise through. If every score is
+/// zero, no preamble is plausible and we reject.
 fn global_max_is_sync_outlier(scores: &[f32], global_max: f32) -> bool {
-    if scores.is_empty() {
+    let mut nz: Vec<f32> = scores.iter().copied().filter(|&s| s > 0.0).collect();
+    if nz.is_empty() {
         return false;
     }
-    let mid = scores.len() / 2;
-    let mut buf: Vec<f32> = scores.to_vec();
-    buf.select_nth_unstable_by(mid, |a, b| a.partial_cmp(b).unwrap());
-    let median = buf[mid];
+    let mid = nz.len() / 2;
+    nz.select_nth_unstable_by(mid, |a, b| a.partial_cmp(b).unwrap());
+    let median = nz[mid];
     if median <= 0.0 {
-        // Median 0 means the buffer is mostly silent — only accept the
-        // peak if it's at least nominally non-zero. This branch is
-        // mostly defensive; downconvert + matched filter on real audio
-        // produces strictly positive |·|².
-        return global_max > 0.0;
+        return false;
     }
     global_max >= SYNC_PEAK_REL_TO_MEDIAN * median
 }
