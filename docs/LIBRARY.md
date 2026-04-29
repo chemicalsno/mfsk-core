@@ -900,6 +900,44 @@ between them. The four parallel decoder strategies introduced in
 §3 (AWGN BP, AP-biased BP, fast-fading metric, AP-list template
 matching) all share the same QRA codec under the hood.
 
+### 10.1 Scope boundary: `uvpacket` as an applied example
+
+`uvpacket` is in-tree but **outside** the WSJT family. It is an
+applied example of how the FEC infrastructure (`Ldpc240_101`, BP,
+OSD-2) can be reused for protocols that share none of the WSJT
+modulation, sync, message-codec, or slot conventions. Specifically
+it is a four-mode packet protocol for narrow-FM voice channels
+(HT/mobile, ~3 kHz audio passband) using single-carrier coherent
+QPSK + root-raised-cosine pulse, a 31-bit BPSK m-sequence preamble,
+pilot-aided phase tracking, and a byte-pipe API.
+
+Sharing with the WSJT family stops at the FEC mother code:
+
+| Layer | WSJT family | uvpacket |
+|---|---|---|
+| Modulation | M-ary tone FSK / GFSK | single-carrier QPSK + RRC |
+| Demod | non-coherent symbol-power detect | matched filter + pilot phase track |
+| Slot | fixed 7.5 / 15 / 60 / 120 s | variable-length burst |
+| Sync | tone-index Costas blocks | 31-bit BPSK m-sequence |
+| Message | structured (callsign + grid) | byte-pipe (`app_type` tag) |
+| Pipeline | generic `mfsk-core` TX/RX | bespoke `uvpacket::{tx,rx}` |
+| FEC | (mode-specific) | `Ldpc240_101` (shared with FST4) |
+
+Because uvpacket bypasses the generic TX/RX pipeline, several of
+its `ModulationParams` trait constants (`NTONES = 4`, `GFSK_BT`,
+`TONE_SPACING_HZ`, `GFSK_HMOD`) are decorative — they exist to
+satisfy the trait signature and the `protocol_invariants` test
+without being consulted by `tx::encode` or `rx::decode_known_layout`.
+This trade-off is documented at
+[`mfsk-core/src/uvpacket/protocol.rs`](../mfsk-core/src/uvpacket/protocol.rs)
+and is the natural consequence of keeping a non-WSJT protocol
+in-tree rather than spinning it out as a sibling crate.
+
+For the full design narrative, AX.25 / M17 / D-STAR / DMR / VARA
+comparison, and Phase 2 characterisation curves, see
+[`docs/UVPACKET.md`](UVPACKET.md). Representative WAV samples are
+at `audio_samples/uvpacket/`.
+
 ## License
 
 Library code is GPL-3.0-or-later, derived from WSJT-X reference

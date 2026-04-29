@@ -100,6 +100,33 @@ License matches upstream: **GPL-3.0-or-later**.
 | Q65-30A    | 30 s   | QRA(15, 65) GF(2⁶) + CRC-12       | 77 bit  | 22 distributed slots   | `q65`   |
 | Q65-60A‥E  | 60 s   | (same QRA codec)                  | 77 bit  | (same sync layout)     | `q65`   |
 
+### Applied example: `uvpacket`
+
+The `uvpacket` module (feature-gated, off by default) is **not** a
+WSJT-X family mode — it is an in-tree applied example of how the
+FEC infrastructure (`Ldpc240_101`, BP, OSD-2) can be reused outside
+that family. uvpacket targets a different design point: a packet
+protocol for narrow-FM voice channels (HT/mobile, ~3 kHz audio
+passband) intended for private-group amateur-radio messaging
+(signed QSL exchange, short text, position reports).
+
+It shares the FEC mother code with FST4 but otherwise diverges from
+WSJT-X assumptions in every layer: single-carrier coherent QPSK +
+root-raised-cosine pulse, 31-bit m-sequence preamble, pilot-aided
+phase tracking, byte-pipe API, and a bespoke TX/RX path. Four sub-
+modes (Robust/Standard/Fast/Express, 1008–1800 net bps) trade
+robustness for throughput via puncturing.
+
+Phase 2 characterisation: 100 % PER at +8 dB Eb/N0_info on AWGN;
+≥ 90 % PER at +12–15 dB on Rayleigh fading (1–10 Hz Doppler).
+~6–7 dB Eb/N0 advantage over AX.25 / AFSK 1200 in the same NFM
+audio passband.
+
+See [`docs/UVPACKET.md`](https://github.com/jl1nie/mfsk-core/blob/main/docs/UVPACKET.md)
+([日本語](https://github.com/jl1nie/mfsk-core/blob/main/docs/UVPACKET.ja.md))
+for the full positioning narrative and characterisation curves;
+representative WAV samples live at `audio_samples/uvpacket/`.
+
 ## Modules
 
 - `mfsk_core::core` — protocol traits, DSP (resample / downsample /
@@ -130,7 +157,8 @@ License matches upstream: **GPL-3.0-or-later**.
 | `jt9`         |         | JT9 decode / synth                           |
 | `jt65`        |         | JT65 decode / synth (+ erasure-aware RS)     |
 | `q65`         |         | Q65-30A decode / synth (QRA soft-decision)   |
-| `full`        |         | Aggregate of all seven protocols             |
+| `uvpacket`    |         | Applied example: NFM voice-channel packet protocol (QPSK + LDPC), reuses `Ldpc240_101` |
+| `full`        |         | Aggregate of all seven WSJT protocols + uvpacket + packet-bytes |
 | `parallel`    | ✓       | Rayon-parallel candidate processing          |
 | `osd-deep`    |         | OSD-3 fallback on AP decodes (extra CPU)     |
 | `eq-fallback` |         | Non-EQ fallback inside `EqMode::Adaptive`    |

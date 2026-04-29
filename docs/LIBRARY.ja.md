@@ -886,6 +886,44 @@ repeat-accumulate 符号で、Walsh-Hadamard メッセージにより確率
 並列デコード戦略 (AWGN BP, AP-biased BP, fast-fading metric,
 AP-list テンプレート照合) はすべて同じ QRA codec を利用する。
 
+### 10.1 スコープ境界: 応用例としての `uvpacket`
+
+`uvpacket` は in-tree ですが WSJT 系の**外側**に位置します。FEC
+基盤 (`Ldpc240_101`、BP、OSD-2) を WSJT の変調・同期・メッセージ
+コーデック・スロット仕様を一切共有しないプロトコルで再利用する
+**応用例**です。具体的には狭帯域 FM 音声チャンネル (HT/モバイル、
+~3 kHz 音声帯域) 向け 4 モードパケットプロトコルで、単一搬送波
+コヒーレント QPSK + ルートレイズドコサインパルス、31 bit BPSK
+m-sequence プリアンブル、パイロット支援位相追跡、バイトパイプ
+API を採用します。
+
+WSJT 系との共有は FEC 親コードに留まります:
+
+| Layer | WSJT 系 | uvpacket |
+|---|---|---|
+| 変調 | M-ary tone FSK / GFSK | 単一搬送波 QPSK + RRC |
+| 復調 | 非コヒーレントシンボル電力検出 | matched filter + パイロット位相追跡 |
+| スロット | 固定 7.5 / 15 / 60 / 120 s | 可変長バースト |
+| 同期 | tone index Costas ブロック | 31 bit BPSK m-sequence |
+| メッセージ | 構造化 (callsign + grid) | バイトパイプ (`app_type` タグ) |
+| パイプライン | 汎用 `mfsk-core` TX/RX | 専用 `uvpacket::{tx,rx}` |
+| FEC | (モード固有) | `Ldpc240_101` (FST4 と共有) |
+
+uvpacket が汎用 TX/RX パイプラインを bypass するため、
+`ModulationParams` trait 定数のうち `NTONES = 4`、`GFSK_BT`、
+`TONE_SPACING_HZ`、`GFSK_HMOD` は **decorative** — trait signature
+と `protocol_invariants` テストを満たすためだけに存在し、
+`tx::encode` や `rx::decode_known_layout` から参照されません。
+このトレードオフは
+[`mfsk-core/src/uvpacket/protocol.rs`](../mfsk-core/src/uvpacket/protocol.rs)
+で明文化されており、非 WSJT プロトコルを sibling crate として切り
+出さず in-tree に残した自然な帰結です。
+
+完全な設計ナラティブ、AX.25 / M17 / D-STAR / DMR / VARA との比較、
+Phase 2 特性測定曲線については
+[`docs/UVPACKET.ja.md`](UVPACKET.ja.md) を参照。代表的な WAV
+サンプルは `audio_samples/uvpacket/` 配下。
+
 ## ライセンス
 
 ライブラリコードは GPL-3.0-or-later。WSJT-X のリファレンス
