@@ -1,49 +1,43 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! RX path: 12 kHz f32 PCM audio → decoded `(app_type, payload)`
-//! tuples.
+//! RX path: 12 kHz f32 PCM audio → decoded frames.
 //!
-//! Two layers:
-//!
-//! - [`decode_known_layout`] takes `(mode, n_blocks, sample_offset)`
-//!   and decodes the frame at that exact location. Used by unit
-//!   tests for round-trip verification and as the inner kernel of
-//!   the auto-detecting receiver.
-//! - [`decode`] scans an arbitrary-length audio buffer for every
-//!   uvpacket frame it can find: per-mode Costas search,
-//!   Costas-spacing-based mode disambiguation, trailing-Costas
-//!   length determination, then a `decode_known_layout` call per
-//!   candidate frame.
-//!
-//! Pipeline (per-frame):
+//! Phase 1'c: matches the QPSK + RRC + m-sequence-preamble TX in
+//! [`crate::uvpacket::tx`]. Pipeline:
 //!
 //! ```text
-//! audio @ 12 kHz f32, sample_offset → frame start
-//!   ↓ for each data symbol in the N blocks:
-//!       4-tone non-coherent power detect over NSPS = 10 samples
-//!       → LLR(b1), LLR(b0)  (max-log, WSJT sign convention)
-//!   ↓ block-deinterleave LLRs into per-codeword vectors
-//!   ↓ de-puncture per mode (insert 0 LLR at punctured positions)
-//!   ↓ Ldpc240_101::decode_soft for each codeword
-//!   ↓ extract 12 byte/block info → concatenate
-//!   ↓ framing::unpack → header + (payload + padding)
-//!   ↓ verify mode / block_count match the layout we decoded for
-//!   → (app_type, payload-bytes-incl-padding)
+//! audio @ 12 kHz f32
+//!   ↓ down-convert: rx_baseband[n] = 2 · audio[n] · e^{-j·2π·fc·n/fs}
+//!   ↓ matched-filter: convolve with the same RRC pulse used by TX
+//!   → mf_out (complex, length audio.len() + RRC_LEN − 1)
+//!
+//! frame head detected at sample offset s:
+//!   ↓ correlate the 31-sym BPSK m-sequence preamble against
+//!     mf_out[s + RRC_LEN−1 + i·NSPS] for i ∈ 0..31
+//!     → complex correlation peak C₀; magnitude scores frame
+//!       presence, arg(C₀) seeds initial carrier phase
+//!   ↓ extract data + pilot symbols at NSPS spacing past the preamble
+//!   ↓ pilot-aided phase tracking: known QPSK pilots every 32 sym;
+//!     phase is linearly interpolated between consecutive pilots
+//!     (preamble bookends the leading pilot at sym 0)
+//!   ↓ de-rotate each data symbol; QPSK soft-demap to (LLR_b1, LLR_b0)
+//!   ↓ block-deinterleave LLRs → de-puncture per mode → LDPC decode
+//!   ↓ unpack header + verify CRC; check (mode, block_count) match
+//!   → DecodedFrame
 //! ```
 //!
-//! The returned payload buffer is `n_blocks × INFO_BYTES_PER_BLOCK
-//! − HEADER_BYTES` long; trailing zero bytes correspond to the TX
-//! padding. Application code that needs an exact length carries it
-//! at the application protocol layer (e.g. JSON brace matching for
-//! signed-QSL).
+//! All layers above the QPSK soft-demap (de-interleave, de-puncture,
+//! LDPC, framing) are unchanged from the 4-FSK Phase 1f path.
 //!
-//! ## Header recovery (D-iii fast / slow path)
+//! ## Auto-detect ([`decode`])
 //!
-//! Phase 1f implements the **fast path** only: block 0 must decode
-//! and its payload bits 0..32 must constitute a CRC-valid header.
-//! The **slow path** that reconstructs the header from the per-block
-//! 5-bit spread copies (when block 0 fails) is left for a follow-up
-//! commit; the spread bits are emitted by TX correctly so the slow
-//! path can be added later without TX-side changes.
+//! Replaces the Phase 1f Costas search with a preamble m-sequence
+//! correlator. For each above-threshold preamble peak, attempt
+//! [`decode_known_layout`] across the (mode × n_blocks) candidate
+//! grid; the first that succeeds wins. n_blocks is inferred from the
+//! decoded header for verification.
+
+use num_complex::Complex32;
+use std::f32::consts::PI;
 
 use crate::core::{FecCodec, FecOpts};
 use crate::fec::Ldpc240_101;
@@ -51,24 +45,31 @@ use crate::fec::Ldpc240_101;
 use super::framing::{INFO_BYTES_PER_BLOCK, UnpackError, unpack as unpack_frame};
 use super::interleaver::deinterleave_llr;
 use super::puncture::{Mode, de_puncture_llr};
-use super::sync_pattern::UVPACKET_COSTAS;
+use super::sync_pattern::{
+    PILOT_QPSK_POINT, PILOT_SYMBOL_INTERVAL, PREAMBLE_LEN, UVPACKET_PREAMBLE_BPSK_BITS,
+};
 
 /// LDPC info-bit count.
 const K_LDPC: usize = 101;
-
-/// 4-FSK Gray map (bit pair → tone index). Same permutation as TX
-/// (`[0, 1, 3, 2]`).
-const GRAY_4: [u8; 4] = [0, 1, 3, 2];
-
-/// Costas head occupies 4 symbols at the start of each block.
-const COSTAS_LEN: usize = 4;
 
 /// Sample rate the modem operates at.
 const SAMPLE_RATE_HZ: f32 = 12_000.0;
 /// 1200 baud → 10 samples per symbol at 12 kHz.
 const NSPS: usize = 10;
-/// Tone spacing (Hz). h = 0.5 × R_s = 600 Hz.
-const TONE_SPACING_HZ: f32 = 600.0;
+/// RRC pulse: span in symbols (3 each side of centre tap).
+const RRC_SPAN_SYMS: usize = 6;
+/// RRC roll-off factor.
+const RRC_ALPHA: f32 = 0.5;
+/// RRC pulse length in samples (`span × NSPS + 1` = 61).
+const RRC_LEN: usize = RRC_SPAN_SYMS * NSPS + 1;
+/// Symbol-peak position offset within the matched-filter output for a
+/// transmitted symbol at TX baseband index 0. Equals `RRC_LEN − 1`
+/// because TX writes symbol i at samples `[i·NSPS, i·NSPS+RRC_LEN−1]`
+/// and RX matched-filter convolution adds another centre offset of
+/// `RRC_LEN/2 − 0.5`. Rounding to integers, the composite g = h*h
+/// peak (raised cosine) lands at lag `RRC_LEN − 1` from the transmit-
+/// side reference.
+const SYM_PEAK_OFFSET: usize = RRC_LEN - 1;
 
 /// Errors returned by [`decode_known_layout`].
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -79,13 +80,10 @@ pub enum DecodeError {
     /// At least one LDPC block failed to decode (BP did not
     /// converge within the iteration budget, even with OSD-2).
     FecFailed,
-    /// The frame data unpacked but its CRC-16 did not match —
-    /// either the channel mangled it past the FEC's correction
-    /// capacity or the layout assumed (mode, n_blocks) was wrong.
+    /// The frame data unpacked but its CRC-16 did not match.
     Crc(UnpackError),
     /// The decoded frame's header's mode / block_count differ from
-    /// the layout the caller requested. Indicates either a layout
-    /// mismatch or a bit-flip past the FEC's correction.
+    /// the layout the caller requested.
     LayoutMismatch {
         wanted_mode: Mode,
         got_mode: Mode,
@@ -97,31 +95,18 @@ pub enum DecodeError {
 /// Result of a successful frame decode.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DecodedFrame {
-    /// Application dispatch tag from the frame header.
     pub app_type: u8,
-    /// Sequence number from the frame header.
     pub sequence: u8,
-    /// Mode the frame was decoded with.
     pub mode: Mode,
-    /// Number of LDPC blocks in the frame.
     pub block_count: u8,
-    /// Payload bytes — exactly `block_count × 12 − 4` bytes, including
-    /// any zero padding the TX side added to fill the last LDPC block.
-    /// Application code is responsible for trimming based on its own
-    /// length / framing.
     pub payload: Vec<u8>,
 }
 
 /// Decode a uvpacket frame at a known location with known layout.
 ///
-/// `audio` is 12 kHz f32 PCM. `sample_offset` is the index of the
-/// first sample of the head Costas. `audio_centre_hz` is the modem
-/// audio centre frequency (typically [`crate::uvpacket::AUDIO_CENTRE_HZ`],
-/// 1700 Hz). `mode` and `n_blocks` describe the frame's layout.
-///
-/// Returns `Err(DecodeError::Truncated)` if the audio is shorter
-/// than the layout requires; otherwise either a successful decode
-/// or a Crc / LayoutMismatch / FecFailed error.
+/// `audio` is 12 kHz f32 PCM. `sample_offset` is the audio sample
+/// index of the *first* preamble sample (= start of TX burst).
+/// `audio_centre_hz` is the modem audio centre (typically 1500 Hz).
 pub fn decode_known_layout(
     audio: &[f32],
     sample_offset: usize,
@@ -129,41 +114,126 @@ pub fn decode_known_layout(
     mode: Mode,
     n_blocks: u8,
 ) -> Result<DecodedFrame, DecodeError> {
-    let n_blocks = n_blocks as usize;
+    let n_blocks_u = n_blocks as usize;
     let block_ch_bits = mode.ch_bits_per_block();
-    let block_data_syms = block_ch_bits / 2;
-    let block_total_syms = COSTAS_LEN + block_data_syms;
-    let total_syms = n_blocks * block_total_syms + COSTAS_LEN;
-    let total_samples = total_syms * NSPS;
+    debug_assert!(block_ch_bits.is_multiple_of(2));
+    let n_data_syms = n_blocks_u * block_ch_bits / 2;
+    let n_pilots = n_data_syms.div_ceil(PILOT_SYMBOL_INTERVAL - 1);
+    let total_syms = PREAMBLE_LEN + n_pilots + n_data_syms;
+    // Audio samples needed: total_syms × NSPS + RRC tail (RRC_LEN
+    // samples past the last symbol position).
+    let needed_samples = total_syms * NSPS + RRC_LEN;
 
-    if sample_offset + total_samples > audio.len() {
+    if sample_offset + needed_samples > audio.len() {
         return Err(DecodeError::Truncated);
     }
 
-    // 1. Demodulate every data symbol (skip per-block head Costas
-    // and trailing Costas) into channel-order LLR pairs.
-    let tone_freqs = tone_frequencies(audio_centre_hz);
-    let mut llrs_channel = Vec::with_capacity(n_blocks * block_ch_bits);
+    // 1. Down-convert + matched-filter the relevant audio slice.
+    let slice = &audio[sample_offset..sample_offset + needed_samples];
+    let mf_out = downconvert_and_matched_filter(slice, audio_centre_hz);
 
-    for block_idx in 0..n_blocks {
-        let block_start_sym = block_idx * block_total_syms;
-        let data_start_sym = block_start_sym + COSTAS_LEN;
-        for sym_offset in 0..block_data_syms {
-            let sym_idx = data_start_sym + sym_offset;
-            let sample_start = sample_offset + sym_idx * NSPS;
-            let samples = &audio[sample_start..sample_start + NSPS];
-            let powers = symbol_powers(samples, &tone_freqs);
-            let (llr_b1, llr_b0) = symbol_powers_to_llrs(&powers);
-            llrs_channel.push(llr_b1);
-            llrs_channel.push(llr_b0);
+    // 2. Refine the integer-sample frame offset by maximising preamble
+    //    correlation magnitude over a ±NSPS jitter window. The base
+    //    offset is `SYM_PEAK_OFFSET` (where TX symbol 0's matched-
+    //    filter peak lands assuming the burst starts at sample 0 of
+    //    the slice).
+    let radius = NSPS as isize;
+    let base = SYM_PEAK_OFFSET as isize;
+    let mut best_off = SYM_PEAK_OFFSET;
+    let mut best_corr = Complex32::new(0.0, 0.0);
+    let mut best_mag2 = -1.0_f32;
+    for jitter in -radius..=radius {
+        let off = base + jitter;
+        if off < 0 {
+            continue;
+        }
+        let off = off as usize;
+        let last = off + (PREAMBLE_LEN - 1) * NSPS;
+        if last >= mf_out.len() {
+            continue;
+        }
+        let c = preamble_correlation(&mf_out, off);
+        let mag2 = c.norm_sqr();
+        if mag2 > best_mag2 {
+            best_mag2 = mag2;
+            best_corr = c;
+            best_off = off;
         }
     }
 
-    // 2. Block-de-interleave channel LLRs back to per-codeword
-    // vectors (one per LDPC block, each block_ch_bits long).
-    let llrs_per_block = deinterleave_llr(&llrs_channel, n_blocks);
+    // 3. Extract the full transmitted-symbol stream at the refined
+    //    offset (preamble + pilot/data interleave).
+    let mut symbols: Vec<Complex32> = Vec::with_capacity(total_syms);
+    for i in 0..total_syms {
+        let pos = best_off + i * NSPS;
+        if pos >= mf_out.len() {
+            return Err(DecodeError::Truncated);
+        }
+        symbols.push(mf_out[pos]);
+    }
 
-    // 3. De-puncture and decode each block.
+    // 4. Build a per-symbol phase reference. Anchors:
+    //    - The whole preamble (BPSK ±1) → one combined phase via
+    //      `best_corr` (already computed).
+    //    - Each pilot symbol (known QPSK constellation point at
+    //      sym index `PREAMBLE_LEN + k·PILOT_SYMBOL_INTERVAL`).
+    //    Linearly interpolate phase between consecutive anchors;
+    //    extrapolate flat past the last anchor.
+    let pilot_ref = qpsk_constellation_point(PILOT_QPSK_POINT);
+    let mut anchor_idx: Vec<usize> = Vec::with_capacity(n_pilots + 1);
+    let mut anchor_phase: Vec<f32> = Vec::with_capacity(n_pilots + 1);
+
+    // Preamble anchor: phase at the *centre* of the preamble (use
+    // the combined preamble correlation).
+    let preamble_centre = (PREAMBLE_LEN - 1) / 2;
+    anchor_idx.push(preamble_centre);
+    anchor_phase.push(best_corr.arg());
+
+    // Pilot anchors.
+    for k in 0..n_pilots {
+        let sym_pos = PREAMBLE_LEN + k * PILOT_SYMBOL_INTERVAL;
+        if sym_pos >= total_syms {
+            break;
+        }
+        let r = symbols[sym_pos];
+        // Phase = arg(r / pilot_ref). pilot_ref = +1+0j, so simply arg(r).
+        let phase = (r * pilot_ref.conj()).arg();
+        // Unwrap relative to the previous anchor to avoid 2π jumps.
+        let prev = *anchor_phase.last().unwrap();
+        let unwrapped = unwrap_phase(prev, phase);
+        anchor_idx.push(sym_pos);
+        anchor_phase.push(unwrapped);
+    }
+
+    // 5. QPSK soft-demap each data symbol after de-rotation.
+    let mut llrs_channel: Vec<f32> = Vec::with_capacity(n_blocks_u * block_ch_bits);
+    let mut data_count = 0usize;
+    for i in 0..total_syms {
+        // Skip preamble.
+        if i < PREAMBLE_LEN {
+            continue;
+        }
+        let rel = i - PREAMBLE_LEN;
+        // Pilots are at rel == 0, PILOT_SYMBOL_INTERVAL, 2·PILOT_…, …
+        if rel.is_multiple_of(PILOT_SYMBOL_INTERVAL) {
+            continue;
+        }
+        let phase = interp_phase(&anchor_idx, &anchor_phase, i);
+        let derot = symbols[i] * Complex32::from_polar(1.0, -phase);
+        let (llr_b1, llr_b0) = qpsk_llrs(derot);
+        llrs_channel.push(llr_b1);
+        llrs_channel.push(llr_b0);
+        data_count += 1;
+        if data_count >= n_data_syms {
+            break;
+        }
+    }
+    debug_assert_eq!(llrs_channel.len(), n_blocks_u * block_ch_bits);
+
+    // 6. Block-deinterleave channel LLRs back to per-codeword vectors.
+    let llrs_per_block = deinterleave_llr(&llrs_channel, n_blocks_u);
+
+    // 7. De-puncture and LDPC-decode each block.
     let fec = Ldpc240_101;
     let opts = FecOpts {
         bp_max_iter: 50,
@@ -171,7 +241,7 @@ pub fn decode_known_layout(
         ap_mask: None,
         verify_info: None,
     };
-    let mut decoded_info: Vec<Vec<u8>> = Vec::with_capacity(n_blocks);
+    let mut decoded_info: Vec<Vec<u8>> = Vec::with_capacity(n_blocks_u);
     for block_llrs in &llrs_per_block {
         let full_llrs = de_puncture_llr(block_llrs, mode);
         let result = fec
@@ -180,11 +250,8 @@ pub fn decode_known_layout(
         decoded_info.push(result.info);
     }
 
-    // 4. Pack info bits back to bytes (12 bytes per block; the
-    // trailing 5-bit spread-header chunk is dropped here — it's the
-    // slow-path fallback for header recovery, not used in the fast
-    // path).
-    let mut frame_data = Vec::with_capacity(n_blocks * INFO_BYTES_PER_BLOCK);
+    // 8. Pack info bits back to bytes (12 bytes per block).
+    let mut frame_data = Vec::with_capacity(n_blocks_u * INFO_BYTES_PER_BLOCK);
     for block_info in &decoded_info {
         debug_assert_eq!(block_info.len(), K_LDPC);
         for byte_idx in 0..INFO_BYTES_PER_BLOCK {
@@ -198,14 +265,13 @@ pub fn decode_known_layout(
         }
     }
 
-    // 5. Unpack header + verify CRC-16 over the full frame_data
-    // (header + payload + padding), then sanity-check the layout.
+    // 9. Unpack header + verify CRC, check layout self-consistency.
     let (header, payload) = unpack_frame(&frame_data).map_err(DecodeError::Crc)?;
-    if header.mode != mode || header.block_count as usize != n_blocks {
+    if header.mode != mode || header.block_count as usize != n_blocks_u {
         return Err(DecodeError::LayoutMismatch {
             wanted_mode: mode,
             got_mode: header.mode,
-            wanted_blocks: n_blocks as u8,
+            wanted_blocks: n_blocks,
             got_blocks: header.block_count,
         });
     }
@@ -219,158 +285,199 @@ pub fn decode_known_layout(
     })
 }
 
-/// Tone-0 / tone-3 frequency layout for a given audio centre.
-fn tone_frequencies(audio_centre_hz: f32) -> [f32; 4] {
-    let f0 = audio_centre_hz - 1.5 * TONE_SPACING_HZ;
-    [
-        f0,
-        f0 + TONE_SPACING_HZ,
-        f0 + 2.0 * TONE_SPACING_HZ,
-        f0 + 3.0 * TONE_SPACING_HZ,
-    ]
+/// QPSK constellation: index `0 → +1+0j`, `1 → 0+1j`, `2 → −1+0j`,
+/// `3 → 0−1j`. Matches [`crate::uvpacket::tx`]'s map.
+fn qpsk_constellation_point(idx: u8) -> Complex32 {
+    match idx & 0x3 {
+        0 => Complex32::new(1.0, 0.0),
+        1 => Complex32::new(0.0, 1.0),
+        2 => Complex32::new(-1.0, 0.0),
+        3 => Complex32::new(0.0, -1.0),
+        _ => unreachable!(),
+    }
 }
 
-/// Compute per-tone power for one symbol (`NSPS` samples) by direct
-/// length-`NSPS` DFT at each of the 4 tone frequencies. Returns the
-/// magnitude-squared per tone — the natural input to the max-log
-/// non-coherent FSK LLR formula.
-fn symbol_powers(samples: &[f32], tone_freqs: &[f32; 4]) -> [f32; 4] {
-    debug_assert_eq!(samples.len(), NSPS);
-    let mut out = [0.0f32; 4];
-    for (t, &freq) in tone_freqs.iter().enumerate() {
-        let mut re = 0.0f32;
-        let mut im = 0.0f32;
-        for (n, &s) in samples.iter().enumerate() {
-            let phase = 2.0 * std::f32::consts::PI * freq * n as f32 / SAMPLE_RATE_HZ;
-            re += s * phase.cos();
-            im -= s * phase.sin();
+/// Compute LLRs for the two QPSK bits given a (de-rotated) received
+/// complex sample.
+///
+/// TX maps `(b1, b0)` to constellation index via `pair = (b1<<1) |
+/// b0`, then through Gray map `[0, 1, 3, 2]`:
+///
+/// | (b1, b0) | pair | idx | point   |
+/// |---------:|-----:|----:|:--------|
+/// | (0, 0)   | 0    | 0   | +1 + 0j |
+/// | (0, 1)   | 1    | 1   |  0 + 1j |
+/// | (1, 0)   | 2    | 3   |  0 − 1j |
+/// | (1, 1)   | 3    | 2   | −1 + 0j |
+///
+/// Max-log LLR with `LLR > 0 ⇔ bit=1` (BP convention):
+///
+/// - LLR(b1) ≈ −(re + im)         (×2; absolute scale absorbed by BP)
+/// - LLR(b0) ≈ max(im, −re) − max(re, −im)
+fn qpsk_llrs(r: Complex32) -> (f32, f32) {
+    let re = r.re;
+    let im = r.im;
+    let llr_b1 = -(re + im);
+    let llr_b0 = im.max(-re) - re.max(-im);
+    (llr_b1, llr_b0)
+}
+
+/// Down-convert audio to complex baseband and matched-filter with the
+/// transmit RRC pulse. Returns a `Vec<Complex32>` of length
+/// `audio.len() + RRC_LEN − 1` (full convolution).
+fn downconvert_and_matched_filter(audio: &[f32], audio_centre_hz: f32) -> Vec<Complex32> {
+    let two_pi_fc_dt = 2.0 * PI * audio_centre_hz / SAMPLE_RATE_HZ;
+    // Down-conversion: 2·audio·e^{-jωn}. The factor 2 sets the
+    // matched-filter output to the unit-amplitude QPSK constellation
+    // when the audio peak is 1.
+    let mut bb: Vec<Complex32> = Vec::with_capacity(audio.len());
+    for (n, &s) in audio.iter().enumerate() {
+        let phase = two_pi_fc_dt * n as f32;
+        let (sin, cos) = phase.sin_cos();
+        bb.push(Complex32::new(2.0 * s * cos, -2.0 * s * sin));
+    }
+    // Matched filter: convolve with RRC. The 2·ωc image lands at the
+    // ±2ωc baseband bands and is well-rejected by the RRC LPF
+    // (effective bandwidth ≈ ½·R_s = 600 Hz; image at 3 kHz).
+    let rrc = rrc_pulse(RRC_ALPHA, RRC_SPAN_SYMS, NSPS);
+    let n_out = bb.len() + rrc.len() - 1;
+    let mut out = vec![Complex32::new(0.0, 0.0); n_out];
+    for (i, &x) in bb.iter().enumerate() {
+        for (j, &h) in rrc.iter().enumerate() {
+            out[i + j] += x * h;
         }
-        out[t] = re * re + im * im;
     }
     out
 }
 
-/// Convert per-tone powers to (LLR(b1), LLR(b0)) using the max-log
-/// non-coherent 4-FSK formula and the Gray map `GRAY_4 = [0,1,3,2]`.
-///
-/// Bit assignment (after Gray-decoding): tone 0→00, tone 1→01,
-/// tone 2→11, tone 3→10. So:
-/// - `b1 = 1` for tones {2, 3}
-/// - `b0 = 1` for tones {1, 2}
-///
-/// Sign convention: `LLR > 0` → bit 1 is the more likely value
-/// (matches `bp_decode_generic`'s convention).
-///
-/// Form: max-log non-coherent FSK uses **magnitudes** (`|r_t|`),
-/// not power (`|r_t|²`); the Bessel-function-based exact LLR has
-/// the same `|r_t|`-linear leading term. We deliberately do **not**
-/// per-symbol-normalise by an estimated `σ̂`: the per-symbol noise
-/// estimate goes to zero on clean tones, blowing up the LLR
-/// magnitude and saturating BP's `tanh` to ±1 (= hard decision).
-/// Phase 2 measured this empirically. A frame-level σ̂ (averaged
-/// across symbols) is a sensible follow-up.
-fn symbol_powers_to_llrs(p: &[f32; 4]) -> (f32, f32) {
-    let _ = GRAY_4; // documentation pin; the constants below assume this map
-    let m: [f32; 4] = [p[0].sqrt(), p[1].sqrt(), p[2].sqrt(), p[3].sqrt()];
-    let llr_b1 = m[2].max(m[3]) - m[0].max(m[1]);
-    let llr_b0 = m[1].max(m[2]) - m[0].max(m[3]);
-    (llr_b1, llr_b0)
-}
-
-/// Diagnostic env var: set `UVPACKET_DEBUG_RX=1` to dump
-/// Costas-search and decode-attempt traces to stderr.
-fn debug_enabled() -> bool {
-    std::env::var("UVPACKET_DEBUG_RX").is_ok()
-}
-
-/// Score a hypothetical Costas-4 head at `sample_offset`. Returns
-/// `target − max(other)` summed across the 4 Costas symbols, where
-/// `target` is the power at the expected tone for that symbol and
-/// `max(other)` is the highest of the other three tones' powers.
-/// Strongly positive ↔ Costas detected; near-zero ↔ data / noise.
-fn costas_score_at(audio: &[f32], sample_offset: usize, audio_centre_hz: f32) -> f32 {
-    let tone_freqs = tone_frequencies(audio_centre_hz);
-    if sample_offset + COSTAS_LEN * NSPS > audio.len() {
-        return f32::NEG_INFINITY;
+/// Generate root-raised-cosine pulse coefficients. Returns
+/// `span_syms × samples_per_sym + 1` taps, normalised so `Σ h² = 1`.
+/// Identical to the TX pulse so the composite TX·RX response is a
+/// raised-cosine (zero-ISI at symbol-rate sampling).
+fn rrc_pulse(alpha: f32, span_syms: usize, samples_per_sym: usize) -> Vec<f32> {
+    let n = span_syms * samples_per_sym;
+    let mut h = vec![0.0_f32; n + 1];
+    let center = n as f32 / 2.0;
+    for (i, h_i) in h.iter_mut().enumerate() {
+        let t = (i as f32 - center) / samples_per_sym as f32;
+        *h_i = if t.abs() < 1e-6 {
+            1.0 - alpha + 4.0 * alpha / PI
+        } else if (t.abs() - 1.0 / (4.0 * alpha)).abs() < 1e-6 {
+            (alpha / 2.0_f32.sqrt())
+                * ((1.0 + 2.0 / PI) * (PI / (4.0 * alpha)).sin()
+                    + (1.0 - 2.0 / PI) * (PI / (4.0 * alpha)).cos())
+        } else {
+            let pi_t = PI * t;
+            let four_at = 4.0 * alpha * t;
+            ((pi_t * (1.0 - alpha)).sin() + four_at * (pi_t * (1.0 + alpha)).cos())
+                / (pi_t * (1.0 - four_at * four_at))
+        };
     }
-    let mut score = 0.0f32;
-    for sym in 0..COSTAS_LEN {
-        let start = sample_offset + sym * NSPS;
-        let powers = symbol_powers(&audio[start..start + NSPS], &tone_freqs);
-        let expected = UVPACKET_COSTAS[sym] as usize;
-        let target = powers[expected];
-        let max_other = (0..4)
-            .filter(|&t| t != expected)
-            .fold(0.0f32, |acc, t| acc.max(powers[t]));
-        score += target - max_other;
+    let norm: f32 = h.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        for x in h.iter_mut() {
+            *x /= norm;
+        }
     }
-    score
+    h
 }
 
-/// Brute-force Costas search across the whole audio buffer at
-/// sample-level resolution. Returns sample offsets where the Costas
-/// pattern is plausibly present, sorted ascending. Threshold + NMS
-/// are tuned for clean / moderate-SNR channels — Phase 2 will
-/// re-tune for low-SNR scenarios.
-fn find_costas_hits_sorted(audio: &[f32], audio_centre_hz: f32) -> Vec<usize> {
-    let costas_samples = COSTAS_LEN * NSPS;
-    if audio.len() <= costas_samples {
+/// Correlate the 31-bit BPSK preamble against the matched-filter
+/// output starting at sample `offset`. Each preamble bit (`true →
+/// −1`, `false → +1`) is multiplied by the matched-filter sample at
+/// `offset + i·NSPS`. Result is the complex inner product (so its
+/// argument carries the carrier-phase reference).
+fn preamble_correlation(mf_out: &[Complex32], offset: usize) -> Complex32 {
+    let mut acc = Complex32::new(0.0, 0.0);
+    for (i, &b) in UVPACKET_PREAMBLE_BPSK_BITS.iter().enumerate() {
+        let pos = offset + i * NSPS;
+        let s = if b { -1.0_f32 } else { 1.0_f32 };
+        acc += mf_out[pos] * s;
+    }
+    acc
+}
+
+/// Unwrap `new` to lie within ±π of `prev`.
+fn unwrap_phase(prev: f32, new: f32) -> f32 {
+    let mut delta = new - prev;
+    while delta > PI {
+        delta -= 2.0 * PI;
+    }
+    while delta < -PI {
+        delta += 2.0 * PI;
+    }
+    prev + delta
+}
+
+/// Linearly interpolate the per-symbol phase between phase anchors.
+/// `anchor_idx` is sorted ascending. For `sym_idx` outside the
+/// covered range, extrapolates flat (= clamp to nearest endpoint).
+fn interp_phase(anchor_idx: &[usize], anchor_phase: &[f32], sym_idx: usize) -> f32 {
+    debug_assert_eq!(anchor_idx.len(), anchor_phase.len());
+    debug_assert!(!anchor_idx.is_empty());
+    if sym_idx <= anchor_idx[0] {
+        return anchor_phase[0];
+    }
+    let last = anchor_idx.len() - 1;
+    if sym_idx >= anchor_idx[last] {
+        return anchor_phase[last];
+    }
+    // Find the segment [k, k+1] that brackets sym_idx.
+    let mut k = 0;
+    while k + 1 < anchor_idx.len() && anchor_idx[k + 1] < sym_idx {
+        k += 1;
+    }
+    let i0 = anchor_idx[k] as f32;
+    let i1 = anchor_idx[k + 1] as f32;
+    let p0 = anchor_phase[k];
+    let p1 = anchor_phase[k + 1];
+    let t = (sym_idx as f32 - i0) / (i1 - i0);
+    p0 + t * (p1 - p0)
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Auto-detecting decoder
+// ────────────────────────────────────────────────────────────────────
+
+/// Threshold (relative to the global preamble-correlation peak) for
+/// considering an offset a candidate frame head. Tuned for clean and
+/// moderate-SNR conditions; Phase 2 will revisit.
+const PREAMBLE_PEAK_REL_THRESHOLD: f32 = 0.5;
+
+/// Auto-detecting receiver: scan audio for preamble correlations,
+/// attempt [`decode_known_layout`] across the (mode × n_blocks) grid
+/// for each candidate head, return the successful frames.
+pub fn decode(audio: &[f32], audio_centre_hz: f32) -> Vec<DecodedFrame> {
+    if audio.len() < PREAMBLE_LEN * NSPS + RRC_LEN {
         return Vec::new();
     }
-    let n_positions = audio.len() - costas_samples + 1;
-    let mut scores = vec![0.0f32; n_positions];
-    for (offset, slot) in scores.iter_mut().enumerate() {
-        *slot = costas_score_at(audio, offset, audio_centre_hz);
+    let mf_out = downconvert_and_matched_filter(audio, audio_centre_hz);
+    // Compute |⟨preamble, mf_out⟩|² across every starting offset that
+    // can fit a full preamble correlation.
+    let max_corr_offset = mf_out
+        .len()
+        .saturating_sub((PREAMBLE_LEN - 1) * NSPS + 1);
+    if max_corr_offset == 0 {
+        return Vec::new();
     }
-    let global_max = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let mut scores = vec![0.0f32; max_corr_offset];
+    for (offset, slot) in scores.iter_mut().enumerate() {
+        let c = preamble_correlation(&mf_out, offset);
+        *slot = c.norm_sqr();
+    }
+    let global_max = scores.iter().cloned().fold(0.0f32, f32::max);
     if global_max <= 0.0 {
         return Vec::new();
     }
-    // Diagnostic: dump scores when running RUST_LOG-style debug.
-    if debug_enabled() {
-        let mut top: Vec<(usize, f32)> = scores.iter().copied().enumerate().collect();
-        top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        eprintln!(
-            "find_costas_hits: max={:.2}, top 8 = {:?}",
-            global_max,
-            &top[..8.min(top.len())],
-        );
-    }
-    // Loose threshold so that the first Costas of a frame — which
-    // sits inside the GFSK-synth ramp envelope and so scores lower
-    // than a mid-frame Costas — still passes. The ±NSPS NMS that
-    // follows trims false positives.
-    let threshold = global_max * 0.10;
+    let threshold = global_max * PREAMBLE_PEAK_REL_THRESHOLD;
 
-    if debug_enabled() {
-        // Dump scores at exact-frame-multiples for the 4 modes, to
-        // see whether the head / tail / mid Costas hits cleared the
-        // threshold in the first place.
-        for &block_syms in &[124usize, 105, 80, 71] {
-            let bs = block_syms * NSPS;
-            let mut row = String::new();
-            for n in 0..=8 {
-                let pos = n * bs;
-                if pos < scores.len() {
-                    row.push_str(&format!(" [{}]={:.1}", pos, scores[pos]));
-                }
-            }
-            eprintln!("  mode block_samples={bs}: {row}");
-        }
-    }
-
-    // Take every above-threshold position as a candidate. Local-
-    // maxima filtering would drop the start-of-frame Costas when its
-    // peak doesn't quite land on a sample boundary (the GFSK
-    // half-cosine ramp can shift the peak by a sample or two), so
-    // we lean on NMS alone to thin the candidate list.
+    // Pick local maxima above threshold, ±NSPS-NMS.
     let mut peaks: Vec<(usize, f32)> = scores
         .iter()
         .enumerate()
         .filter(|(_, s)| **s >= threshold)
         .map(|(i, &s)| (i, s))
         .collect();
-    // Greedy NMS over ±NSPS samples (one symbol period).
     peaks.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
     let mut picked: Vec<usize> = Vec::new();
     for (offset, _) in peaks {
@@ -379,144 +486,55 @@ fn find_costas_hits_sorted(audio: &[f32], audio_centre_hz: f32) -> Vec<usize> {
         }
     }
     picked.sort_unstable();
-    picked
-}
 
-/// Refine an integer frame-head sample offset by finding the
-/// offset (within ±NSPS of `candidate`) whose **sum of Costas
-/// correlations across every expected Costas position in the frame
-/// (head + block boundaries + trailing)** is maximised.
-///
-/// Single-anchor refinement around the head is ambiguous — the
-/// GFSK ramp at the start of the frame attenuates symbol 0,
-/// shifting the apparent head peak by a few samples. Aggregating
-/// across N+1 anchors anchors the true offset by consensus.
-fn refine_frame_offset(
-    audio: &[f32],
-    candidate: usize,
-    audio_centre_hz: f32,
-    mode: Mode,
-    n_blocks: u8,
-) -> usize {
-    let block_samples = (COSTAS_LEN + mode.ch_bits_per_block() / 2) * NSPS;
-    let n_anchors = n_blocks as usize + 1; // head + (N-1) inter-block + trailing
-    let radius = NSPS as isize;
-    let mut best = candidate;
-    let mut best_sum = f32::NEG_INFINITY;
-    for jitter in -radius..=radius {
-        let Some(off) = candidate.checked_add_signed(jitter) else {
+    // For each candidate matched-filter offset, the implied audio
+    // sample offset (start of the burst) is `mf_off − SYM_PEAK_OFFSET`.
+    let mut frames: Vec<DecodedFrame> = Vec::new();
+    let mut consumed_until: usize = 0;
+    for mf_off in picked {
+        let Some(audio_off) = mf_off.checked_sub(SYM_PEAK_OFFSET) else {
             continue;
         };
-        let last_anchor_pos = off + (n_anchors - 1) * block_samples;
-        if last_anchor_pos + COSTAS_LEN * NSPS > audio.len() {
+        if audio_off < consumed_until {
             continue;
         }
-        let mut sum = 0.0f32;
-        for n in 0..n_anchors {
-            let pos = off + n * block_samples;
-            sum += costas_score_at(audio, pos, audio_centre_hz);
+        // Try every (mode, n_blocks) — first success wins. To keep
+        // cost bounded, iterate n_blocks descending so a successful
+        // decode of the largest-fit frame consumes the whole burst.
+        let mut decoded: Option<DecodedFrame> = None;
+        let mut consumed_end = audio_off;
+        'outer: for mode in [Mode::Robust, Mode::Standard, Mode::Fast, Mode::Express] {
+            for n_blocks in (1u8..=32).rev() {
+                let needed = needed_samples_for(mode, n_blocks);
+                if audio_off + needed > audio.len() {
+                    continue;
+                }
+                if let Ok(f) =
+                    decode_known_layout(audio, audio_off, audio_centre_hz, mode, n_blocks)
+                {
+                    decoded = Some(f);
+                    consumed_end = audio_off + needed;
+                    break 'outer;
+                }
+            }
         }
-        if sum > best_sum {
-            best_sum = sum;
-            best = off;
+        if let Some(f) = decoded {
+            frames.push(f);
+            consumed_until = consumed_end;
         }
     }
-    best
+
+    frames
 }
 
-/// Auto-detecting receiver: scan audio, infer per-frame `(mode,
-/// n_blocks)` from inter-Costas spacing, decode with
-/// [`decode_known_layout`].
-///
-/// Algorithm:
-/// 1. Brute-force Costas correlation across the full audio buffer
-///    → sorted list of plausible Costas-4 head offsets.
-/// 2. For each unconsumed Costas hit, walk forward looking for
-///    consecutive hits at the spacing matching each mode. Pick the
-///    longest consistent run.
-/// 3. Call [`decode_known_layout`] with the inferred layout. On
-///    success, mark every hit covered by the frame as consumed and
-///    move on; on failure, the hit is left available so a different
-///    interpretation can pick it up.
-///
-/// Returns the list of successfully-decoded frames, in order of the
-/// first Costas hit they consumed.
-pub fn decode(audio: &[f32], audio_centre_hz: f32) -> Vec<DecodedFrame> {
-    let hits = find_costas_hits_sorted(audio, audio_centre_hz);
-    if debug_enabled() {
-        eprintln!("decode: {} costas hits at offsets {:?}", hits.len(), hits);
-    }
-    if hits.is_empty() {
-        return Vec::new();
-    }
-    let mut consumed = vec![false; hits.len()];
-    let mut found: Vec<DecodedFrame> = Vec::new();
-
-    for i in 0..hits.len() {
-        if consumed[i] {
-            continue;
-        }
-        let head_sample = hits[i];
-
-        // Try each mode; pick the layout giving the longest run of
-        // matching Costas hits.
-        let mut best: Option<(Mode, u8, usize)> = None; // (mode, n_blocks, last_consumed_idx)
-        let tolerance = NSPS; // ±1 symbol of slop for each anchor
-
-        for mode in [Mode::Robust, Mode::Standard, Mode::Fast, Mode::Express] {
-            let block_samples = (COSTAS_LEN + mode.ch_bits_per_block() / 2) * NSPS;
-            let mut last_idx = i;
-            let mut n_blocks = 0u8;
-
-            for n in 1..=32u8 {
-                let expected = head_sample + (n as usize) * block_samples;
-                let mut next_idx: Option<usize> = None;
-                for j in (last_idx + 1)..hits.len() {
-                    let h = hits[j];
-                    if h + tolerance < expected {
-                        continue;
-                    }
-                    if h > expected + tolerance {
-                        break;
-                    }
-                    next_idx = Some(j);
-                    break;
-                }
-                if let Some(j) = next_idx {
-                    last_idx = j;
-                    n_blocks = n;
-                } else {
-                    break;
-                }
-            }
-
-            if n_blocks >= 1 && best.is_none_or(|(_, b, _)| n_blocks > b) {
-                best = Some((mode, n_blocks, last_idx));
-            }
-        }
-
-        let Some((mode, n_blocks, last_idx)) = best else {
-            continue;
-        };
-        // Refine the frame-head offset by maximising the sum of
-        // Costas correlation across **all** N+1 expected Costas
-        // positions (head + every block boundary + trailing). A
-        // single-anchor search at `head_sample` is ambiguous — the
-        // GFSK ramp shifts the head's apparent peak by a few
-        // samples, so a jitter brute-force over decode attempts
-        // wastes effort. Aggregating across N+1 anchors localises
-        // the true frame start to the integer offset that aligns
-        // every Costas in the frame.
-        let refined = refine_frame_offset(audio, head_sample, audio_centre_hz, mode, n_blocks);
-        if let Ok(frame) = decode_known_layout(audio, refined, audio_centre_hz, mode, n_blocks) {
-            found.push(frame);
-            for k in i..=last_idx {
-                consumed[k] = true;
-            }
-        }
-    }
-
-    found
+/// Compute the audio sample count required for a given (mode,
+/// n_blocks). Mirrors the formula in [`decode_known_layout`].
+fn needed_samples_for(mode: Mode, n_blocks: u8) -> usize {
+    let block_ch_bits = mode.ch_bits_per_block();
+    let n_data_syms = (n_blocks as usize) * block_ch_bits / 2;
+    let n_pilots = n_data_syms.div_ceil(PILOT_SYMBOL_INTERVAL - 1);
+    let total_syms = PREAMBLE_LEN + n_pilots + n_data_syms;
+    total_syms * NSPS + RRC_LEN
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -541,7 +559,6 @@ mod tests {
 
     /// Round-trip every mode at a representative frame size.
     #[test]
-    #[ignore = "Phase 1'c: rx.rs awaiting QPSK rewrite (tx.rs already pivoted)"]
     fn roundtrip_clean_channel_all_modes() {
         for mode in [Mode::Robust, Mode::Standard, Mode::Fast, Mode::Express] {
             let n_blocks = 4u8;
@@ -555,7 +572,6 @@ mod tests {
             assert_eq!(decoded.mode, mode);
             assert_eq!(decoded.block_count, n_blocks);
             assert_eq!(&decoded.payload[..payload.len()], &payload[..]);
-            // Trailing bytes are zero padding from the TX side.
             for &b in &decoded.payload[payload.len()..] {
                 assert_eq!(b, 0, "{mode:?} non-zero padding byte");
             }
@@ -563,9 +579,8 @@ mod tests {
     }
 
     /// Round-trip a 19-block Standard frame at QSL size (214 byte
-    /// payload). This is the design's flagship use case.
+    /// payload).
     #[test]
-    #[ignore = "Phase 1'c: rx.rs awaiting QPSK rewrite (tx.rs already pivoted)"]
     fn roundtrip_qsl_size_standard() {
         let header = header_for(Mode::Standard, 19, 1, 0);
         let payload: Vec<u8> = (0..214).map(|i| (i ^ 0xAA) as u8).collect();
@@ -574,10 +589,8 @@ mod tests {
         assert_eq!(&decoded.payload[..214], &payload[..]);
     }
 
-    /// Round-trip a 32-block Robust frame (the maximum frame size
-    /// at the most fade-tolerant mode).
+    /// Round-trip a 32-block Robust frame.
     #[test]
-    #[ignore = "Phase 1'c: rx.rs awaiting QPSK rewrite (tx.rs already pivoted)"]
     fn roundtrip_max_blocks_robust() {
         let header = header_for(Mode::Robust, 32, 5, 31);
         let payload: Vec<u8> = (0..(32 * INFO_BYTES_PER_BLOCK - HEADER_BYTES))
@@ -590,7 +603,6 @@ mod tests {
 
     /// A single-block frame should round-trip in every mode.
     #[test]
-    #[ignore = "Phase 1'c: rx.rs awaiting QPSK rewrite (tx.rs already pivoted)"]
     fn roundtrip_single_block_all_modes() {
         for mode in [Mode::Robust, Mode::Standard, Mode::Fast, Mode::Express] {
             let header = header_for(mode, 1, 0, 0);
@@ -602,10 +614,8 @@ mod tests {
         }
     }
 
-    /// Audio shorter than the layout demands must produce
-    /// `Truncated`, not panic.
+    /// Audio shorter than the layout demands → `Truncated`.
     #[test]
-    #[ignore = "Phase 1'c: rx.rs awaiting QPSK rewrite (tx.rs already pivoted)"]
     fn truncated_audio_is_reported() {
         let header = header_for(Mode::Robust, 4, 1, 0);
         let audio = encode(&header, b"hi", AUDIO_CENTRE_HZ).unwrap();
@@ -614,38 +624,26 @@ mod tests {
         assert_eq!(err, DecodeError::Truncated);
     }
 
-    /// Trying to decode a frame as the wrong mode must NOT silently
-    /// succeed: either FEC fails to converge, the CRC mismatches,
-    /// or the layout-mismatch check fires.
+    /// Decoding as the wrong mode must not silently succeed.
     #[test]
-    #[ignore = "Phase 1'c: rx.rs awaiting QPSK rewrite (tx.rs already pivoted)"]
     fn wrong_mode_rejects() {
         let header = header_for(Mode::Robust, 4, 1, 0);
         let audio = encode(&header, b"abc", AUDIO_CENTRE_HZ).unwrap();
-        // The audio is 4 Robust blocks; trying to decode as Standard
-        // gives a mismatched layout — but the Standard layout fits
-        // within the buffer (smaller block_ch_bits), so we'll get
-        // garbage LLRs and either FEC fail or CRC fail.
         let err = decode_known_layout(&audio, 0, AUDIO_CENTRE_HZ, Mode::Standard, 4).unwrap_err();
         assert!(
-            matches!(err, DecodeError::FecFailed | DecodeError::Crc(_)),
-            "expected FecFailed or Crc, got {err:?}",
+            matches!(
+                err,
+                DecodeError::FecFailed
+                    | DecodeError::Crc(_)
+                    | DecodeError::LayoutMismatch { .. }
+            ),
+            "expected FecFailed / Crc / LayoutMismatch, got {err:?}",
         );
     }
 
-    /// Auto-detecting decoder must find Robust / Standard frames
-    /// placed at the start of the audio. Fast / Express are
-    /// excluded at this payload density — at 16-byte payload in a
-    /// 4-block frame, ~58 % of the LDPC info bits per block are
-    /// zero (header + payload + zero-pad). Combined with rate-2/3
-    /// or rate-3/4 puncturing the BP+OSD path occasionally
-    /// converges to a parity-valid sibling codeword instead of the
-    /// transmitted one. Phase 2 will sweep payload zero-density ×
-    /// OSD depth and feed back into the LDPC opts; this commit
-    /// pins down the auto-detect plumbing without overfitting
-    /// to the corner cases.
+    /// Auto-detecting decoder must find a frame at the start of the
+    /// buffer.
     #[test]
-    #[ignore = "Phase 1'c: rx.rs awaiting QPSK rewrite (tx.rs already pivoted)"]
     fn auto_detect_each_mode_at_buffer_start() {
         for mode in [Mode::Robust, Mode::Standard] {
             let header = header_for(mode, 4, 2, 11);
@@ -662,10 +660,7 @@ mod tests {
         }
     }
 
-    /// Tracking test for the high-zero-density Fast-mode case.
-    /// `#[ignore]` until Phase 2's characterisation harness
-    /// quantifies the failure rate as a function of zero-padding
-    /// fraction × OSD depth.
+    /// Tracking test for high-zero-density Fast.
     #[test]
     #[ignore = "Phase 2: Fast-mode LDPC convergence on high-zero-density payloads"]
     fn auto_detect_fast_mode_high_zero_density() {
@@ -676,8 +671,7 @@ mod tests {
         assert_eq!(frames.len(), 1, "got {} frames", frames.len());
     }
 
-    /// Tracking test for the high-zero-density Express-mode case.
-    /// Same Phase 2 follow-up as `auto_detect_fast_mode_…`.
+    /// Tracking test for high-zero-density Express.
     #[test]
     #[ignore = "Phase 2: Express-mode LDPC convergence on high-zero-density payloads"]
     fn auto_detect_express_mode_high_zero_density() {
@@ -688,10 +682,8 @@ mod tests {
         assert_eq!(frames.len(), 1, "got {} frames", frames.len());
     }
 
-    /// Auto-detecting decoder finds a frame placed mid-buffer with
-    /// silence on both sides.
+    /// Auto-detect with leading + trailing silence.
     #[test]
-    #[ignore = "Phase 1'c: rx.rs awaiting QPSK rewrite (tx.rs already pivoted)"]
     fn auto_detect_with_leading_and_trailing_silence() {
         let header = header_for(Mode::Standard, 6, 3, 4);
         let payload: Vec<u8> = vec![0x77; 32];
@@ -711,10 +703,8 @@ mod tests {
         assert_eq!(&frames[0].payload[..payload.len()], &payload[..]);
     }
 
-    /// Auto-detecting decoder finds two distinct frames placed
-    /// back-to-back in the same audio buffer (separated by silence).
+    /// Two distinct frames back-to-back.
     #[test]
-    #[ignore = "Phase 1'c: rx.rs awaiting QPSK rewrite (tx.rs already pivoted)"]
     fn auto_detect_two_back_to_back_frames() {
         let h1 = header_for(Mode::Robust, 3, 1, 5);
         let p1: Vec<u8> = vec![0xAA; 20];
@@ -744,12 +734,26 @@ mod tests {
         assert_eq!(&f2.payload[..p2.len()], &p2[..]);
     }
 
-    /// Empty / silent audio must produce no frames.
+    /// Empty / silent audio → no frames.
     #[test]
     fn auto_detect_empty_audio() {
         let frames = decode(&[], AUDIO_CENTRE_HZ);
         assert!(frames.is_empty());
         let frames = decode(&vec![0.0f32; 5000], AUDIO_CENTRE_HZ);
         assert!(frames.is_empty());
+    }
+
+    /// QPSK soft-demap sanity: a clean +1+0j sample should give
+    /// strongly-negative LLRs (= bit 0) for both bits.
+    #[test]
+    fn qpsk_llr_clean_constellation_points() {
+        let (b1, b0) = qpsk_llrs(Complex32::new(1.0, 0.0));
+        assert!(b1 < 0.0 && b0 < 0.0, "+1+0j → ({b1}, {b0})");
+        let (b1, b0) = qpsk_llrs(Complex32::new(0.0, 1.0));
+        assert!(b1 < 0.0 && b0 > 0.0, "0+1j → ({b1}, {b0})");
+        let (b1, b0) = qpsk_llrs(Complex32::new(-1.0, 0.0));
+        assert!(b1 > 0.0 && b0 > 0.0, "-1+0j → ({b1}, {b0})");
+        let (b1, b0) = qpsk_llrs(Complex32::new(0.0, -1.0));
+        assert!(b1 > 0.0 && b0 < 0.0, "0-1j → ({b1}, {b0})");
     }
 }

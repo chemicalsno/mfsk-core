@@ -74,7 +74,6 @@ fn awgn_per(
 /// formula bug, AWGN helper miswired) — not to gate any SNR or
 /// PER threshold.
 #[test]
-#[ignore = "Phase 1'c: rx.rs awaiting QPSK rewrite (tx.rs already pivoted)"]
 fn awgn_smoke_gate_clean_channel_low_rate_modes() {
     let n = 20;
     let full_payload = 44; // 4 blocks × 12 byte − 4 byte header

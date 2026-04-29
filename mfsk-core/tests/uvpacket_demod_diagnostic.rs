@@ -18,11 +18,14 @@ use mfsk_core::uvpacket::{AUDIO_CENTRE_HZ, Mode, rx, tx};
 mod common;
 use common::channel::{AwgnChannel, awgn_sigma_for_eb_n0_info};
 
-/// Confirm that synthesised audio sits where the σ formula assumes:
-/// peak ≤ 1.0, RMS ≈ 1/√2.
+/// Confirm the synthesised audio's envelope sits in the expected
+/// QPSK+RRC range. After the Phase 2 modulation pivot the burst is
+/// no longer constant-envelope: TX peak-normalises to ≤ 1, RMS sits
+/// well below `1/√2` because the RRC-shaped QPSK has ~7 dB PAPR.
+/// Phase 2'a will recalibrate the σ-formula in `awgn_sigma_for_eb_n0_info`
+/// against this signal power.
 #[test]
-#[ignore = "Phase 1'c: σ formula assumed unit-envelope 4-FSK; QPSK+RRC has different PAPR/RMS"]
-fn audio_peak_and_rms_match_assumed_unit_amplitude() {
+fn audio_envelope_matches_qpsk_rrc_assumptions() {
     let header = FrameHeader {
         mode: Mode::Robust,
         block_count: 4,
@@ -35,10 +38,13 @@ fn audio_peak_and_rms_match_assumed_unit_amplitude() {
     let mean_sq: f32 = audio.iter().map(|s| s * s).sum::<f32>() / audio.len() as f32;
     let rms = mean_sq.sqrt();
     eprintln!("audio diag: peak={peak:.4}, rms={rms:.4}, mean_sq={mean_sq:.4}");
-    assert!(peak <= 1.05, "peak {peak} exceeds amplitude=1 by more than 5%");
+    assert!(peak <= 1.05, "peak {peak} > 1.05 (TX peak-normalisation broke)");
+    // QPSK + RRC + 1500 Hz upconvert: empirically RMS ≈ 0.2 — 0.5
+    // depending on payload-driven peak distribution. Anything outside
+    // that range signals a TX wiring change.
     assert!(
-        (0.55..=0.85).contains(&rms),
-        "RMS {rms} far off the expected ≈ 0.707",
+        (0.10..=0.55).contains(&rms),
+        "RMS {rms} outside the expected QPSK+RRC envelope range",
     );
 }
 
