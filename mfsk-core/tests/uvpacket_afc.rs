@@ -11,7 +11,9 @@
 use std::f32::consts::PI;
 
 use mfsk_core::uvpacket::framing::FrameHeader;
-use mfsk_core::uvpacket::rx::{AfcOpts, decode_known_layout, decode_known_layout_with_afc};
+use mfsk_core::uvpacket::rx::{
+    AfcOpts, decode_known_layout, decode_known_layout_with_afc, diag_estimate_freq_offset,
+};
 use mfsk_core::uvpacket::{AUDIO_CENTRE_HZ, Mode, tx};
 
 mod common;
@@ -124,8 +126,17 @@ fn afc_diag_estimate_accuracy() {
                 break;
             }
         }
+        // Direct probe of AFC's frequency-offset estimate.
+        let est = diag_estimate_freq_offset(
+            &audio,
+            0,
+            AUDIO_CENTRE_HZ,
+            audio.len(),
+            &afc,
+        );
         eprintln!(
-            "Δf_true {delta:+7.1} Hz: AFC = {:?}  baseline_centre @ {:?}",
+            "Δf_true {delta:+7.1} Hz: AFC_est={:>7.2} Hz  decode={:?}  baseline_centre @ {:?}",
+            est.unwrap_or(f32::NAN),
             res.as_ref().map(|_| "✓").map_err(|e| format!("{e:?}")),
             baseline_works_at,
         );
