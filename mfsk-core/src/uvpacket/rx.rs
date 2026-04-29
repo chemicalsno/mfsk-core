@@ -1259,6 +1259,55 @@ pub struct SyncStats {
     pub n_scores: usize,
 }
 
+/// Diagnostic: finds the strongest preamble peak in `audio`, runs the
+/// per-peak AFC that `decode` would, and returns the pre-AFC and
+/// post-AFC sync statistics plus the estimated frequency offset.
+///
+/// Useful for diagnosing acoustic-loopback decode failures: a
+/// successful AFC should rebuild the coherence ratio toward the
+/// Cauchy-Schwarz limit (`PREAMBLE_LEN = 31`); if the post-AFC ratio
+/// stays low or the offset estimate looks wild, the issue is upstream
+/// of carrier offset (audio-path distortion, phase noise, …) rather
+/// than residual freq.
+///
+/// Returns `(pre_stats, delta_f, post_stats)`.
+pub fn diag_sync_with_afc(audio: &[f32], audio_centre_hz: f32) -> (SyncStats, f32, SyncStats) {
+    let pre = diag_sync_stats(audio, audio_centre_hz);
+    if pre.global_max <= 0.0 {
+        return (pre, 0.0, pre);
+    }
+    // Re-derive the strongest peak's mf_off from a fresh score pass —
+    // diag_sync_stats doesn't expose it. Same matched filter + score
+    // pass that decode_inner uses, just we keep the position as well.
+    let mf_out = downconvert_and_matched_filter(audio, audio_centre_hz);
+    let max_corr_offset = mf_out.len().saturating_sub((PREAMBLE_LEN - 1) * NSPS + 1);
+    if max_corr_offset == 0 {
+        return (pre, 0.0, pre);
+    }
+    let mut best_off = 0_usize;
+    let mut best_score = 0.0_f32;
+    for offset in 0..max_corr_offset {
+        let s = preamble_coherence_score(&mf_out, offset);
+        if s > best_score {
+            best_score = s;
+            best_off = offset;
+        }
+    }
+    let Some(audio_off) = best_off.checked_sub(SYM_PEAK_OFFSET) else {
+        return (pre, 0.0, pre);
+    };
+    let afc_window = (PREAMBLE_LEN - 1) * NSPS + 1 + RRC_LEN;
+    if audio_off + afc_window > audio.len() {
+        return (pre, 0.0, pre);
+    }
+    let afc_opts = AfcOpts::default();
+    let delta_f =
+        diag_estimate_freq_offset(audio, audio_off, audio_centre_hz, afc_window, &afc_opts)
+            .unwrap_or(0.0);
+    let post = diag_sync_stats(audio, audio_centre_hz + delta_f);
+    (pre, delta_f, post)
+}
+
 /// Compute [`SyncStats`] for a given audio buffer at a known centre.
 /// Same matched-filter + preamble correlation + median statistic that
 /// [`decode`] uses for its sync gate, but returned to the caller
