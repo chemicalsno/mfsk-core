@@ -40,8 +40,8 @@
 //!
 //! - [`UvRobust`] — `Ldpc240_101` native rate 0.42, 1008 net bps.
 //!   Mountain / weak-signal posture.
-//! - [`UvStandard`] — punctured to rate 1/2, 1200 net bps. Throughput
-//!   parity with AFSK 1200, with FEC.
+//! - [`UvStandard`] — punctured to rate 1/2, 1200 net bps. Typical
+//!   NFM with fading.
 //! - [`UvFast`] — rate 2/3, 1600 net bps (+33 %).
 //! - [`UvExpress`] — rate 3/4, 1800 net bps (+50 %). OSD-2 is
 //!   essentially mandatory at the BP threshold; viable only thanks to
@@ -87,22 +87,24 @@
 //!
 //! ## Characterisation
 //!
-//! Phase 2'a / 2'b sweeps (commit `f590adf`, σ formula calibrated
-//! from per-burst signal power):
+//! σ formula calibrated from per-burst signal power
+//! (`tests/common/channel.rs`):
 //!
-//! - **AWGN**: 100 % PER at +8 dB Eb/N0_info across all four modes;
-//!   50 % PER at +4 dB. Matches QPSK + LDPC theory (~1–2 dB code
-//!   gain over uncoded QPSK).
+//! - **AWGN**: 50 % PER at +3.7 dB Eb/N0_info, 100 % PER at +6–8 dB.
 //! - **Rayleigh** (4-block, 20-byte payload, ≥ 90 % PER):
-//!   Robust/Standard at +12 dB / 1–5 Hz, +15 dB / 10 Hz Doppler;
-//!   Fast/Express at +15 dB across all Doppler.
+//!   Robust at +10–12 dB / 1–5 Hz Doppler, +12–15 dB / 10 Hz;
+//!   Express at +15 dB across all Doppler.
+//! - **LDPC-only ceiling** (modem-bypassed): Robust 50 % PER at
+//!   +0.5 dB, Express at +1.5 dB. The ~3 dB end-to-end gap is the
+//!   modem implementation loss; see `docs/UVPACKET.md` §4 for the
+//!   breakdown.
 //!
 //! Representative WAV samples for ear-level inspection live at
 //! `audio_samples/uvpacket/` in the repository.
 //!
 //! See [`docs/UVPACKET.md`](https://github.com/jl1nie/mfsk-core/blob/main/docs/UVPACKET.md)
-//! for the full positioning narrative, AX.25 comparison, and
-//! rationale for the QPSK pivot.
+//! for the full design narrative, the modulation-pivot history,
+//! and the implementation-loss breakdown.
 
 pub mod framing;
 pub mod interleaver;

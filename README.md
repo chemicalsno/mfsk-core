@@ -117,15 +117,18 @@ phase tracking, byte-pipe API, and a bespoke TX/RX path. Four sub-
 modes (Robust/Standard/Fast/Express, 1008–1800 net bps) trade
 robustness for throughput via puncturing.
 
-Phase 2 characterisation: 100 % PER at +8 dB Eb/N0_info on AWGN;
-≥ 90 % PER at +12–15 dB on Rayleigh fading (1–10 Hz Doppler).
-~6–7 dB Eb/N0 advantage over AX.25 / AFSK 1200 in the same NFM
-audio passband.
+Phase 2 characterisation: 50 % PER at +3.7 dB Eb/N0_info on AWGN
+(100 % PER at +6–8 dB); ≥ 90 % PER at +10–15 dB on Rayleigh fading
+(1–10 Hz Doppler). The LDPC-only ceiling sits at +0.5 dB; the ~3 dB
+gap is the QPSK modem implementation loss (documented as Phase 3+
+work).
 
 See [`docs/UVPACKET.md`](https://github.com/jl1nie/mfsk-core/blob/main/docs/UVPACKET.md)
 ([日本語](https://github.com/jl1nie/mfsk-core/blob/main/docs/UVPACKET.ja.md))
-for the full positioning narrative and characterisation curves;
-representative WAV samples live at `audio_samples/uvpacket/`.
+for the full design narrative, the modulation-pivot history that
+shaped the current implementation, and the characterisation curves
+underlying those headline numbers; representative WAV samples live
+at `audio_samples/uvpacket/`.
 
 ## Modules
 

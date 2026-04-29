@@ -1,69 +1,45 @@
-# uvpacket — NFM voice-channel packet protocol (applied example)
+# uvpacket — applied example: NFM voice-channel packet protocol
 
 > **日本語版:** [UVPACKET.ja.md](UVPACKET.ja.md)
 
 `uvpacket` is an in-tree applied example of how `mfsk-core`'s FEC
-infrastructure (`Ldpc240_101`, belief propagation, OSD-2) can be
+infrastructure (`Ldpc240_101`, belief propagation, OSD-2/3) can be
 reused outside the WSJT-X family. It is **not** a member of that
 family. It targets a different design point — narrow-FM voice
 channels (HT/mobile, ~3 kHz audio passband) intended for private-
 group amateur-radio messaging (signed QSL exchange, short text,
 position reports).
 
-This document covers the positioning, the design choices, the
-characterisation results, and the comparison with AX.25 / AFSK 1200
-(the only fair baseline at this design point). For the API surface
-see the in-source rustdoc.
+This document covers the design choices, the characterisation
+results, and the known modem implementation loss. For the API
+surface see the in-source rustdoc.
 
-## 1. Positioning
+## 1. Scope
 
-### 1.1 What problem this solves
+### 1.1 What this is
 
-AX.25 / AFSK 1200 has been the de facto NFM digital protocol for
-~40 years. It has two characteristics that motivated this
-experiment:
+A **four-mode packet modem** that fits inside an NFM voice
+passband, layered on a hand-tuned irregular LDPC mother code from
+FST4. Designed for **private groups** running the same software on
+both ends — not a public protocol replacement, not interoperable
+with anything else.
 
-1. **No FEC.** A single bit error anywhere in the frame is fatal.
-   On a clean channel that's fine; on a fading channel a single
-   deep null kills frames that would otherwise carry useful range.
-2. **Non-coherent BFSK** at 1200 baud, audio centre 1700 Hz. The
-   demod has no phase reference and pays the textbook ~3 dB
-   non-coherent penalty.
+### 1.2 What this is not
 
-If you accept those two as fixed, the only knob you can turn for
-better range is transmit power. uvpacket asks: *if we replace the
-modem and add an LDPC code that fits inside the same NFM audio
-passband, how much margin do we get?*
+- Not an interoperable mode. No standardisation, no TNC support.
+- Not a voice mode. Data only.
+- Not a wideband mode. Fits in NFM voice (~3 kHz), nominal 1–1.8
+  kbps net throughput. Different design point from M17 / D-STAR /
+  DMR / VARA FM.
+- Not a weak-signal mode. Aimed at the operating envelope above the
+  FM threshold (CNR ≥ +9–10 dB), which is the channel's own
+  irreducible floor for any FM-detected mode.
 
-### 1.2 What this is **not**
+### 1.3 Where it sits
 
-- Not a public APRS replacement. Wide deployment requires
-  interoperability with existing TNCs and that ship has sailed.
-  uvpacket is for **private groups** running the same software on
-  both ends.
-- Not a voice mode. M17, D-STAR, DMR / NXDN are voice-primary
-  protocols with optional data subchannels. uvpacket is data-only.
-- Not a wideband mode. VARA FM uses ~12.5 kHz of bandwidth and
-  delivers ~25 kbps; uvpacket fits in NFM voice (~3 kHz) and
-  delivers 1–1.8 kbps. Different leagues.
-
-### 1.3 Where this fits
-
-| Mode | net bps | Bandwidth | AWGN threshold (SNR_3kHz) | FEC | Open source |
-|---|---:|---|---:|---|:-:|
-| AX.25 / AFSK 1200 | 1200 | NFM (~3 kHz) | +10 dB | none | ✓ |
-| uvpacket Robust | 1008 | NFM | **+3 dB** | LDPC 0.42 | ✓ |
-| uvpacket Express | 1800 | NFM | **+5–6 dB** | LDPC 0.75 | ✓ |
-| M17 (4-FSK) | 4800 | ~9 kHz | +5–7 dB | conv | ✓ |
-| D-STAR DV | 4800 | 6.25 kHz | ~+10 dB CNR | Golay | partial |
-| DMR / NXDN | 4-FSK | 6.25 / 12.5 kHz | ~+7–8 dB CNR | BCH | (commercial) |
-| VARA FM | ~25000 | 12.5 kHz | +10 dB | proprietary | ✗ |
-
-uvpacket sits in a niche that turns out to be relatively empty: an
-**open-source data-only NFM digital protocol with FEC and decent
-fading tolerance, in the AX.25 audio-bandwidth slot**. It is not
-revolutionary versus M17/VARA on different design points, but it is
-a clear improvement over AX.25 in its own.
+uvpacket fills an open-source niche: an LDPC-coded data-only NFM
+modem with a coherent QPSK physical layer, sub-second burst
+duration, and graceful rate ladder for opportunistic throughput.
 
 ## 2. Design
 
@@ -88,16 +64,17 @@ The TX peak-normalises the burst envelope to ≤ 1; RMS sits around
 Frame head is a **31-bit BPSK m-sequence** (Fibonacci LFSR,
 polynomial x⁵ + x² + 1, initial state `[0, 0, 0, 0, 1]`). 31 chips
 × 1 sym/chip = 26 ms preamble at 1200 baud. Cyclic autocorrelation
-sidelobes are bounded by 1/31 ≈ −15 dB amplitude — clean correlator
-peak for symbol-timing acquisition, frame detection, and initial
-carrier-phase reference.
+sidelobes are bounded by 1/31 ≈ −15 dB amplitude — a clean
+correlator peak for symbol-timing acquisition, frame detection,
+and initial carrier-phase reference.
 
 After the preamble, **one known QPSK pilot symbol every 32
 transmitted symbols** (≈ 3 % overhead). The pilot constellation
 point is +1 + 0j. The RX builds a per-symbol phase reference by
-linearly interpolating between consecutive pilot anchors; a full
-decision-directed PLL is overkill at this pilot density and channel
-coherence time.
+linearly interpolating between consecutive pilot anchors. A
+**per-block decision-directed correction** (see §4) is then applied
+on top of the pilot interpolation to absorb the average within-
+block phase-tracking residual.
 
 ### 2.3 FEC
 
@@ -108,10 +85,10 @@ puncturing chosen by **kSR-greedy puncture-set selection**
 
 | Sub-mode | rate | Puncture | Net bps | Posture |
 |---|---:|---:|---:|---|
-| Robust | 0.42 | 0 % | 1008 | mountain / weak signal / deep fading |
+| Robust | 0.42 | 0 % | 1008 | maximum-margin posture |
 | Standard | 0.50 | 30 % | 1200 | typical NFM with fading |
 | Fast | 0.66 | 63 % | 1600 | good-signal default |
-| Express | 0.75 | 76 % | 1800 | strong-signal headline-fast (OSD-2 mandatory) |
+| Express | 0.75 | 76 % | 1800 | strong-signal headline (OSD-3 mandatory) |
 
 kSR-greedy delivers ~1–3 dB Eb/N0 gain over uniform-spread
 puncturing at the deeper rates, which is what makes Express viable
@@ -122,14 +99,13 @@ at all (uniform-spread fails to converge at 76 % parity puncture).
 - Variable length: 1–32 LDPC blocks per frame.
 - Each LDPC block carries 96 info bits (12 byte) padded to the
   FEC's 101-bit input. The remaining 5 bits per block carry a
-  **D-iii spread copy** of the 32-bit frame header (header replicated
-  ~7 times across the frame for slow-path recovery — currently the
-  fast path simply uses block 0's CRC-validated header).
+  **D-iii spread copy** of the 32-bit frame header (header
+  replicated ~7 times across the frame for slow-path recovery —
+  the current fast path simply uses block 0's CRC-validated header).
 - 4-byte frame header: mode (2b) + block count (5b) + app type
   (4b) + sequence (5b) + CRC-16 (16b).
 - **Block-interleaver** across all codewords in the frame spreads
-  fade-burst erasures across every codeword — the deeper the
-  Rayleigh null, the more it gets diluted.
+  fade-burst erasures across every codeword.
 
 ### 2.5 Application API
 
@@ -148,108 +124,133 @@ the bytes. Suggested allocation:
 
 ## 3. Characterisation
 
-### 3.1 AWGN
+### 3.1 LDPC layer (modem-bypassed reference)
 
-Phase 2'a sweep, 30 trials per cell, 4-block frame, 44-byte payload.
-Eb/N0 is **per information bit** (cross-mode-fair convention used
-throughout the WSJT family). σ is calibrated from per-burst
-measured signal power — see [§4](#4-snr-calibration-history) for
-why this matters.
+`tests/uvpacket_ldpc_direct.rs` feeds Gaussian-noise LLRs straight
+into the LDPC decoder, calibrated for `Eb/N0_info` per channel bit.
+This isolates the FEC from the modem and gives the **theoretical
+ceiling** the QPSK end-to-end pipeline aspires to:
+
+```
+mode      eb/n0 (dB)  -2  -1   0   1   2   3   4
+─────────────────────────────────────────────────
+Robust                 0   2   6  21  28  30  30
+Standard               0   1   5  20  29  30  30
+Fast                   0   1   6  22  26  30  30
+Express                0   0   0  14  24  29  30
+```
+
+50 % PER thresholds: Robust ≈ +0.5 dB, Standard / Fast ≈ +0.7 dB,
+Express ≈ +1.5 dB. The mother code's design rate is 0.42 so Robust
+holds a ~1 dB lead at the FEC layer.
+
+### 3.2 QPSK end-to-end (modem + FEC)
+
+`tests/uvpacket_demod_diagnostic::awgn_threshold_finder_per_mode`,
+30 trials per cell, 4-block frame, 44-byte payload, OSD-3:
 
 ```
 mode      eb/n0 (dB)  -2  0  2  4  6  8 10 12 14 16 18 20 22
 ─────────────────────────────────────────────────────────────
-Robust                 0  0  0  9 26 29 30 30 30 30 30 30 30
-Standard               0  0  1 15 27 30 30 30 30 30 30 30 30
-Fast                   0  0  1 19 27 30 30 30 30 30 30 30 30
-Express                0  0  1 16 29 30 30 30 30 30 30 30 30
+Robust                 0  0  3 19 27 30 30 30 30 30 30 30 30
+Standard               0  0  4 21 30 30 30 30 30 30 30 30 30
+Fast                   0  0  3 20 29 30 30 30 30 30 30 30 30
+Express                0  0  1 19 30 30 30 30 30 30 30 30 30
 ```
 
-All four modes hit **50 % PER at +4 dB** Eb/N0_info, **100 % PER
-at +8 dB**. This matches QPSK + rate-0.42–0.75 LDPC theory (~1–2 dB
-code gain over uncoded QPSK at 1e-2 BER).
+50 % PER threshold ≈ **+3.7 dB** Eb/N0_info, 100 % PER threshold ≈
+**+6–8 dB**. Modem implementation loss versus the LDPC-only ceiling
+is **~3 dB across all modes**.
 
-### 3.2 Rayleigh flat fading
+The Robust LDPC advantage from §3.1 is largely consumed by the
+modem implementation loss — see §4. Robust does win below the
+modem floor where the higher-rate modes catastrophically fail, but
+that regime is operationally narrow.
 
-Phase 2'b sweep, 30 trials per cell, 4-block frame, 20-byte payload.
+### 3.3 Rayleigh flat fading
+
+`tests/uvpacket_rayleigh.rs`, 30 trials per cell, 4-block frame,
+20-byte payload:
 
 ```
-mode      doppler  +10  +12  +15  +20  +25  +30  +35  (Eb/N0_info dB)
+mode       Doppler  +10  +12  +15  +20  +25  +30  +35  (Eb/N0_info dB)
 ──────────────────────────────────────────────────────────────────
-Robust    1 Hz     25   26   30   30   30   30
-Robust    5 Hz     24   30   30   30   30   30
-Robust    10 Hz    19   21   26   29   30   30
-Standard  1 Hz     23   27   29   30   30   30
-Standard  5 Hz     23   30   30   30   30   30
-Standard  10 Hz    19   21   27   30   30   30
-Fast      1 Hz     17        29   30   30   30   30
-Fast      5 Hz     23        29   30   30   30   30
-Fast      10 Hz    22        29   30   30   30   30
-Express   1 Hz     16        26   30   30   30   30
-Express   5 Hz     19        29   30   30   30   30
-Express   10 Hz    19        29   30   30   30   30
+Robust     1 Hz     —    —    30   30   30   30   —
+Robust     5 Hz     28   30   30   30   30   30   —
+Robust    10 Hz     20   24   29   30   30   30   —
+Standard   1 Hz     24   28   29   30   30   30   —
+Standard   5 Hz     26   30   30   30   30   30   —
+Standard  10 Hz     19   21   27   30   30   30   —
+Fast       1 Hz     —    —    —    30   30   30   30
+Fast       5 Hz     23   —    29   30   30   30   30
+Fast      10 Hz     23   —    30   30   30   30   30
+Express    1 Hz     18   —    26   30   30   30   30
+Express    5 Hz     22   —    29   30   30   30   30
+Express   10 Hz     22   —    29   30   30   30   30
 ```
 
-≥ 90 % PER thresholds:
-
-- **Robust / Standard**: +12 dB at 1–5 Hz Doppler, +15 dB at 10 Hz
-- **Fast / Express**: +15 dB across all Doppler
-
-These are realistic fading-tolerance numbers for VHF/UHF mobile NFM
-channels.
-
-### 3.3 Comparison with AX.25 / AFSK 1200
-
-For a 256-byte AX.25 frame at FER ≤ 1 %, BER must be ≤ ~5e-6. Non-
-coherent BFSK reaches that BER at Eb/N0 ≈ 14 dB. Translating to
-SNR in a 3 kHz audio passband:
-
-- **AFSK 1200**: 14 + 10·log₁₀(1200/3000) = **+10 dB SNR_3kHz**
-- **uvpacket Robust**: 8 + 10·log₁₀(1008/3000) = **+3 dB SNR_3kHz**
-- **uvpacket Express**: ~8 + 10·log₁₀(1800/3000) = **+6 dB SNR_3kHz**
-
-uvpacket Robust is **~7 dB** better than AX.25 at comparable
-throughput; Express is **~4 dB** better while delivering 50 % more
-net bps. On Rayleigh fading the gap widens (AX.25 has no FEC and
-its frames are atomic against any single-bit erasure; uvpacket's
-FEC + interleaver dilute fade bursts across every codeword).
+≥ 90 % PER thresholds: **Robust ~+10–12 dB at 1–5 Hz Doppler,
+~+15 dB at 10 Hz**; Express ~+15 dB across all Doppler. Realistic
+fading-tolerance for VHF/UHF mobile NFM channels.
 
 ### 3.4 The +9–10 dB FM-threshold floor
 
-Both modems sit on top of FM detection. Below CNR ≈ +9–10 dB the FM
-discriminator output is dominated by impulse noise and **both
-modems fail catastrophically**. The audio-domain Eb/N0 numbers
-above are meaningful only above the FM threshold; below it, neither
-protocol decodes. This is a property of the channel, not the
-modems.
+The modem sits on top of FM detection. Below CNR ≈ +9–10 dB the FM
+discriminator output is dominated by impulse noise and **the modem
+fails catastrophically**. The audio-domain Eb/N0 numbers above are
+meaningful only above the FM threshold; below it, no audio-domain
+demod recovers. This is a property of the channel, not the modem.
 
-To get below the FM threshold you need a different on-air
-modulation (SSB digital, direct IQ digital), which is outside the
-scope of this experiment.
+To get below the FM threshold a different on-air modulation (SSB
+digital, direct IQ digital) is needed, which is outside the scope
+of this experiment.
 
-## 4. SNR calibration history
+## 4. Known modem implementation loss
 
-The Phase 1 4-FSK design (h = 0.5, GFSK BT = 0.5) showed a ~+11 dB
-SNR threshold gap versus theory. Two contributions:
+The ~3 dB gap between the LDPC-only threshold (§3.1) and the QPSK
+end-to-end threshold (§3.2) is the modem implementation loss. It
+breaks down approximately as:
 
-1. **Tone non-orthogonality**: at h = 0.5, the orthogonality
-   integral `sinc(Δf · T_sym) = sinc(0.5) ≈ 0.637` — adjacent tones
-   leak 64 % of their energy, breaking max-likelihood symbol
-   detection. This was the root cause and motivated the modulation
-   pivot to QPSK (I/Q axes are orthogonal by construction).
-2. **σ-formula miscalibration**: the AWGN harness assumed a
-   constant-envelope `P = 0.5` signal. After the QPSK pivot, RRC-
-   shaped QPSK has RMS ≈ 0.22 (peak-normalised to 1), so the stated
-   Eb/N0 was off by ~10 dB. Phase 2'a recalibrated the formula to
-   take per-burst measured signal power.
+- **~1.5 dB irreducible floor** at moderate-to-high SNR — likely a
+  combination of finite-span RRC mismatch, `signal_power` formula
+  treating preamble/pilot energy as data energy, and amplitude /
+  σ_n estimator noise.
+- **~1.5 dB low-SNR penalty** that shrinks as SNR rises — pilot-
+  interpolated phase tracking has variance proportional to channel
+  σ²_n, so pilot phase estimates are noisier exactly when the
+  modem is closest to its threshold. Robust suffers most because
+  its σ_n is largest at fixed Eb/N0_info.
 
-The numbers in §3 are post-recalibration and are cross-modulation-
-comparable. The tx-side burst power is measured via
-`signal_power(audio) = mean(audio²)` and fed into
-`awgn_sigma_for_eb_n0_info(mode, eb_n0_db, signal_power)` — see
-`mfsk-core/tests/common/channel.rs`.
+The current rx (commit history through `Phase 2'a improvements`)
+implements:
 
-## 5. Audio samples
+- σ-aware LLR scaling: `LLR = (A / σ²_n) · qpsk_max_log(r_derot)`
+- Magnitude-based σ²_n estimator from data symbols:
+  `σ²_n = (E[|r|²] − A²) / 2`
+- One-pass per-block decision-directed phase correction (DDPT):
+  hard-decide each data symbol, accumulate residual phase per LDPC
+  block, apply as a constant correction on top of pilot interp
+- OSD-3 fallback (mandatory for Express, marginal-but-positive for
+  the others)
+
+These took ~0.4 dB out of the original ~3.5 dB modem loss. The
+remaining ~1.5–3 dB requires deeper changes (denser pilots → TX
+format change, proper decision-directed PLL with per-symbol phase
+update, sub-sample timing recovery). Phase 3+ work, not bug-fix.
+
+## 5. Modulation pivot history
+
+The first 0.3.1 design was 4-GFSK at h = 0.5. Phase 2 found the
+orthogonality integral `sinc(0.5) ≈ 0.637` left adjacent tones
+leaking 64 % of their energy, breaking max-likelihood symbol
+detection. The redesign to coherent QPSK + RRC matched filter was
+committed mid-cycle. See `docs/0.3.1_PLAN.md` for the chronology.
+
+The σ formula in `tests/common/channel.rs` was also recalibrated
+in Phase 2'a to take per-burst measured signal power, so stated
+Eb/N0_info numbers are now cross-modulation comparable.
+
+## 6. Audio samples
 
 Representative WAV files for ear-level inspection live at
 `audio_samples/uvpacket/` in this repository. All are 12 kHz mono
@@ -272,13 +273,11 @@ cargo run --release --features uvpacket --example uvpacket_samples
 
 The clean Robust burst is ~440 ms; Express is ~270 ms. The audible
 character is "narrow-band data buzz" — the RRC pulse spreads each
-QPSK symbol across multiple tones, so the spectrum is roughly
-flat across `[1500 − 600, 1500 + 600] Hz` with raised-cosine
-shoulders. To a human ear it sounds fairly close to AFSK 1200,
-slightly more "smeared" because the constellation moves through
-all four phases rather than two tones.
+QPSK symbol across multiple tones, giving an approximately flat
+spectrum across `[1500 − 600, 1500 + 600] Hz` with raised-cosine
+shoulders.
 
-## 6. Implementation pointers
+## 7. Implementation pointers
 
 | Layer | File |
 |---|---|
@@ -290,9 +289,11 @@ all four phases rather than two tones.
 | TX (bytes → audio) | [`mfsk-core/src/uvpacket/tx.rs`](../mfsk-core/src/uvpacket/tx.rs) |
 | RX (audio → bytes) | [`mfsk-core/src/uvpacket/rx.rs`](../mfsk-core/src/uvpacket/rx.rs) |
 | AWGN + Rayleigh harness | [`mfsk-core/tests/common/channel.rs`](../mfsk-core/tests/common/channel.rs) |
-| Threshold sweeps | [`mfsk-core/tests/uvpacket_awgn.rs`](../mfsk-core/tests/uvpacket_awgn.rs), [`uvpacket_rayleigh.rs`](../mfsk-core/tests/uvpacket_rayleigh.rs) |
+| LDPC-only sweep (modem-bypassed) | [`mfsk-core/tests/uvpacket_ldpc_direct.rs`](../mfsk-core/tests/uvpacket_ldpc_direct.rs) |
+| Modem TX/RX diagnostics | [`mfsk-core/tests/uvpacket_modem_diag.rs`](../mfsk-core/tests/uvpacket_modem_diag.rs) |
+| AWGN / Rayleigh threshold sweeps | [`mfsk-core/tests/uvpacket_awgn.rs`](../mfsk-core/tests/uvpacket_awgn.rs), [`uvpacket_rayleigh.rs`](../mfsk-core/tests/uvpacket_rayleigh.rs) |
 
-## 7. License
+## 8. License
 
 GPL-3.0-or-later, matching the rest of `mfsk-core`. The LDPC mother
 code is derived from WSJT-X (`lib/fst4/`).

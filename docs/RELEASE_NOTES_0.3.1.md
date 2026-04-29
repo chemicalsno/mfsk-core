@@ -60,14 +60,15 @@ not a wideband mode.
 σ formula calibrated from per-burst measured signal power for
 cross-modulation comparability.
 
-- **AWGN**: 100 % PER at +8 dB Eb/N0_info across all four modes;
-  50 % PER at +4 dB. Matches QPSK + LDPC theory.
+- **AWGN**: 50 % PER at +3.7 dB Eb/N0_info, 100 % PER at +6–8 dB
+  across all four modes.
 - **Rayleigh** (4-block, 20-byte payload, ≥ 90 % PER):
-  Robust/Standard +12 dB at 1–5 Hz, +15 dB at 10 Hz Doppler;
-  Fast/Express +15 dB across all Doppler.
-- **vs AX.25**: Robust at +3 dB SNR_3kHz vs AFSK 1200 at +10 dB —
-  ~7 dB Eb/N0 advantage at comparable throughput. The +9–10 dB FM
-  threshold floor still bounds both modems.
+  Robust at +10–12 dB / 1–5 Hz Doppler, +12–15 dB at 10 Hz;
+  Express at +15 dB across all Doppler.
+- **LDPC-only ceiling** (modem-bypassed): Robust 50 % PER at
+  +0.5 dB, Express at +1.5 dB. The ~3 dB end-to-end gap is the
+  QPSK modem implementation loss — the dominant remaining work for
+  Phase 3+.
 
 ### Modulation pivot history
 
@@ -91,8 +92,9 @@ cargo run --release --features uvpacket --example uvpacket_samples
 
 - [`docs/UVPACKET.md`](UVPACKET.md) /
   [`docs/UVPACKET.ja.md`](UVPACKET.ja.md) — full positioning
-  narrative, comparison with AX.25 / M17 / D-STAR / DMR / VARA FM,
-  and characterisation tables.
+  narrative, design choices, characterisation tables for AWGN +
+  Rayleigh + LDPC-only ceiling, and the known modem
+  implementation-loss section.
 - [`docs/0.3.1_PLAN.md`](0.3.1_PLAN.md) — design plan and
   modulation-pivot rationale (kept for posterity).
 

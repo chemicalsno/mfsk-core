@@ -205,9 +205,206 @@ pub fn decode_known_layout(
         anchor_phase.push(unwrapped);
     }
 
-    // 5. QPSK soft-demap each data symbol after de-rotation.
+    // 4b. Decision-directed phase refinement. The pilot grid (every
+    //     32 sym) leaves significant phase-tracking residual on data
+    //     symbols at low SNR — that residual is the dominant modem
+    //     implementation loss (~1–2 dB at the threshold).
+    //
+    //     One-pass DDPT: hard-decide each data symbol using the
+    //     pilot-only phase track, then incorporate that decision as
+    //     an additional phase anchor. Wrong decisions add noise to
+    //     the anchor set but the gain from 32× density typically
+    //     dominates as long as the bit error rate is < ~25 %.
+    //
+    //     Since the channel is slowly-varying (AWGN: phase is
+    //     constant; Rayleigh: ≤ 10 Hz Doppler), a single global
+    //     additive phase offset captures most of the per-block
+    //     phase noise. We do the refinement **per LDPC block** —
+    //     each block gets its own averaged DD phase correction
+    //     applied on top of the pilot-interpolated phase. Within a
+    //     block (≤ ~120 syms = 100 ms) the phase is stable to a few
+    //     mrad even at 10 Hz Doppler.
+    let block_data_syms = block_ch_bits / 2;
+    let mut block_dd_correction = vec![0.0_f32; n_blocks_u];
+    {
+        // Walk all symbols in TX order. The data slot for block b
+        // covers data-symbol indices `[b·block_data_syms,
+        // (b+1)·block_data_syms)`. We need to convert that to
+        // `total_syms` index, accounting for the preamble + pilots
+        // interspersed.
+        let mut data_running = 0_usize;
+        // Per-block accumulator of complex residual.
+        let mut block_resid = vec![Complex32::new(0.0, 0.0); n_blocks_u];
+        for i in PREAMBLE_LEN..total_syms {
+            let rel = i - PREAMBLE_LEN;
+            if rel.is_multiple_of(PILOT_SYMBOL_INTERVAL) {
+                continue;
+            }
+            let phase = interp_phase(&anchor_idx, &anchor_phase, i);
+            let derot = symbols[i] * Complex32::from_polar(1.0, -phase);
+            // Hard decide closest constellation point at amplitude 1
+            // (we don't have `amplitude` yet; use unit constellation
+            // since hard decision is only sensitive to the *direction*
+            // of `derot`).
+            let candidates = [
+                Complex32::new(1.0, 0.0),
+                Complex32::new(0.0, 1.0),
+                Complex32::new(-1.0, 0.0),
+                Complex32::new(0.0, -1.0),
+            ];
+            let mut best_c = candidates[0];
+            let mut best_d2 = f32::INFINITY;
+            for &c in &candidates {
+                // Maximise Re(derot · c̄) = pick closest direction.
+                let d2 = (derot - c).norm_sqr();
+                if d2 < best_d2 {
+                    best_d2 = d2;
+                    best_c = c;
+                }
+            }
+            // Residual of derot w.r.t. its hard decision: any phase
+            // offset shows up as a rotation of `derot` away from
+            // `best_c`. Accumulate `derot · best_c.conj()` (which
+            // should be ≈ A · 1 + small noise if phase is right; any
+            // residual phase error rotates the accumulator).
+            let r = derot * best_c.conj();
+            let block_idx = data_running / block_data_syms;
+            if block_idx < n_blocks_u {
+                block_resid[block_idx] += r;
+            }
+            data_running += 1;
+            if data_running >= n_data_syms {
+                break;
+            }
+        }
+        for b in 0..n_blocks_u {
+            // Per-block correction: arg of the accumulated residual.
+            // If residual is dominated by signal (correct decisions),
+            // arg ≈ residual phase error; if dominated by wrong
+            // decisions, arg ≈ random and we damage the track. The
+            // |residual| / N gives confidence; if confidence is low
+            // we leave the correction at 0.
+            let mag = block_resid[b].norm();
+            let n_per_block = block_data_syms as f32;
+            // Confidence proxy: |sum| / N. With unit-amplitude hard
+            // decisions and ε fraction wrong, |sum|/N ≈ (1 − 2ε) · A.
+            // For ε = 0.25 (≈ +6 dB Eb/N0_info Robust threshold),
+            // |sum|/N ≈ 0.5·A. We require ≥ 0.25·A_proxy = 0.25
+            // (using A=1 as the unit-decided constellation), below
+            // which we trust the pilot track instead.
+            if mag > 0.25 * n_per_block {
+                block_dd_correction[b] = block_resid[b].arg();
+            }
+        }
+    }
+
+    // 5a. Estimate signal amplitude `A` and per-axis noise variance
+    //     `σ²_n` from the **known** symbols (preamble BPSK chips +
+    //     QPSK pilots) so the LLRs delivered to BP have correct
+    //     likelihood magnitude (without σ²-scaling, BP receives high-
+    //     confidence LLRs even at noisy channels — at low rate where
+    //     σ is largest, this fools BP into propagating wrong signs
+    //     instead of relying on parity correction).
+    //
+    //     For preamble chip i: expected = ±1 + 0j (sign per
+    //     `UVPACKET_PREAMBLE_BPSK_BITS`). For pilot k: expected =
+    //     `pilot_ref` (+1 + 0j). De-rotate by interpolated phase,
+    //     then accumulate ⟨r, expected⟩ for the amplitude estimator
+    //     and Σ |r − A·expected|² for the noise estimator.
+    let mut a_acc = 0.0_f32;
+    let mut a_norm = 0.0_f32;
+    // Preamble:
+    for (i, &b) in UVPACKET_PREAMBLE_BPSK_BITS.iter().enumerate() {
+        let expected = Complex32::new(if b { -1.0 } else { 1.0 }, 0.0);
+        let phase = interp_phase(&anchor_idx, &anchor_phase, i);
+        let derot = symbols[i] * Complex32::from_polar(1.0, -phase);
+        a_acc += derot.re * expected.re + derot.im * expected.im;
+        a_norm += expected.norm_sqr();
+    }
+    // Pilots:
+    for k in 0..n_pilots {
+        let sym_pos = PREAMBLE_LEN + k * PILOT_SYMBOL_INTERVAL;
+        if sym_pos >= total_syms {
+            break;
+        }
+        let phase = interp_phase(&anchor_idx, &anchor_phase, sym_pos);
+        let derot = symbols[sym_pos] * Complex32::from_polar(1.0, -phase);
+        a_acc += derot.re * pilot_ref.re + derot.im * pilot_ref.im;
+        a_norm += pilot_ref.norm_sqr();
+    }
+    let amplitude = if a_norm > 0.0 {
+        a_acc / a_norm
+    } else {
+        1.0
+    };
+    let amplitude = amplitude.max(1e-6); // guard against pathological cases
+
+    // σ²_n estimation: use the **data-symbol magnitude variance**
+    // rather than pilot/preamble residuals. For QPSK with
+    // constellation amplitude `A` (`|c|=1`) and per-axis noise
+    // variance `σ²_n`,
+    //
+    //     E[|r|²] = A²·E[|c|²] + 2·A·Re(E[c̄]·E[n]) + E[|n|²]
+    //             = A² + 0 + 2·σ²_n
+    //
+    // so σ²_n = (E[|r|²] − A²) / 2. This estimator captures the
+    // **total** noise on data symbols — AWGN plus any inter-pilot
+    // phase-tracking residual — which is the noise BP actually has
+    // to overcome. Pilot-only residual under-counts by 6–16 % and
+    // makes the LLR scale over-confident at low SNR.
+    // Per-data-symbol DD correction must be applied before measuring
+    // |r|² for σ²_n (the correction takes phase-tracking residual
+    // out of the noise budget).
+    let mut data_mag_sq = 0.0_f32;
+    let mut data_seen = 0_usize;
+    {
+        let mut data_running = 0_usize;
+        for i in PREAMBLE_LEN..total_syms {
+            let rel = i - PREAMBLE_LEN;
+            if rel.is_multiple_of(PILOT_SYMBOL_INTERVAL) {
+                continue;
+            }
+            let block_idx = data_running / block_data_syms;
+            let phase = interp_phase(&anchor_idx, &anchor_phase, i)
+                + block_dd_correction.get(block_idx).copied().unwrap_or(0.0);
+            let derot = symbols[i] * Complex32::from_polar(1.0, -phase);
+            data_mag_sq += derot.norm_sqr();
+            data_seen += 1;
+            data_running += 1;
+            if data_running >= n_data_syms {
+                break;
+            }
+        }
+    }
+    let sigma_sq_n = if data_seen > 0 {
+        let mean_mag_sq = data_mag_sq / data_seen as f32;
+        ((mean_mag_sq - amplitude * amplitude) / 2.0).max(1e-6)
+    } else {
+        1.0
+    };
+
+    // 5b. QPSK soft-demap each data symbol after de-rotation, with
+    //     proper LLR scaling. The true max-log LLR for QPSK with
+    //     constellation amplitude `A` (`c ∈ A·{±1, ±j}`) and per-
+    //     axis noise variance `σ²_n` is:
+    //
+    //         LLR(b1) = −A·(re + im) / σ²_n
+    //         LLR(b0) = A·(max(im,−re) − max(re,−im)) / σ²_n
+    //
+    //     `qpsk_llrs(r)` returns the unit-amplitude form (= the
+    //     bracketed expression without the `A`), so the scale that
+    //     turns it into a true likelihood-ratio LLR is
+    //     `A / σ²_n` — *multiplication* by `A`, not division.
+    //
+    //     Without `1/σ²_n`, BP receives over-confident LLRs at
+    //     noisy channels (low-rate modes at fixed Eb/N0_info) and
+    //     propagates wrong-sign decisions instead of relying on the
+    //     parity-correction structure. This was the +1 dB extra
+    //     implementation-loss penalty observed for Robust pre-fix.
+    let llr_scale = amplitude / sigma_sq_n;
     let mut llrs_channel: Vec<f32> = Vec::with_capacity(n_blocks_u * block_ch_bits);
     let mut data_count = 0usize;
+    let mut data_running = 0_usize;
     for i in 0..total_syms {
         // Skip preamble.
         if i < PREAMBLE_LEN {
@@ -218,12 +415,15 @@ pub fn decode_known_layout(
         if rel.is_multiple_of(PILOT_SYMBOL_INTERVAL) {
             continue;
         }
-        let phase = interp_phase(&anchor_idx, &anchor_phase, i);
+        let block_idx = data_running / block_data_syms;
+        let phase = interp_phase(&anchor_idx, &anchor_phase, i)
+            + block_dd_correction.get(block_idx).copied().unwrap_or(0.0);
         let derot = symbols[i] * Complex32::from_polar(1.0, -phase);
         let (llr_b1, llr_b0) = qpsk_llrs(derot);
-        llrs_channel.push(llr_b1);
-        llrs_channel.push(llr_b0);
+        llrs_channel.push(llr_b1 * llr_scale);
+        llrs_channel.push(llr_b0 * llr_scale);
         data_count += 1;
+        data_running += 1;
         if data_count >= n_data_syms {
             break;
         }
@@ -237,7 +437,7 @@ pub fn decode_known_layout(
     let fec = Ldpc240_101;
     let opts = FecOpts {
         bp_max_iter: 50,
-        osd_depth: 2,
+        osd_depth: 3,
         ap_mask: None,
         verify_info: None,
     };
