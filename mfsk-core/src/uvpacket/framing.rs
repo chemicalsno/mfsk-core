@@ -86,12 +86,33 @@ pub enum PackError {
     PayloadTooLarge(usize),
 }
 
-/// Pack a frame header + payload into the on-the-wire byte stream.
+/// Pack a frame header + payload into a tight byte stream
+/// `[header_word_be (2)] [crc16_be (2)] [payload]` with no padding.
+/// The CRC covers the header word plus the full payload.
 ///
-/// Returns `[header_word_be (2)] [crc16_be (2)] [payload]`. The CRC
-/// covers the header word plus the full payload — a single CRC catches
-/// either header or payload corruption.
+/// Equivalent to [`pack_to_size`] with `target_size = HEADER_BYTES +
+/// payload.len()`.
 pub fn pack(header: &FrameHeader, payload: &[u8]) -> Result<Vec<u8>, PackError> {
+    pack_to_size(header, payload, HEADER_BYTES + payload.len())
+}
+
+/// Pack a frame header + payload, padded with zeros to exactly
+/// `target_size` bytes. The CRC covers the header word plus
+/// **everything after the CRC field** — i.e. payload **and** any
+/// trailing zero padding. This way the receiver can verify CRC over
+/// the whole post-LDPC-decode buffer (which is naturally padded to
+/// `n_blocks × INFO_BYTES_PER_BLOCK`) without first having to know
+/// the exact payload length.
+///
+/// Errors:
+/// - `PackError::PayloadTooLarge` if `payload.len() >
+///   target_size - HEADER_BYTES` or `payload.len() > MAX_PAYLOAD_BYTES`.
+/// - The usual header-field range errors.
+pub fn pack_to_size(
+    header: &FrameHeader,
+    payload: &[u8],
+    target_size: usize,
+) -> Result<Vec<u8>, PackError> {
     if !(1..=32).contains(&header.block_count) {
         return Err(PackError::InvalidBlockCount(header.block_count));
     }
@@ -104,6 +125,9 @@ pub fn pack(header: &FrameHeader, payload: &[u8]) -> Result<Vec<u8>, PackError> 
     if payload.len() > MAX_PAYLOAD_BYTES {
         return Err(PackError::PayloadTooLarge(payload.len()));
     }
+    if target_size < HEADER_BYTES + payload.len() {
+        return Err(PackError::PayloadTooLarge(payload.len()));
+    }
 
     let mode_bits = u16::from(header.mode.header_code()) & 0x3;
     let blocks_bits = u16::from(header.block_count - 1) & 0x1F;
@@ -113,17 +137,19 @@ pub fn pack(header: &FrameHeader, payload: &[u8]) -> Result<Vec<u8>, PackError> 
     let header_word: u16 = (mode_bits << 14) | (blocks_bits << 9) | (app_bits << 5) | seq_bits;
     let header_be = header_word.to_be_bytes();
 
-    // CRC over header bytes + payload.
-    let mut crc_input = Vec::with_capacity(2 + payload.len());
-    crc_input.extend_from_slice(&header_be);
-    crc_input.extend_from_slice(payload);
-    let crc = crc16(&crc_input);
-    let crc_be = crc.to_be_bytes();
+    let mut out = vec![0u8; target_size];
+    out[0..2].copy_from_slice(&header_be);
+    // bytes 2..4 stay zero for now (CRC placeholder).
+    out[HEADER_BYTES..HEADER_BYTES + payload.len()].copy_from_slice(payload);
+    // bytes HEADER_BYTES + payload.len()..target_size remain zero (padding).
 
-    let mut out = Vec::with_capacity(HEADER_BYTES + payload.len());
-    out.extend_from_slice(&header_be);
-    out.extend_from_slice(&crc_be);
-    out.extend_from_slice(payload);
+    // CRC covers header word + everything after CRC (payload + padding).
+    let mut crc_input = Vec::with_capacity(2 + (target_size - HEADER_BYTES));
+    crc_input.extend_from_slice(&out[0..2]);
+    crc_input.extend_from_slice(&out[HEADER_BYTES..target_size]);
+    let crc = crc16(&crc_input);
+    out[2..4].copy_from_slice(&crc.to_be_bytes());
+
     Ok(out)
 }
 
@@ -157,6 +183,11 @@ pub fn unpack(bytes: &[u8]) -> Result<(FrameHeader, &[u8]), UnpackError> {
     }
     let header_word = u16::from_be_bytes([bytes[0], bytes[1]]);
     let crc_recv = u16::from_be_bytes([bytes[2], bytes[3]]);
+    // The "payload" returned to the caller is everything after the
+    // CRC, which may include trailing zero padding when the input was
+    // produced by [`pack_to_size`]. The CRC is computed over the same
+    // span, so callers can pass either tight or padded buffers and
+    // get a clean integrity check either way.
     let payload = &bytes[HEADER_BYTES..];
 
     let mut crc_input = Vec::with_capacity(2 + payload.len());

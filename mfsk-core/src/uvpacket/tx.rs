@@ -51,7 +51,7 @@ use crate::core::dsp::gfsk::{GfskCfg, synth_f32};
 use crate::core::{FecCodec, ModulationParams};
 use crate::fec::Ldpc240_101;
 
-use super::framing::{FrameHeader, HEADER_BYTES, INFO_BYTES_PER_BLOCK, PackError, pack};
+use super::framing::{FrameHeader, HEADER_BYTES, INFO_BYTES_PER_BLOCK, PackError, pack_to_size};
 use super::interleaver::interleave;
 use super::puncture::puncture;
 use super::sync_pattern::UVPACKET_COSTAS;
@@ -111,12 +111,13 @@ pub fn encode(
         return Err(PackError::PayloadTooLarge(payload.len()));
     }
 
-    // 1. Pack header + payload, pad to n_blocks × 12 bytes.
-    let header_payload = pack(header, payload)?;
-    let header_bytes: [u8; HEADER_BYTES] = header_payload[..HEADER_BYTES].try_into().unwrap();
+    // 1. Pack header + payload + zero-padding into exactly the LDPC
+    // info-byte budget for n_blocks. The CRC is computed over header
+    // word + (payload + padding), so the receiver can verify integrity
+    // without having to know the original payload length up front.
     let frame_data_total = n_blocks * INFO_BYTES_PER_BLOCK;
-    let mut frame_data = vec![0u8; frame_data_total];
-    frame_data[..header_payload.len()].copy_from_slice(&header_payload);
+    let frame_data = pack_to_size(header, payload, frame_data_total)?;
+    let header_bytes: [u8; HEADER_BYTES] = frame_data[..HEADER_BYTES].try_into().unwrap();
 
     // 2. Pre-compute the 32-bit header bits (MSB-first per byte) for
     // the per-block spread copy.
