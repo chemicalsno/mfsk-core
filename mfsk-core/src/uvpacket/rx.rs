@@ -262,10 +262,13 @@ fn symbol_powers(samples: &[f32], tone_freqs: &[f32; 4]) -> [f32; 4] {
 /// (matches `bp_decode_generic`'s convention).
 ///
 /// Form: max-log non-coherent FSK uses **magnitudes** (`|r_t|`),
-/// not power (`|r_t|²`). The Bessel-function-based exact LLR has
-/// the same `|r_t|`-linear leading term; switching to power
-/// over-emphasises high-magnitude tones and biases the LDPC into
-/// over-confident wrong decisions at moderate SNR.
+/// not power (`|r_t|²`); the Bessel-function-based exact LLR has
+/// the same `|r_t|`-linear leading term. We deliberately do **not**
+/// per-symbol-normalise by an estimated `σ̂`: the per-symbol noise
+/// estimate goes to zero on clean tones, blowing up the LLR
+/// magnitude and saturating BP's `tanh` to ±1 (= hard decision).
+/// Phase 2 measured this empirically. A frame-level σ̂ (averaged
+/// across symbols) is a sensible follow-up.
 fn symbol_powers_to_llrs(p: &[f32; 4]) -> (f32, f32) {
     let _ = GRAY_4; // documentation pin; the constants below assume this map
     let m: [f32; 4] = [p[0].sqrt(), p[1].sqrt(), p[2].sqrt(), p[3].sqrt()];
