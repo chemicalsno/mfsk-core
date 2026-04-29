@@ -229,7 +229,7 @@ kind decodes.
 The FM threshold is the binding constraint for NFM voice
 channels.
 
-### 3.5 SSB compatibility
+### 3.5 SSB compatibility — and AFC
 
 The modem is an audio-domain QPSK + RRC processor (signal
 occupies ~1200–1800 Hz around the 1500 Hz centre, well inside a
@@ -237,17 +237,31 @@ typical SSB passband). On SSB the FM-threshold floor goes away
 and the modem operates at its true ~−3.7 dB SNR_3kHz Robust
 threshold — a useful weak-signal data envelope, especially on HF.
 
-What's missing for production SSB use is **automatic frequency
-control (AFC)**: the current rx assumes `audio_centre_hz` is known
-exactly, while real SSB receivers see a ±50–100 Hz centre offset
-from VFO-dial mismatches between TX and RX. Adding AFC is a
-~50–100-line change (frequency-search the preamble correlator over
-a configurable window, then track the offset through the LMS
-phase fit) — planned for a follow-up cycle, not 0.3.1.
+**AFC ships in 0.3.2.** Use
+[`decode_known_layout_with_afc(audio, .., &AfcOpts)`](https://docs.rs/mfsk-core/latest/mfsk_core/uvpacket/rx/fn.decode_known_layout_with_afc.html)
+for SSB use; the default `decode_known_layout` continues to
+assume `audio_centre_hz` is exact (right for NFM where TX/RX
+share the same audio centre).
 
-Until AFC lands, SSB usage requires both ends to dial in the same
-frequency to within ~10 Hz. With a digital VFO and CAT control
-that's straightforward; with a manual dial it's not.
+The AFC algorithm sweeps `audio_centre_hz + Δf_test` in 25 Hz
+steps across `[−search_hz, +search_hz]` (default ±200 Hz),
+runs the matched filter at each candidate, and picks the Δf
+where the preamble-correlation magnitude peaks. Parabolic
+refinement of the 3-point coarse-grid magnitudes drives the
+final Δf to within a fraction of the grid spacing. Cost is
+~17× single-decode cost (~50–100 ms in release mode); the
+existing LMS phase fit downstream absorbs the sub-grid
+residual without trouble.
+
+The naive FFT-over-chip-rate-samples approach (cheap but wrong)
+fails because the integer-sample preamble correlator that picks
+`best_off` itself rolls off as `sinc(δ · 31 / 1200)`, landing on
+noise samples for `|δ| ≳ 20 Hz`. The frequency-grid search
+sidesteps this — the correlator magnitude itself peaks at the
+correct Δf.
+
+NFM users can keep using `decode_known_layout` (AFC is pure
+overhead on a static-VFO channel).
 
 ## 4. Modem implementation loss
 

@@ -1,5 +1,103 @@
 # Changelog
 
+## 0.3.2 — 2026-04-29
+
+Focused single-feature release on top of 0.3.1: **AFC (automatic
+frequency control) for uvpacket** so the modem operates correctly
+on SSB carriers without requiring TX/RX VFO-dial alignment.
+
+WSJT-family modes (FT8/FT4/FST4/WSPR/JT9/JT65/Q65) and the
+0.3.1-shipped uvpacket NFM path are unchanged. No breaking API
+changes — AFC is opt-in via a new entry-point function.
+
+### Added
+
+- `mfsk-core::uvpacket::rx::decode_known_layout_with_afc(audio,
+  sample_offset, audio_centre_hz, mode, n_blocks, &fec_opts,
+  &afc_opts) -> Result<DecodedFrame, DecodeError>`. Runs the AFC
+  search, then re-invokes the standard decoder at the corrected
+  centre frequency.
+- `mfsk-core::uvpacket::rx::AfcOpts { search_hz: f32 }` with
+  `Default` returning `AfcOpts { search_hz: 200.0 }`. The total
+  search window is `±search_hz`; 200 Hz covers typical SSB VFO
+  mismatch worst-case.
+- `pub fn diag_estimate_freq_offset` — test/characterisation hook
+  that returns the AFC's Δf estimate without running the full
+  decode roundtrip.
+- `tests/uvpacket_afc.rs` — round-trip clean recover at ±150 Hz,
+  baseline-fails-at-offset control, ±100 Hz at +6 dB AWGN
+  (10/10), optional accuracy-print diagnostic.
+
+### Algorithm
+
+Frequency-grid preamble-correlation search at 25 Hz steps across
+`[−search_hz, +search_hz]` (default 17 candidates). At each
+candidate `audio_centre_hz + Δf_test`, run the matched filter and
+take the best preamble-correlation magnitude over the ±NSPS
+jitter window. Pick the coarse-grid winner, then parabolic-fit
+the three adjacent magnitudes for sub-grid resolution. Re-run
+the standard decoder at the corrected centre frequency.
+
+The first attempt was an FFT-over-chip-rate-samples (cheap but
+wrong): at non-trivial Δf the integer-sample preamble correlator
+that picks `best_off` itself rolls off as `sinc(δ · 31 / 1200)`,
+landing on noise samples for `|δ| ≳ 20 Hz` — the FFT then
+operates on garbage. The frequency-grid search sidesteps this
+because the preamble correlator magnitude itself peaks at the
+correct Δf.
+
+### Cost
+
+~17× single-decode cost (full down-convert + matched-filter at
+each grid point), ~50–100 ms total per attempted decode in
+release mode. Tolerable for opportunistic SSB decode; can be
+tightened by lazy-evaluating only enough grid points to
+distinguish the winner from its neighbours, if profiling demands.
+
+### Empirical accuracy
+
+Clean-channel AFC estimate vs injected truth (search ±200 Hz):
+
+```
+Δf_true (Hz)  AFC_est (Hz)  decode
+−150          −150.00       ✓
+−100          −100.00       ✓
+ −50           −49.99       ✓
+ −20           −22.34       ✓ (mid-grid; LMS absorbs residual)
+   0             0.00       ✓
+ +20           +22.34       ✓
+ +50           +50.00       ✓
++100          +100.00       ✓
++150          +150.00       ✓
++200          +200.00       ✓
+```
+
+≤ 0.01 Hz error at multi-of-25 Hz Δf; ≤ 2.5 Hz error at mid-grid
+Δf. The LMS quadratic phase fit downstream absorbs the residual
+without trouble (residual frequency offset over a 0.5 s burst is
+within the LMS linear-term capacity).
+
+### Operating envelope
+
+With AFC, uvpacket decodes correctly across the full SSB VFO-
+mismatch range (±200 Hz default; configurable). Combined with
+the existing modem characterisation, this opens the modem up to
+HF SSB weak-signal data and microwave SSB applications.
+
+NFM users can keep using `decode_known_layout` — AFC is an extra
+~50–100 ms per decode that's pure overhead on a static-VFO
+channel.
+
+### Known limitations
+
+- AFC is per-frame static. Doppler-induced carrier drift across
+  the burst is still absorbed by the LMS phase fit (constant +
+  linear + quadratic), which works for ≤ ~10 Hz/s drift —
+  typical for HF / VHF / UHF SSB.
+- The auto-detect `decode()` path doesn't yet take an `AfcOpts`.
+  Multi-frame SSB scans go through `decode_known_layout_with_afc`
+  with caller-managed framing for now.
+
 ## 0.3.1 — 2026-04-29
 
 Additive release on top of 0.3.0. Headline: the new `uvpacket`

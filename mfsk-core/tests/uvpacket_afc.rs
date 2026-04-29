@@ -107,15 +107,8 @@ fn afc_diag_estimate_accuracy() {
         // and reporting which one wins. Also try the public API.
         let opts = default_fec_opts();
         let afc = AfcOpts::default();
-        let res = decode_known_layout_with_afc(
-            &audio,
-            0,
-            AUDIO_CENTRE_HZ,
-            mode,
-            n_blocks,
-            &opts,
-            &afc,
-        );
+        let res =
+            decode_known_layout_with_afc(&audio, 0, AUDIO_CENTRE_HZ, mode, n_blocks, &opts, &afc);
         // Find the Δf at which baseline (no AFC) decode succeeds — that
         // is the "true" centre the AFC should converge to.
         let mut baseline_works_at: Option<f32> = None;
@@ -127,13 +120,7 @@ fn afc_diag_estimate_accuracy() {
             }
         }
         // Direct probe of AFC's frequency-offset estimate.
-        let est = diag_estimate_freq_offset(
-            &audio,
-            0,
-            AUDIO_CENTRE_HZ,
-            audio.len(),
-            &afc,
-        );
+        let est = diag_estimate_freq_offset(&audio, 0, AUDIO_CENTRE_HZ, audio.len(), &afc);
         eprintln!(
             "Δf_true {delta:+7.1} Hz: AFC_est={:>7.2} Hz  decode={:?}  baseline_centre @ {:?}",
             est.unwrap_or(f32::NAN),
@@ -180,20 +167,12 @@ fn afc_recovers_clean_channel_offset() {
     for delta in [-150.0_f32, -100.0, -50.0, 0.0, 50.0, 100.0, 150.0] {
         // TX at AUDIO_CENTRE_HZ + delta, RX dialed in at AUDIO_CENTRE_HZ.
         // Simulates: TX dialed in correctly, RX is `delta` Hz off.
-        let audio =
-            encode_with_offset_audio_centre(&header, &payload, AUDIO_CENTRE_HZ + delta);
+        let audio = encode_with_offset_audio_centre(&header, &payload, AUDIO_CENTRE_HZ + delta);
 
         let opts = default_fec_opts();
         let afc = AfcOpts::default();
-        let res = decode_known_layout_with_afc(
-            &audio,
-            0,
-            AUDIO_CENTRE_HZ,
-            mode,
-            n_blocks,
-            &opts,
-            &afc,
-        );
+        let res =
+            decode_known_layout_with_afc(&audio, 0, AUDIO_CENTRE_HZ, mode, n_blocks, &opts, &afc);
         assert!(
             res.is_ok(),
             "AFC failed at Δf = {delta:+.0} Hz: {:?}",
@@ -225,8 +204,7 @@ fn baseline_decoder_fails_at_offset() {
 
     // Δf = 100 Hz is well inside SSB-mismatch territory and should
     // break the AFC-less decoder.
-    let audio =
-        encode_with_offset_audio_centre(&header, &payload, AUDIO_CENTRE_HZ + 100.0);
+    let audio = encode_with_offset_audio_centre(&header, &payload, AUDIO_CENTRE_HZ + 100.0);
     let res = decode_known_layout(&audio, 0, AUDIO_CENTRE_HZ, mode, n_blocks);
     assert!(
         res.is_err(),
@@ -255,23 +233,12 @@ fn afc_recovers_offset_at_moderate_snr() {
     for &delta in &[-100.0_f32, 0.0, 100.0] {
         let mut decoded = 0;
         for trial in 0..n_trials {
-            let mut audio = encode_with_offset_audio_centre(
-                &header,
-                &payload,
-                AUDIO_CENTRE_HZ + delta,
-            );
+            let mut audio =
+                encode_with_offset_audio_centre(&header, &payload, AUDIO_CENTRE_HZ + delta);
             let sigma = awgn_sigma_for_eb_n0_info(mode, eb_n0_db, signal_power(&audio));
             AwgnChannel::new(sigma, 0xC0FFEE + trial as u64).apply(&mut audio);
-            if decode_known_layout_with_afc(
-                &audio,
-                0,
-                AUDIO_CENTRE_HZ,
-                mode,
-                n_blocks,
-                &opts,
-                &afc,
-            )
-            .is_ok()
+            if decode_known_layout_with_afc(&audio, 0, AUDIO_CENTRE_HZ, mode, n_blocks, &opts, &afc)
+                .is_ok()
             {
                 decoded += 1;
             }

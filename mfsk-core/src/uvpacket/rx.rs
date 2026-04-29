@@ -159,32 +159,24 @@ pub struct AfcOpts {
     /// is `±search_hz`). 200 Hz covers typical SSB VFO mismatch
     /// worst-case without a meaningful CPU cost.
     pub search_hz: f32,
-    /// FFT zero-pad length. 256 → 1200 / 256 = 4.69 Hz bin width.
-    pub fft_n: usize,
 }
 
 impl Default for AfcOpts {
     fn default() -> Self {
-        Self {
-            search_hz: 200.0,
-            fft_n: 256,
-        }
+        Self { search_hz: 200.0 }
     }
 }
 
 /// Decode a uvpacket frame at a known location, with AFC and
 /// caller-supplied LDPC options.
 ///
-/// Two-pass operation:
-///
-/// 1. Down-convert + matched-filter at the nominal
-///    `audio_centre_hz`. Find the best integer-sample preamble
-///    offset.
-/// 2. Compute an FFT over the 31 preamble-correlated samples
-///    (zero-padded to `afc_opts.fft_n`). The bin index maximising
-///    `|FFT[k]|²` within the `±search_hz` window gives the
-///    estimated frequency offset Δf. Parabolic peak refinement
-///    narrows Δf to within a fraction of a bin.
+/// 1. Sweep `Δf_test` in 25 Hz steps across `[−search_hz,
+///    +search_hz]`. At each step, down-convert + matched-filter
+///    at `audio_centre_hz + Δf_test` and take the best
+///    preamble-correlation magnitude over the ±NSPS jitter
+///    window.
+/// 2. Pick the coarse-grid winner and parabolic-fit the three
+///    adjacent magnitudes for sub-grid resolution.
 /// 3. Re-run [`decode_known_layout_with_opts`] at
 ///    `audio_centre_hz + Δf`.
 ///
@@ -322,9 +314,11 @@ fn estimate_freq_offset(
     (best_k as f32 + frac) * coarse_step_hz
 }
 
-/// Public diagnostic accessor for [`estimate_freq_offset`].
-/// Returns the AFC's Δf estimate without executing the full
-/// decode. For tests only.
+/// Public diagnostic accessor for the AFC's frequency-offset
+/// estimate. Returns the same Δf that
+/// [`decode_known_layout_with_afc`] would derive from the same
+/// audio + offset + AFC settings, without running the full decode
+/// roundtrip. Intended for tests and characterisation harnesses.
 pub fn diag_estimate_freq_offset(
     audio: &[f32],
     sample_offset: usize,
@@ -342,86 +336,6 @@ pub fn diag_estimate_freq_offset(
         audio_centre_hz,
         afc_opts,
     ))
-}
-
-/// Legacy FFT-over-chip-rate AFC. Kept for reference but not
-/// reachable from the public API any more.
-#[allow(dead_code)]
-fn estimate_freq_offset_fft(mf_out: &[Complex32], best_off: usize, afc_opts: &AfcOpts) -> f32 {
-    use rustfft::FftPlanner;
-
-    if best_off + (PREAMBLE_LEN - 1) * NSPS >= mf_out.len() {
-        return 0.0;
-    }
-    let n = afc_opts.fft_n.max(PREAMBLE_LEN.next_power_of_two());
-
-    // Build the chip-rate sequence x_i = mf[best_off + i·NSPS] · s_i^*
-    // where s_i is the BPSK preamble symbol (±1, real). For a clean
-    // signal at frequency offset Δf, the x_i sequence has the form
-    // `A · e^{j·2π·Δf·i·T_sym} + noise`, so its DFT peaks at the
-    // bin nearest to Δf.
-    let mut buf: Vec<Complex32> = Vec::with_capacity(n);
-    for i in 0..PREAMBLE_LEN {
-        let pos = best_off + i * NSPS;
-        let s = if UVPACKET_PREAMBLE_BPSK_BITS[i] {
-            -1.0_f32
-        } else {
-            1.0
-        };
-        buf.push(mf_out[pos] * s);
-    }
-    buf.resize(n, Complex32::new(0.0, 0.0));
-
-    let mut planner = FftPlanner::<f32>::new();
-    let fft = planner.plan_fft_forward(n);
-    fft.process(&mut buf);
-
-    // Each bin k (in [0, n)) maps to frequency `k · fs_sym / n` (Hz)
-    // for k ≤ n/2, or `(k − n) · fs_sym / n` (negative) for k > n/2.
-    // Restrict the search to bins within ±search_hz.
-    let fs_sym = SAMPLE_RATE_HZ / NSPS as f32; // 1200 Hz
-    let bin_hz = fs_sym / n as f32;
-    let search_bins = (afc_opts.search_hz / bin_hz).floor() as usize;
-    let max_bin = search_bins.min(n / 2);
-
-    let mut best_k: i32 = 0;
-    let mut best_pow = -1.0_f32;
-    for k in 0..=max_bin {
-        let p = buf[k].norm_sqr();
-        if p > best_pow {
-            best_pow = p;
-            best_k = k as i32;
-        }
-        // Negative-frequency bin: n - k
-        if k > 0 {
-            let kn = n - k;
-            let p = buf[kn].norm_sqr();
-            if p > best_pow {
-                best_pow = p;
-                best_k = -(k as i32);
-            }
-        }
-    }
-
-    // Parabolic peak refinement on |FFT|² in the bin domain.
-    let k_idx = if best_k >= 0 {
-        best_k as usize
-    } else {
-        n - (-best_k) as usize
-    };
-    let k_minus = (k_idx + n - 1) % n;
-    let k_plus = (k_idx + 1) % n;
-    let m_minus = buf[k_minus].norm_sqr();
-    let m_zero = buf[k_idx].norm_sqr();
-    let m_plus = buf[k_plus].norm_sqr();
-    let denom = 2.0 * (m_plus - 2.0 * m_zero + m_minus);
-    let frac = if denom.abs() > 1e-9 {
-        ((m_minus - m_plus) / denom).clamp(-0.5, 0.5)
-    } else {
-        0.0
-    };
-
-    (best_k as f32 + frac) * bin_hz
 }
 
 /// Same as [`decode_known_layout`] but with caller-supplied LDPC
