@@ -50,15 +50,87 @@ fn noise_floor_short_buffer() {
     let frames = rx::decode(&audio, 1500.0);
     let elapsed = t0.elapsed();
     eprintln!(
-        "noise-only 1 s @ σ={}: {} frames, decode took {:?}",
+        "[white]   1 s σ={}: {} frames, decode took {:?}",
         sigma,
         frames.len(),
         elapsed
     );
-    assert_eq!(frames.len(), 0, "noise must not produce decoded frames");
+    assert_eq!(frames.len(), 0, "white noise must not produce frames");
+    assert!(elapsed.as_millis() < 1500, "white noise took {:?}", elapsed);
+}
+
+/// Mic-input-like noise: AWGN + low-frequency 1/f tilt + 50 Hz hum +
+/// a 60 Hz hum harmonic. Closer to what a real Mac/PC built-in mic
+/// returns in a "quiet room" — spectrally non-uniform, which can make
+/// the χ²(2) statistical assumption of `decode`'s sync gate too lax.
+#[test]
+fn noise_floor_mic_like() {
+    let sample_rate = 12_000.0_f32;
+    let n_samples = 7 * sample_rate as usize; // 7 s = the uvpacket-web window
+    let mut rng = Awgn::new(0xdeadbeef);
+    let sigma = 0.02_f32;
+    // Independent state for the 1/f filter (single-pole low-pass on
+    // white noise) — gives a typical mic-preamp pink-ish tail.
+    let mut pink = 0.0_f32;
+    let pink_alpha = 0.995_f32;
+    let two_pi = 2.0 * std::f32::consts::PI;
+    let audio: Vec<f32> = (0..n_samples)
+        .map(|i| {
+            let g = sigma * rng.gaussian();
+            pink = pink_alpha * pink + (1.0 - pink_alpha) * g * 30.0;
+            let t = i as f32 / sample_rate;
+            let hum50 = 0.005 * (two_pi * 50.0 * t).sin();
+            let hum60 = 0.003 * (two_pi * 60.0 * t).sin();
+            g + pink + hum50 + hum60
+        })
+        .collect();
+
+    let peak = audio.iter().fold(0.0_f32, |m, &s| m.max(s.abs()));
+    let t0 = Instant::now();
+    let frames = rx::decode(&audio, 1500.0);
+    let elapsed = t0.elapsed();
+    eprintln!(
+        "[mic-like] 7 s σ={} (peak={:.4}): {} frames, decode took {:?}",
+        sigma,
+        peak,
+        frames.len(),
+        elapsed
+    );
+    assert_eq!(frames.len(), 0, "mic-like noise must not produce frames");
     assert!(
         elapsed.as_millis() < 1500,
-        "noise-only 1 s buffer took {:?} — false-sync rejection is missing or weak",
+        "mic-like noise took {:?} — sync gate is leaky against structured noise",
+        elapsed
+    );
+}
+
+/// Buffer with an *amplitude* peak that matches what uvpacket-web is
+/// reporting in the field (0.012). This is the operating regime where
+/// the sync gate must hold.
+#[test]
+fn noise_floor_field_amplitude() {
+    let sample_rate = 12_000.0_f32;
+    let n_samples = 7 * sample_rate as usize;
+    let mut rng = Awgn::new(0xfeedface);
+    // σ tuned so peak ≈ 0.012 (matches user's reported snapshot peak).
+    let sigma = 0.003_f32;
+    let audio: Vec<f32> = (0..n_samples).map(|_| sigma * rng.gaussian()).collect();
+    let peak = audio.iter().fold(0.0_f32, |m, &s| m.max(s.abs()));
+
+    let t0 = Instant::now();
+    let frames = rx::decode(&audio, 1500.0);
+    let elapsed = t0.elapsed();
+    eprintln!(
+        "[field]    7 s σ={} (peak={:.4}): {} frames, decode took {:?}",
+        sigma,
+        peak,
+        frames.len(),
+        elapsed
+    );
+    assert_eq!(frames.len(), 0);
+    assert!(
+        elapsed.as_millis() < 1500,
+        "field-amplitude noise took {:?} — gate is leaky",
         elapsed
     );
 }

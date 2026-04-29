@@ -1124,6 +1124,67 @@ pub fn decode(audio: &[f32], audio_centre_hz: f32) -> Vec<DecodedFrame> {
     frames
 }
 
+/// Diagnostic: peak / median / ratio of the preamble-correlation
+/// score distribution at a given audio centre. Lets callers (e.g. the
+/// uvpacket-web PWA) verify whether the sync gate is firing on their
+/// real audio without having to instrument the decoder itself.
+#[derive(Copy, Clone, Debug)]
+pub struct SyncStats {
+    pub global_max: f32,
+    pub median: f32,
+    /// `global_max / median`. Values ≤ ~17 are consistent with pure
+    /// χ²(2) noise (extreme value statistics over the offset count);
+    /// values ≥ 20 trip the sync gate; real signals at +1 dB Robust
+    /// reach ≥ 56.
+    pub ratio: f32,
+    /// Number of correlation offsets sampled (≈ audio.len() − preamble).
+    pub n_scores: usize,
+}
+
+/// Compute [`SyncStats`] for a given audio buffer at a known centre.
+/// Same matched-filter + preamble correlation + median statistic that
+/// [`decode`] uses for its sync gate, but returned to the caller
+/// without running the per-peak LDPC sweep.
+pub fn diag_sync_stats(audio: &[f32], audio_centre_hz: f32) -> SyncStats {
+    if audio.len() < PREAMBLE_LEN * NSPS + RRC_LEN {
+        return SyncStats {
+            global_max: 0.0,
+            median: 0.0,
+            ratio: 0.0,
+            n_scores: 0,
+        };
+    }
+    let mf_out = downconvert_and_matched_filter(audio, audio_centre_hz);
+    let max_corr_offset = mf_out.len().saturating_sub((PREAMBLE_LEN - 1) * NSPS + 1);
+    if max_corr_offset == 0 {
+        return SyncStats {
+            global_max: 0.0,
+            median: 0.0,
+            ratio: 0.0,
+            n_scores: 0,
+        };
+    }
+    let mut scores = vec![0.0f32; max_corr_offset];
+    for (offset, slot) in scores.iter_mut().enumerate() {
+        *slot = preamble_correlation(&mf_out, offset).norm_sqr();
+    }
+    let global_max = scores.iter().cloned().fold(0.0f32, f32::max);
+    let mid = scores.len() / 2;
+    scores.select_nth_unstable_by(mid, |a, b| a.partial_cmp(b).unwrap());
+    let median = scores[mid];
+    let ratio = if median > 0.0 {
+        global_max / median
+    } else {
+        0.0
+    };
+    SyncStats {
+        global_max,
+        median,
+        ratio,
+        n_scores: max_corr_offset,
+    }
+}
+
 /// Returns `true` iff `global_max` is plausibly a real preamble peak
 /// — i.e. far enough above the score-distribution median that it can't
 /// be the natural extreme value of pure noise.

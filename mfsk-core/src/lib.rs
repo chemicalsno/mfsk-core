@@ -260,6 +260,12 @@
     clippy::unusual_byte_groupings
 )]
 
+/// Crate version string, taken from Cargo.toml at compile time. Useful
+/// for FFI / WASM consumers that need to verify which mfsk-core they
+/// actually linked against (e.g. through a [patch.crates-io] path
+/// override that didn't get re-fingerprinted).
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub mod core;
 pub mod fec;
 pub mod msg;
