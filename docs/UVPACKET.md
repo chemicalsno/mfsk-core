@@ -227,9 +227,27 @@ channel's own irreducible CNR floor, where no audio modem of any
 kind decodes.
 
 The FM threshold is the binding constraint for NFM voice
-channels. To get below it requires a different on-air modulation
-(SSB digital, direct IQ digital), which is out of scope for this
-experiment.
+channels.
+
+### 3.5 SSB compatibility
+
+The modem is an audio-domain QPSK + RRC processor (signal
+occupies ~1200–1800 Hz around the 1500 Hz centre, well inside a
+typical SSB passband). On SSB the FM-threshold floor goes away
+and the modem operates at its true ~−3.7 dB SNR_3kHz Robust
+threshold — a useful weak-signal data envelope, especially on HF.
+
+What's missing for production SSB use is **automatic frequency
+control (AFC)**: the current rx assumes `audio_centre_hz` is known
+exactly, while real SSB receivers see a ±50–100 Hz centre offset
+from VFO-dial mismatches between TX and RX. Adding AFC is a
+~50–100-line change (frequency-search the preamble correlator over
+a configurable window, then track the offset through the LMS
+phase fit) — planned for a follow-up cycle, not 0.3.1.
+
+Until AFC lands, SSB usage requires both ends to dial in the same
+frequency to within ~10 Hz. With a digital VFO and CAT control
+that's straightforward; with a manual dial it's not.
 
 ## 4. Modem implementation loss
 
