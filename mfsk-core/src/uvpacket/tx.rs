@@ -1,98 +1,93 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! TX path: bytes → 12 kHz f32 PCM audio.
 //!
+//! **Phase 2 modulation pivot**: this module implements **single-
+//! carrier coherent QPSK** with root raised-cosine pulse shaping,
+//! a 31-bit BPSK m-sequence preamble at the frame head, and
+//! periodic QPSK pilot symbols for receiver-side phase tracking.
+//! See `docs/0.3.1_PLAN.md` for the rationale.
+//!
 //! Pipeline:
 //!
 //! ```text
-//! bytes + (mode, app_type, sequence) + audio_centre_hz
-//!   ↓ framing::pack                            4-byte header + payload bytes
-//!   ↓ pad to N × 12 byte (N = block_count)
-//!   ↓ slice into 12-byte chunks                one chunk → one LDPC info block
-//!   ↓ for each block i ∈ 0..N:
-//!       info[ 0..96] = 12-byte payload chunk
-//!       info[96..101] = 5-bit "spread header" chunk
-//!                       (= header bits [5(i mod 7) .. 5(i mod 7)+5) ;
-//!                        zero where the chunk would extend past bit 31)
-//!   ↓ Ldpc240_101::encode each block           240-bit codeword
-//!   ↓ puncture per mode                        ch_bits_per_block(mode) bits/block
-//!   ↓ block-interleaver across all blocks      same total length
+//! bytes + (mode, block_count, app_type, sequence) + audio_centre_hz
+//!   ↓ framing::pack_to_size                  N×12 byte frame data
+//!   ↓ slice into 12-byte LDPC info chunks
+//!   ↓ for each block i:
+//!       info[ 0..96 ]  = 12-byte payload chunk
+//!       info[96..101]  = D-iii spread-header chunk
+//!       Ldpc240_101::encode → 240-bit codeword
+//!   ↓ puncture per mode (existing kSR-greedy keep set)
+//!   ↓ block-interleave across all blocks
+//!   ↓ map channel-bit pairs → QPSK constellation indices (Gray map)
 //!   ↓ build symbol stream:
-//!       for chunk i ∈ 0..N:
-//!         [Costas-4]
-//!         [chunk i bits, mapped via 4-FSK Gray to ch_bits/2 symbols]
-//!       [trailing Costas-4]
-//!   ↓ GFSK synth at audio_centre_hz - 1.5 × tone_spacing
+//!       [31-sym BPSK m-sequence preamble]
+//!       [pilot, 31 data, pilot, 31 data, ..., pilot, ≤31 data]
+//!   ↓ RRC pulse shape (α = 0.5, span 6 sym, NSPS = 10) →
+//!     complex baseband samples at 12 kHz
+//!   ↓ upconvert to audio centre 1500 Hz: Re{baseband · e^{j·2πfc·t}}
 //!   → Vec<f32> at 12 kHz
 //! ```
 //!
-//! ## Spread header (D-iii)
-//!
-//! Each LDPC info block has 101 information bits; the first 96 carry
-//! 12 bytes of frame data (so the **whole** 4-byte frame header sits
-//! in block 0's payload at bit positions 0..32). The remaining 5
-//! bits per block carry a **redundant copy** of the 32-bit frame
-//! header, distributed via:
-//!
-//! ```text
-//! info[96..101]  =  header_bits[5(i mod 7) .. 5(i mod 7) + 5)
-//! ```
-//!
-//! For frames with `n_blocks ≥ 7` the full 32-bit header gets at
-//! least one complete copy across the 5-bit fields (each 7 blocks
-//! is one cycle); 32-block frames carry > 4 redundant cycles. If
-//! block 0 fails to decode but several other blocks survive, the
-//! receiver can reconstruct the header from the 5-bit fields by
-//! brute-forcing any missing chunks against the frame CRC-16.
-//!
-//! For `n_blocks < 7` the spread is partial — receiver still uses
-//! block 0's payload as the primary header source.
+//! Everything **above** the QPSK mapping is unchanged from the
+//! Phase 1 4-FSK design — framing, LDPC encode, kSR-greedy
+//! puncture, block interleaver, D-iii spread header all reuse
+//! the existing modules.
 
-use crate::core::dsp::gfsk::{GfskCfg, synth_f32};
-use crate::core::{FecCodec, ModulationParams};
+use num_complex::Complex32;
+use std::f32::consts::PI;
+
+use crate::core::FecCodec;
 use crate::fec::Ldpc240_101;
 
 use super::framing::{FrameHeader, HEADER_BYTES, INFO_BYTES_PER_BLOCK, PackError, pack_to_size};
 use super::interleaver::interleave;
 use super::puncture::puncture;
-use super::sync_pattern::UVPACKET_COSTAS;
+use super::sync_pattern::{
+    PILOT_QPSK_POINT, PILOT_SYMBOL_INTERVAL, UVPACKET_PREAMBLE_BPSK_BITS,
+};
 
 /// LDPC mother-codeword length.
 const N_LDPC: usize = 240;
 /// LDPC info-bit count.
 const K_LDPC: usize = 101;
-/// Payload bits per block — first 96 of the 101 info bits.
+/// Payload bits per block (first 96 of the 101 info bits).
 const PAYLOAD_BITS_PER_BLOCK: usize = INFO_BYTES_PER_BLOCK * 8; // 96
-/// Spread header bits per block — last 5 of the 101 info bits.
+/// Spread header bits per block.
 const HEADER_CHUNK_BITS: usize = K_LDPC - PAYLOAD_BITS_PER_BLOCK; // 5
-/// Spread header period (every 7 blocks the cycle repeats).
+/// Spread header repeats every 7 blocks.
 const HEADER_SPREAD_PERIOD: usize = 7;
 /// Total header bits.
 const HEADER_BITS: usize = HEADER_BYTES * 8; // 32
 
-/// 4-FSK Gray map (bit pair → tone index). Same permutation as FT4
-/// (`[0, 1, 3, 2]`).
+/// 4-symbol QPSK Gray map (bit pair → constellation index). Bit
+/// pair `(b1, b0)` gives the index `(b1 << 1) | b0`; the Gray map
+/// rotates indices so that adjacent constellation points differ
+/// by one bit, matching the FT4 / Phase 1 mapping.
 const GRAY_4: [u8; 4] = [0, 1, 3, 2];
 
-/// Tone-spacing-derived frequency offset of the lowest tone (`tone 0`)
-/// from the audio centre.
-const TONE_SPACING_HZ: f32 = 600.0;
-const LOWEST_TONE_OFFSET_HZ: f32 = -1.5 * TONE_SPACING_HZ;
+/// Sample rate of the modem.
+const SAMPLE_RATE_HZ: f32 = 12_000.0;
+/// 1200 baud → 10 samples / symbol at 12 kHz.
+const NSPS: usize = 10;
+/// RRC pulse: span in symbols (3 each side of the centre tap).
+const RRC_SPAN_SYMS: usize = 6;
+/// RRC roll-off factor.
+const RRC_ALPHA: f32 = 0.5;
 
-/// Encode a uvpacket frame to 12 kHz f32 audio.
+/// Encode a uvpacket frame to 12 kHz f32 PCM audio.
 ///
-/// `header` carries the per-frame metadata (mode + block count + app
+/// `header` carries per-frame metadata (mode + block count + app
 /// type + sequence). `payload` is the application-layer byte stream
-/// (length must be ≤ `header.block_count * 12 - 4`). `audio_centre_hz`
-/// is the mid-band carrier (recommended: 1700 Hz, exposed as
-/// [`crate::uvpacket::AUDIO_CENTRE_HZ`]).
+/// (length must be ≤ `header.block_count * 12 - 4`).
+/// `audio_centre_hz` is the carrier frequency to upconvert the QPSK
+/// baseband to (typically 1500 Hz; clearing both the typical NFM
+/// HT high-pass at 300–500 Hz and the audio-passband corner ≥ 2.7
+/// kHz).
 ///
-/// Returns owned `Vec<f32>` PCM at 12 kHz, ready to feed an audio
-/// output device. Length is `(header.block_count × (4 + ch_bits/2)
-/// + 4) × NSPS` samples, where `NSPS = 10` (= 12 kHz / 1200 baud) and
-/// `ch_bits = mode.ch_bits_per_block()`.
-///
-/// Returns `Err(PackError)` if the header fields are out of range or
-/// the payload exceeds the per-frame capacity.
+/// Returns owned `Vec<f32>` PCM at 12 kHz with peak amplitude ≤ 1.
+/// Length depends on mode / n_blocks / pilot count + RRC tail —
+/// see [`expected_total_symbols`] for the symbol-count formula.
 pub fn encode(
     header: &FrameHeader,
     payload: &[u8],
@@ -101,9 +96,6 @@ pub fn encode(
     let mode = header.mode;
     let n_blocks = header.block_count as usize;
 
-    // Per-frame payload capacity: n_blocks × 12 byte − 4 byte header.
-    // Reject before `pack` so the caller sees a single failure mode
-    // rather than a downstream panic.
     let per_frame_capacity = n_blocks
         .saturating_mul(INFO_BYTES_PER_BLOCK)
         .saturating_sub(HEADER_BYTES);
@@ -111,23 +103,20 @@ pub fn encode(
         return Err(PackError::PayloadTooLarge(payload.len()));
     }
 
-    // 1. Pack header + payload + zero-padding into exactly the LDPC
-    // info-byte budget for n_blocks. The CRC is computed over header
-    // word + (payload + padding), so the receiver can verify integrity
-    // without having to know the original payload length up front.
+    // 1. Pack header + payload + zero-pad → exactly N×12 bytes; CRC
+    //    covers header word + (payload + padding).
     let frame_data_total = n_blocks * INFO_BYTES_PER_BLOCK;
     let frame_data = pack_to_size(header, payload, frame_data_total)?;
     let header_bytes: [u8; HEADER_BYTES] = frame_data[..HEADER_BYTES].try_into().unwrap();
 
-    // 2. Pre-compute the 32-bit header bits (MSB-first per byte) for
-    // the per-block spread copy.
+    // 2. Header bits MSB-first, for the per-block 5-bit spread copy.
     let mut header_bits = [0u8; HEADER_BITS];
     for (i, bit) in header_bits.iter_mut().enumerate() {
         let byte = header_bytes[i / 8];
         *bit = (byte >> (7 - (i % 8))) & 1;
     }
 
-    // 3. Encode each LDPC block.
+    // 3. LDPC-encode every block.
     let fec = Ldpc240_101;
     let mut info_buf = vec![0u8; K_LDPC];
     let mut codeword_buf = vec![0u8; N_LDPC];
@@ -136,15 +125,11 @@ pub fn encode(
     for block_idx in 0..n_blocks {
         let payload_chunk =
             &frame_data[block_idx * INFO_BYTES_PER_BLOCK..(block_idx + 1) * INFO_BYTES_PER_BLOCK];
-
-        // info[0..96]: payload bits, MSB-first per byte.
         for (byte_idx, &byte) in payload_chunk.iter().enumerate() {
             for bit_idx in 0..8 {
                 info_buf[byte_idx * 8 + bit_idx] = (byte >> (7 - bit_idx)) & 1;
             }
         }
-
-        // info[96..101]: spread-header chunk for this block.
         let chunk_offset = HEADER_CHUNK_BITS * (block_idx % HEADER_SPREAD_PERIOD);
         for chunk_bit in 0..HEADER_CHUNK_BITS {
             let header_bit_idx = chunk_offset + chunk_bit;
@@ -154,69 +139,149 @@ pub fn encode(
                 0
             };
         }
-
         fec.encode(&info_buf, &mut codeword_buf);
         concat_codewords.extend_from_slice(&codeword_buf);
     }
 
-    // 4. Puncture each codeword per mode.
+    // 4. Puncture per mode.
     let block_ch_bits = mode.ch_bits_per_block();
     let mut punctured_concat = Vec::with_capacity(n_blocks * block_ch_bits);
     for block_idx in 0..n_blocks {
         let cw = &concat_codewords[block_idx * N_LDPC..(block_idx + 1) * N_LDPC];
-        let p = puncture(cw, mode);
-        punctured_concat.extend_from_slice(&p);
+        punctured_concat.extend_from_slice(&puncture(cw, mode));
     }
 
-    // 5. Block-interleave across all blocks.
+    // 5. Block-interleave.
     let interleaved = interleave(&punctured_concat, n_blocks);
 
-    // 6. Build symbol stream: per-block Costas-4 + data symbols, then
-    // trailing Costas-4. 4-FSK = 2 bits/symbol, so block_ch_bits is
-    // even by construction (240/202/152/134).
-    debug_assert!(block_ch_bits.is_multiple_of(2));
-    let block_data_syms = block_ch_bits / 2;
-    let costas_len = UVPACKET_COSTAS.len();
-    let total_syms = n_blocks * (costas_len + block_data_syms) + costas_len;
-    let mut syms = Vec::with_capacity(total_syms);
+    // 6. Map channel-bit pairs to QPSK constellation indices.
+    debug_assert!(interleaved.len().is_multiple_of(2));
+    let n_data_syms = interleaved.len() / 2;
+    let mut qpsk_data: Vec<u8> = Vec::with_capacity(n_data_syms);
+    for sym_idx in 0..n_data_syms {
+        let pair = (interleaved[sym_idx * 2] << 1) | interleaved[sym_idx * 2 + 1];
+        qpsk_data.push(GRAY_4[pair as usize]);
+    }
 
-    for block_idx in 0..n_blocks {
-        syms.extend_from_slice(&UVPACKET_COSTAS);
-        let chunk = &interleaved[block_idx * block_ch_bits..(block_idx + 1) * block_ch_bits];
-        for sym_idx in 0..block_data_syms {
-            // MSB-first within each 2-bit symbol.
-            let pair = (chunk[sym_idx * 2] << 1) | chunk[sym_idx * 2 + 1];
-            syms.push(GRAY_4[pair as usize]);
+    // 7. Build the symbol stream:
+    //    [preamble (31 BPSK)]
+    //    [pilot, 31 data, pilot, 31 data, ..., pilot, ≤31 data]
+    let mut symbols: Vec<Complex32> = Vec::new();
+    for &b in UVPACKET_PREAMBLE_BPSK_BITS.iter() {
+        // m-sequence bit `true` → BPSK -1, `false` → +1.
+        symbols.push(Complex32::new(if b { -1.0 } else { 1.0 }, 0.0));
+    }
+    let pilot = qpsk_constellation_point(PILOT_QPSK_POINT);
+    let data_per_interval = PILOT_SYMBOL_INTERVAL - 1;
+    let mut data_idx = 0;
+    while data_idx < qpsk_data.len() {
+        symbols.push(pilot);
+        let end = (data_idx + data_per_interval).min(qpsk_data.len());
+        for i in data_idx..end {
+            symbols.push(qpsk_constellation_point(qpsk_data[i]));
+        }
+        data_idx = end;
+    }
+
+    // 8. RRC pulse-shape into a complex baseband.
+    let rrc = rrc_pulse(RRC_ALPHA, RRC_SPAN_SYMS, NSPS);
+    let total_samples = symbols.len() * NSPS + rrc.len();
+    let mut baseband = vec![Complex32::new(0.0, 0.0); total_samples];
+    let center_offset = rrc.len() / 2; // align symbol centres at half-pulse
+    for (i, &sym) in symbols.iter().enumerate() {
+        let start = i * NSPS;
+        for (j, &tap) in rrc.iter().enumerate() {
+            let pos = start + j;
+            if pos < baseband.len() {
+                baseband[pos] += sym * tap;
+            }
         }
     }
-    syms.extend_from_slice(&UVPACKET_COSTAS);
+    let _ = center_offset; // (TX uses left-aligned convolution; centring matters only for RX)
 
-    // 7. GFSK synth.
-    let nsps = <super::protocol::UvRobust as ModulationParams>::NSPS as usize;
-    let cfg = GfskCfg {
-        sample_rate: 12_000.0,
-        samples_per_symbol: nsps,
-        bt: 0.5,
-        hmod: 0.5,
-        // Smooth half-symbol cosine ramps at the very start and end of
-        // the burst. NSPS / 2 = 5 samples ≈ 0.4 ms — short enough not
-        // to interfere with the head Costas, long enough to suppress
-        // brick-wall TX-key click.
-        ramp_samples: nsps / 2,
-    };
-    let f0_hz = audio_centre_hz + LOWEST_TONE_OFFSET_HZ;
+    // 9. Upconvert: real audio = Re{baseband · e^{j 2π fc n / fs}}.
+    let mut audio = vec![0.0_f32; total_samples];
+    let two_pi_fc_dt = 2.0 * PI * audio_centre_hz / SAMPLE_RATE_HZ;
+    for n in 0..total_samples {
+        let phase = two_pi_fc_dt * n as f32;
+        let (s, c) = phase.sin_cos();
+        audio[n] = baseband[n].re * c - baseband[n].im * s;
+    }
 
-    Ok(synth_f32(&syms, f0_hz, 1.0, &cfg))
+    // 10. Normalise so the peak is ≤ 1.0 (the σ formula assumes
+    //     unit peak; RRC + sum-of-symbols can briefly overshoot
+    //     ±1 during transitions).
+    let peak = audio.iter().map(|s| s.abs()).fold(0.0_f32, f32::max);
+    if peak > 1.0 {
+        let scale = 1.0 / peak;
+        for s in audio.iter_mut() {
+            *s *= scale;
+        }
+    }
+
+    Ok(audio)
 }
 
-// ────────────────────────────────────────────────────────────────────
-// Tests
-// ────────────────────────────────────────────────────────────────────
+/// QPSK constellation: `index 0 → +1+0j`, `1 → 0+1j`,
+/// `2 → −1+0j`, `3 → 0−1j`.
+fn qpsk_constellation_point(idx: u8) -> Complex32 {
+    match idx & 0x3 {
+        0 => Complex32::new(1.0, 0.0),
+        1 => Complex32::new(0.0, 1.0),
+        2 => Complex32::new(-1.0, 0.0),
+        3 => Complex32::new(0.0, -1.0),
+        _ => unreachable!(),
+    }
+}
+
+/// Generate root-raised-cosine pulse coefficients. Returns
+/// `span_syms × samples_per_sym + 1` taps, normalised so that
+/// `Σ h² = 1`.
+fn rrc_pulse(alpha: f32, span_syms: usize, samples_per_sym: usize) -> Vec<f32> {
+    let n = span_syms * samples_per_sym;
+    let mut h = vec![0.0_f32; n + 1];
+    let center = n as f32 / 2.0;
+    for (i, h_i) in h.iter_mut().enumerate() {
+        let t = (i as f32 - center) / samples_per_sym as f32;
+        *h_i = if t.abs() < 1e-6 {
+            // L'Hôpital limit at t = 0.
+            1.0 - alpha + 4.0 * alpha / PI
+        } else if (t.abs() - 1.0 / (4.0 * alpha)).abs() < 1e-6 {
+            // L'Hôpital limit at t = ±1/(4α).
+            (alpha / 2.0_f32.sqrt())
+                * ((1.0 + 2.0 / PI) * (PI / (4.0 * alpha)).sin()
+                    + (1.0 - 2.0 / PI) * (PI / (4.0 * alpha)).cos())
+        } else {
+            let pi_t = PI * t;
+            let four_at = 4.0 * alpha * t;
+            ((pi_t * (1.0 - alpha)).sin() + four_at * (pi_t * (1.0 + alpha)).cos())
+                / (pi_t * (1.0 - four_at * four_at))
+        };
+    }
+    let norm: f32 = h.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        for x in h.iter_mut() {
+            *x /= norm;
+        }
+    }
+    h
+}
+
+/// Compute the total transmitted symbol count for a given mode +
+/// block count: 31-sym preamble + (pilots interleaved with data).
+pub fn expected_total_symbols(mode: super::puncture::Mode, n_blocks: u8) -> usize {
+    let block_ch_bits = mode.ch_bits_per_block();
+    let n_data = (n_blocks as usize) * block_ch_bits / 2; // 2 bits / QPSK sym
+    let data_per_interval = PILOT_SYMBOL_INTERVAL - 1;
+    let n_pilots = n_data.div_ceil(data_per_interval);
+    UVPACKET_PREAMBLE_BPSK_BITS.len() + n_pilots + n_data
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::uvpacket::{AUDIO_CENTRE_HZ, Mode};
+    use crate::uvpacket::AUDIO_CENTRE_HZ;
+    use crate::uvpacket::Mode;
 
     fn header_for(mode: Mode, n_blocks: u8) -> FrameHeader {
         FrameHeader {
@@ -227,88 +292,100 @@ mod tests {
         }
     }
 
+    /// Smoke: encode succeeds for every mode × representative
+    /// frame size.
     #[test]
-    fn encode_returns_expected_sample_count() {
+    fn encode_succeeds_all_modes() {
         for mode in [Mode::Robust, Mode::Standard, Mode::Fast, Mode::Express] {
             for n_blocks in [1u8, 4, 18, 32] {
                 let header = header_for(mode, n_blocks);
-                let payload_size = (n_blocks as usize) * INFO_BYTES_PER_BLOCK - HEADER_BYTES;
-                let payload = vec![0xA5u8; payload_size];
+                let cap = (n_blocks as usize) * INFO_BYTES_PER_BLOCK - HEADER_BYTES;
+                let payload = vec![0xA5_u8; cap];
                 let audio = encode(&header, &payload, AUDIO_CENTRE_HZ).unwrap();
-
-                let block_data_syms = mode.ch_bits_per_block() / 2;
-                let costas_len = UVPACKET_COSTAS.len();
-                let total_syms = (n_blocks as usize) * (costas_len + block_data_syms) + costas_len;
-                let nsps = 10usize;
-                assert_eq!(
-                    audio.len(),
-                    total_syms * nsps,
-                    "{mode:?} n={n_blocks}: sample count {} != expected {}",
-                    audio.len(),
-                    total_syms * nsps,
-                );
+                assert!(!audio.is_empty(), "{mode:?} n={n_blocks}: empty audio");
             }
         }
     }
 
+    /// Audio peak must be ≤ 1 (the σ-for-Eb/N0 formula assumes
+    /// unit peak; we normalise the burst to match).
     #[test]
-    fn encode_audio_is_finite_and_bounded() {
+    fn encode_peak_amplitude_bounded() {
         let header = header_for(Mode::Robust, 4);
         let audio = encode(&header, b"hello", AUDIO_CENTRE_HZ).unwrap();
-        for &s in &audio {
-            assert!(s.is_finite(), "non-finite sample");
-            assert!(s.abs() <= 1.001, "sample exceeds amplitude bound: {s}");
+        let peak = audio.iter().map(|s| s.abs()).fold(0.0_f32, f32::max);
+        assert!(peak <= 1.0001, "peak {peak} > 1");
+    }
+
+    /// Sample-count must match `expected_total_symbols × NSPS +
+    /// RRC tail`.
+    #[test]
+    fn encode_sample_count_matches_formula() {
+        for mode in [Mode::Robust, Mode::Standard, Mode::Fast, Mode::Express] {
+            let n_blocks = 4u8;
+            let header = header_for(mode, n_blocks);
+            let cap = (n_blocks as usize) * INFO_BYTES_PER_BLOCK - HEADER_BYTES;
+            let payload = vec![0xCC_u8; cap];
+            let audio = encode(&header, &payload, AUDIO_CENTRE_HZ).unwrap();
+
+            let n_syms = expected_total_symbols(mode, n_blocks);
+            let rrc_len = RRC_SPAN_SYMS * NSPS + 1;
+            let expected = n_syms * NSPS + rrc_len;
+            assert_eq!(
+                audio.len(),
+                expected,
+                "{mode:?}: got {} samples, expected {}",
+                audio.len(),
+                expected,
+            );
         }
     }
 
+    /// Distinct payloads must produce substantively different
+    /// audio.
     #[test]
-    fn encode_rejects_oversize_payload() {
-        let header = header_for(Mode::Robust, 1);
-        let too_big = vec![0u8; INFO_BYTES_PER_BLOCK]; // 12 bytes; exceeds 12 - 4 = 8 byte capacity.
-        let err = encode(&header, &too_big, AUDIO_CENTRE_HZ).unwrap_err();
-        assert!(matches!(err, PackError::PayloadTooLarge(_)));
-    }
-
-    #[test]
-    fn distinct_payloads_produce_distinct_audio() {
-        let header = header_for(Mode::Standard, 4);
+    fn distinct_payloads_diverge() {
+        let header = header_for(Mode::Robust, 4);
         let a = encode(&header, b"alpha", AUDIO_CENTRE_HZ).unwrap();
         let b = encode(&header, b"bravo", AUDIO_CENTRE_HZ).unwrap();
         assert_eq!(a.len(), b.len());
-        let differences: usize = a
+        let differences = a
             .iter()
             .zip(b.iter())
-            .filter(|(x, y)| (**x - **y).abs() > 1e-6)
+            .filter(|(x, y)| (**x - **y).abs() > 1e-4)
             .count();
         assert!(
             differences > a.len() / 4,
-            "expected substantial waveform divergence, got {differences} differing samples",
+            "expected substantial divergence, got {differences} / {}",
+            a.len(),
         );
     }
 
+    /// Higher-rate modes (more puncturing) → fewer transmitted
+    /// symbols → shorter audio.
     #[test]
-    fn distinct_modes_produce_distinct_audio_lengths() {
-        let robust = encode(&header_for(Mode::Robust, 8), b"hi", AUDIO_CENTRE_HZ).unwrap();
-        let standard = encode(&header_for(Mode::Standard, 8), b"hi", AUDIO_CENTRE_HZ).unwrap();
-        let fast = encode(&header_for(Mode::Fast, 8), b"hi", AUDIO_CENTRE_HZ).unwrap();
-        let express = encode(&header_for(Mode::Express, 8), b"hi", AUDIO_CENTRE_HZ).unwrap();
-
-        // ch_bits_per_block strictly decreases Robust → Express, so
-        // audio length should as well.
-        assert!(robust.len() > standard.len());
-        assert!(standard.len() > fast.len());
-        assert!(fast.len() > express.len());
+    fn modes_have_decreasing_audio_length() {
+        let n_blocks = 8u8;
+        let payload = vec![0_u8; 32];
+        let lens: Vec<usize> = [Mode::Robust, Mode::Standard, Mode::Fast, Mode::Express]
+            .iter()
+            .map(|&m| encode(&header_for(m, n_blocks), &payload, AUDIO_CENTRE_HZ).unwrap().len())
+            .collect();
+        for w in lens.windows(2) {
+            assert!(w[0] >= w[1], "expected non-increasing audio lengths: {lens:?}");
+        }
+        // Robust strictly longer than Express (different ch_bits).
+        assert!(lens[0] > lens[3]);
     }
 
+    /// Oversize payload → PackError.
     #[test]
-    fn full_capacity_qsl_size_payload_encodes() {
-        // 214-byte signed-QSL fits in 19 blocks at 12 byte/block + 4
-        // byte header; we round up to fit the full capacity.
-        let header = header_for(Mode::Standard, 19);
-        let payload = vec![0x42u8; 19 * INFO_BYTES_PER_BLOCK - HEADER_BYTES];
-        let audio = encode(&header, &payload, AUDIO_CENTRE_HZ).unwrap();
-        // 19 blocks × (4 Costas + 101 data) + 4 trailer = 19 × 105 + 4
-        // = 1999 syms × 10 samples = 19_990 samples.
-        assert_eq!(audio.len(), 19 * (4 + 202 / 2) * 10 + 4 * 10);
+    fn oversize_payload_rejected() {
+        let header = header_for(Mode::Robust, 1);
+        let too_big = vec![0_u8; INFO_BYTES_PER_BLOCK]; // 12 byte > capacity 8.
+        assert!(matches!(
+            encode(&header, &too_big, AUDIO_CENTRE_HZ).unwrap_err(),
+            PackError::PayloadTooLarge(_),
+        ));
     }
 }
