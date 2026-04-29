@@ -43,7 +43,7 @@ use mfsk_core::Wspr;
 use mfsk_core::q65::{Q65a30, Q65a60, Q65b60, Q65c60, Q65d60, Q65e60};
 
 #[cfg(feature = "uvpacket")]
-use mfsk_core::{UvFast, UvRobust, UvStandard};
+use mfsk_core::{UvExpress, UvFast, UvRobust, UvStandard};
 
 /// Invariants that depend only on `<P as ModulationParams>`.
 fn assert_modulation_invariants<P: ModulationParams>(name: &str) {
@@ -301,12 +301,13 @@ fn q65_eme_submodes_satisfy_protocol_invariants() {
 #[cfg(feature = "uvpacket")]
 #[test]
 fn uvpacket_submodes_satisfy_protocol_invariants() {
-    // All three uvpacket sub-modes share Ldpc240_101 + UvPacketRawMessage
+    // All four uvpacket sub-modes share Ldpc240_101 + UvPacketRawMessage
     // + the same Costas-prefixed-LDPC-block frame layout. Only the
     // (inherent) `MODE` puncture-posture constant differs.
     assert_protocol_invariants::<UvRobust>("UvRobust");
     assert_protocol_invariants::<UvStandard>("UvStandard");
     assert_protocol_invariants::<UvFast>("UvFast");
+    assert_protocol_invariants::<UvExpress>("UvExpress");
 }
 
 // ─── Registry / trait-surface cross-check ─────────────────────────────
@@ -481,7 +482,7 @@ fn registry_size_matches_wired_protocols() {
     }
     #[cfg(feature = "uvpacket")]
     {
-        expected += 3;
+        expected += 4;
     }
     assert_eq!(
         PROTOCOLS.len(),
@@ -533,11 +534,12 @@ fn every_wired_protocol_has_a_unique_protocol_id() {
     }
     #[cfg(feature = "uvpacket")]
     {
-        // All three uvpacket sub-modes share ProtocolId::UvPacket —
+        // All four uvpacket sub-modes share ProtocolId::UvPacket —
         // family-level FFI tag, same rationale as Q65.
         ids.push(("UvRobust", <UvRobust as Protocol>::ID));
         ids.push(("UvStandard", <UvStandard as Protocol>::ID));
         ids.push(("UvFast", <UvFast as Protocol>::ID));
+        ids.push(("UvExpress", <UvExpress as Protocol>::ID));
     }
 
     // Distinct protocol families must have distinct IDs.

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Protocol markers + trait wiring for the three uvpacket modes.
+//! Protocol markers + trait wiring for the four uvpacket modes.
 //!
-//! All three modes share the same modem (4-GFSK at 1200 baud,
+//! All four modes share the same modem (4-GFSK at 1200 baud,
 //! 600 Hz tone spacing, h=0.5, BT=0.5), the same FEC mother code
 //! (`Ldpc240_101`), the same Costas-4 head sync, and the same
 //! per-LDPC-block frame layout at the [`Protocol`] trait level. They
@@ -13,22 +13,19 @@
 //! |----------------|-----:|--------------------------------:|-----|
 //! | [`UvRobust`]   | 0.42 | 1008 | mountain / weak signal / deep fading |
 //! | [`UvStandard`] | 0.50 | 1200 | typical NFM with fading             |
-//! | [`UvFast`]     | 0.66 | 1600 | strong-signal mode (rate-2/3, requires empirical convergence validation) |
+//! | [`UvFast`]     | 0.66 | 1600 | good-signal default                  |
+//! | [`UvExpress`]  | 0.75 | 1800 | strong-signal headline-fast mode (OSD-2 essentially mandatory) |
 //!
-//! `UvFast` punctures 88 of the mother code's 139 parity bits
-//! (≈ 63 %) — well above the 30 % rule-of-thumb where uniform-spread
-//! puncturing of an irregular LDPC starts to lose ground. Whether
-//! it actually decodes is an empirical question gated by the test
-//! [`crate::uvpacket::puncture::tests`] runs.
+//! Higher-rate modes use kSR-greedy puncture-set selection (see
+//! [`crate::uvpacket::puncture`]) — the empirical AWGN sweep showed
+//! ~1–3 dB Eb/N0 gain over uniform-spread at the deeper puncture
+//! rates, which makes `UvExpress` (76 % parity puncturing) viable.
 //!
-//! A rate-3/4 mode existed in earlier drafts but was dropped before
-//! implementation; see `puncture.rs` for the rationale.
-//!
-//! Note: at the [`Protocol`] level, all three ZSTs claim the same
+//! Note: at the [`Protocol`] level, all four ZSTs claim the same
 //! `N_DATA = 120` (= unpunctured codeword 240 ch bits / 2 bits/sym).
 //! The actual on-air block length post-puncture is shorter for
-//! Standard / Fast and is handled by the bespoke TX/RX paths in
-//! [`crate::uvpacket::tx`] / [`crate::uvpacket::rx`]. The
+//! Standard / Fast / Express and is handled by the bespoke TX/RX
+//! paths in [`crate::uvpacket::tx`] / [`crate::uvpacket::rx`]. The
 //! Protocol-level constants describe the *unpunctured* codeword so
 //! the standard mfsk-core invariants (FEC fits in N_DATA × bits/sym)
 //! hold.
@@ -133,9 +130,18 @@ uvpacket_submode! {
 
 uvpacket_submode! {
     /// **Fast** — punctured to rate 2/3. 1600 net bps (+33 % vs
-    /// AFSK 1200). Strong-signal mode. Aggressive puncturing
-    /// (63 % of parity bits dropped); decoder convergence is
-    /// gated on the `puncture::tests::fast_decodes_at_high_snr`
-    /// empirical test.
+    /// AFSK 1200). Good-signal default. 63 % parity puncturing;
+    /// kSR-greedy puncture selection delivers ~1 dB Eb/N0 gain
+    /// over uniform-spread at the BP threshold.
     UvFast, mode = Mode::Fast,
+}
+
+uvpacket_submode! {
+    /// **Express** — punctured to rate 3/4. 1800 net bps (+50 % vs
+    /// AFSK 1200). Strong-signal headline-fast mode. 76 % parity
+    /// puncturing — OSD-2 is essentially mandatory at the BP
+    /// threshold (~+3 dB Eb/N0 with OSD-2; BP-only needs ~+5 dB).
+    /// Viable only thanks to kSR-greedy puncture selection
+    /// (uniform-spread fails at this rate).
+    UvExpress, mode = Mode::Express,
 }

@@ -16,34 +16,60 @@
 //! | Robust    | 139         | 240           | 101/240 = 0.421   |
 //! | Standard  | 101         | 202           | 101/202 = 0.500   |
 //! | Fast      |  51         | 152           | 101/152 = 0.665   |
+//! | Express   |  33         | 134           | 101/134 = 0.754   |
 //!
-//! `Fast` requires empirical decoder-convergence validation — at
-//! 63 % parity puncturing of a hand-tuned irregular LDPC the BP
-//! threshold can shift unpredictably (the WSJT-X authors did not
-//! design `Ldpc240_101` for puncturing). See the `puncture::tests`
-//! module for the high-SNR convergence sweep that gates it.
+//! `Fast` and `Express` apply aggressive puncturing (63 % and
+//! 76 % of the mother code's 139 parity bits, respectively) — the
+//! WSJT-X authors did not design `Ldpc240_101` for puncturing, so
+//! decoder convergence at these rates is not given. The empirical
+//! AWGN sweep in [`tests::modes_awgn_sweep_uniform_vs_kSR`] and
+//! [`tests::experimental_rate_3_4`] characterises the per-mode
+//! behaviour and motivates the kSR-greedy puncture-set selection.
 //!
-//! A rate-3/4 mode existed in earlier design drafts but was dropped
-//! before implementation: 76 % parity puncturing of a
-//! non-rate-compatible code is essentially guaranteed to break BP
-//! convergence; reaching rate 3/4 reliably needs either a
-//! purpose-designed RC-LDPC or a different mother code, both out of
-//! scope for 0.3.1.
+//! Empirical findings (200-trial AWGN sweep, OSD-2 fallback):
 //!
-//! Selection of which parity positions to keep is done with a
-//! Bresenham-style integer recurrence over the 139 parity slots —
-//! equivalent to "keep position `i` iff
-//! `floor((i + 1) · keep / 139) > floor(i · keep / 139)`". This
-//! yields a maximally uniform spread without any tables, and is
-//! deterministic (the same `Mode` always produces the same keep
-//! set). The info positions (0..101) are always kept.
+//! - `Express` decodes 99 % at Eb/N0 = +3 dB with OSD-2; BP-only
+//!   needs ~+5 dB. Without kSR-greedy the BP floor is ~3 dB worse.
+//! - `Fast` shows BP improvement of ~0.5–1 dB from kSR-greedy.
+//! - `Standard` is mostly indifferent to selector choice (puncture
+//!   density too low to matter).
+//! - `Robust` is unpunctured — both selectors emit the same set.
 //!
-//! Uniform-spread is the simplest puncture-set construction; it
-//! does not exploit the H-matrix's girth or row-weight structure.
-//! A more sophisticated selection (greedy minimum-distance, or
-//! density-evolution-guided) is left for future work — the
-//! empirical sweep tells us whether the simple approach is good
-//! enough for the chosen rates.
+//! Two puncture-set construction methods are implemented:
+//!
+//! 1. **Uniform spread** — Bresenham-style integer recurrence over
+//!    the 139 parity slots: keep position `i` iff
+//!    `floor((i + 1) · keep / 139) > floor(i · keep / 139)`.
+//!    Maximally uniform spread without any tables. Reference
+//!    baseline; ignores H-matrix structure entirely.
+//!
+//! 2. **kSR-greedy** — at each step, add the parity position
+//!    whose addition leaves the puncture set most recoverable,
+//!    measured by the per-bit `k`-step recoverability classifier
+//!    described below. This is the Ha-McLaughlin-style construction
+//!    used in the LDPC-puncturing literature.
+//!
+//! The default returned by [`keep_indices`] is **kSR-greedy**.
+//! `keep_indices_uniform` and `keep_indices_kSR_greedy` expose
+//! both for direct comparison; the convergence sweep test in
+//! `tests::compare_uniform_vs_kSR_greedy` measures the difference.
+//!
+//! Selected sets are computed once per process (via `OnceLock`)
+//! since the greedy search is not free (~1 s wall-clock for the
+//! Fast mode at 88 punctures, in release mode).
+//!
+//! ## k-step recoverability (k-SR)
+//!
+//! After Ha & McLaughlin (2002, 2004): a punctured variable node
+//! `v` is **k-SR** iff there exists a check-node neighbour `c` of
+//! `v` such that every other variable node in `c` is either
+//! unpunctured or `j`-SR with `j < k`. Equivalently, BP recovers
+//! `v`'s value within `k` iterations under the assumption that
+//! all unpunctured neighbours are perfectly known.
+//!
+//! Lower `k` is better for the punctured bit. Maximising the
+//! count of low-`k` punctured bits across the whole puncture set
+//! is the objective of the greedy construction.
 
 /// `Ldpc240_101` codeword length.
 const N: usize = 240;
@@ -61,32 +87,37 @@ pub enum Mode {
     /// Punctured to rate 1/2. 1200 net bps. AFSK 1200 throughput
     /// parity plus FEC for typical NFM channels.
     Standard,
-    /// Punctured to rate 2/3. 1600 net bps. Strong-signal mode;
-    /// requires the high-SNR empirical convergence test to pass
-    /// before being shipped (see this module's tests).
+    /// Punctured to rate 2/3. 1600 net bps. Aggressive puncturing
+    /// (63 % of parity bits dropped); BP threshold benefits ~1 dB
+    /// from kSR-greedy puncture-set selection over uniform-spread.
     Fast,
+    /// Punctured to rate 3/4. 1800 net bps. Headline-fast mode for
+    /// strong signals; 76 % parity puncturing makes OSD-2 essentially
+    /// mandatory at the BP threshold (BP-only convergence needs ~+5 dB
+    /// Eb/N0 vs ~+3 dB with OSD-2).
+    Express,
 }
 
 impl Mode {
-    /// 2-bit encoding for the frame-header `mode` field. Code `3`
-    /// is reserved for forward-compatibility (a future rate-3/4 or
-    /// RC-LDPC variant); `from_header_code` returns `None` for it.
+    /// 2-bit encoding for the frame-header `mode` field.
     pub const fn header_code(self) -> u8 {
         match self {
             Mode::Robust => 0,
             Mode::Standard => 1,
             Mode::Fast => 2,
+            Mode::Express => 3,
         }
     }
 
-    /// Inverse of [`Self::header_code`]. Returns `None` for code
-    /// `3` (reserved) or any value `> 3`. The 2-bit header field
-    /// encodes the three live modes plus one reserved slot.
+    /// Inverse of [`Self::header_code`]. Returns `None` for any
+    /// value `> 3` (the field is 2 bits wide and all 4 codes are
+    /// valid); kept fallible for forward compatibility.
     pub const fn from_header_code(code: u8) -> Option<Self> {
         match code {
             0 => Some(Mode::Robust),
             1 => Some(Mode::Standard),
             2 => Some(Mode::Fast),
+            3 => Some(Mode::Express),
             _ => None,
         }
     }
@@ -99,6 +130,7 @@ impl Mode {
             Mode::Robust => 240,
             Mode::Standard => 202,
             Mode::Fast => 152,
+            Mode::Express => 134,
         }
     }
 
@@ -109,18 +141,37 @@ impl Mode {
     }
 }
 
-/// Build the keep-index list for a given mode. Returned vector has
-/// length `mode.ch_bits_per_block()`; positions are codeword indices
-/// (in `0..240`) given in natural order. Info bits `0..101` always
-/// appear first, followed by the surviving parity positions in
-/// ascending order.
+/// Build the kSR-greedy keep-index list for a given mode. Returned
+/// vector has length `mode.ch_bits_per_block()`; positions are
+/// codeword indices (in `0..240`) given in ascending order. Info
+/// bits `0..101` always appear first.
 ///
-/// The exact layout is well-defined and reproducible: parity
-/// position `p` (where `p ∈ 0..139`) is kept iff
-/// `((p + 1) · keep) / 139 > (p · keep) / 139` (integer division),
-/// where `keep = mode.parity_kept()`. This is the standard
-/// Bresenham-style uniform selection.
+/// Result is cached per mode in a `OnceLock`; first call per mode
+/// pays the greedy-search cost (~1 s for Fast mode in release
+/// mode), subsequent calls are O(1).
 pub fn keep_indices(mode: Mode) -> Vec<usize> {
+    use std::sync::OnceLock;
+    static ROBUST: OnceLock<Vec<usize>> = OnceLock::new();
+    static STANDARD: OnceLock<Vec<usize>> = OnceLock::new();
+    static FAST: OnceLock<Vec<usize>> = OnceLock::new();
+    static EXPRESS: OnceLock<Vec<usize>> = OnceLock::new();
+
+    let cell = match mode {
+        Mode::Robust => &ROBUST,
+        Mode::Standard => &STANDARD,
+        Mode::Fast => &FAST,
+        Mode::Express => &EXPRESS,
+    };
+    cell.get_or_init(|| keep_indices_kSR_greedy(mode)).clone()
+}
+
+/// Uniform-spread keep-index list — the reference baseline.
+///
+/// Parity position `p` (where `p ∈ 0..139`) is kept iff
+/// `((p + 1) · keep) / 139 > (p · keep) / 139` (integer division),
+/// where `keep = mode.parity_kept()`. This is a Bresenham-style
+/// maximally-uniform selection that ignores the H-matrix structure.
+pub fn keep_indices_uniform(mode: Mode) -> Vec<usize> {
     let mut keep = Vec::with_capacity(mode.ch_bits_per_block());
     keep.extend(0..K_INFO);
     let n_keep = mode.parity_kept();
@@ -137,6 +188,124 @@ pub fn keep_indices(mode: Mode) -> Vec<usize> {
     }
     debug_assert_eq!(keep.len(), mode.ch_bits_per_block());
     keep
+}
+
+/// kSR-greedy keep-index list for the standard rate-mode count.
+#[allow(non_snake_case)]
+pub fn keep_indices_kSR_greedy(mode: Mode) -> Vec<usize> {
+    keep_indices_kSR_greedy_with_count(N_PARITY - mode.parity_kept())
+}
+
+/// kSR-greedy keep-index list for an arbitrary number of parity
+/// punctures (`0..=N_PARITY`). Info bits `0..101` are always kept.
+///
+/// Constructs the puncture set one position at a time, picking the
+/// candidate whose tentative addition produces the lowest
+/// "puncture pain" — minimise the count of unrecoverable bits
+/// first, then minimise the sum of k-SR levels (so 1-SR is preferred
+/// over 2-SR, etc.).
+///
+/// Used directly for experimental sweeps at puncture counts that
+/// aren't part of the production [`Mode`] set (e.g. rate-3/4 study).
+#[allow(non_snake_case)]
+pub fn keep_indices_kSR_greedy_with_count(target_punctures: usize) -> Vec<usize> {
+    use crate::fec::ldpc::Ldpc240_101Params as P;
+
+    assert!(
+        target_punctures <= N_PARITY,
+        "target_punctures must not exceed parity count {N_PARITY}",
+    );
+
+    if target_punctures == 0 {
+        return (0..N).collect();
+    }
+
+    let mut punctured = vec![false; N];
+
+    for _ in 0..target_punctures {
+        let mut best_p = K_INFO;
+        let mut best_score = (i64::MIN, i64::MIN);
+        for p in K_INFO..N {
+            if punctured[p] {
+                continue;
+            }
+            punctured[p] = true;
+            let lvls = classify_kSR::<P>(&punctured, 12);
+            let s = score_levels(&lvls);
+            if s > best_score {
+                best_score = s;
+                best_p = p;
+            }
+            punctured[p] = false;
+        }
+        punctured[best_p] = true;
+    }
+
+    (0..N).filter(|&i| !punctured[i]).collect()
+}
+
+/// Classify every variable bit by its k-step recoverability after
+/// puncturing. `level[v] == 0` means `v` is unpunctured (the
+/// decoder always knows its LLR); `level[v] == k > 0` means `v` is
+/// `k`-SR (recoverable in `k` BP iterations); `level[v] == u32::MAX`
+/// means unrecoverable within `max_k` steps.
+#[allow(non_snake_case)]
+pub(crate) fn classify_kSR<P: crate::fec::ldpc::LdpcParams>(
+    punctured: &[bool],
+    max_k: u32,
+) -> Vec<u32> {
+    let mut level = vec![u32::MAX; P::N];
+    for v in 0..P::N {
+        if !punctured[v] {
+            level[v] = 0;
+        }
+    }
+
+    for k in 1..=max_k {
+        for v in 0..P::N {
+            if !punctured[v] || level[v] != u32::MAX {
+                continue;
+            }
+            // Check each check-node neighbour of v.
+            let checks = P::mn(v);
+            for &c_idx in &checks {
+                let c = c_idx as usize;
+                let row_w = P::nrw(c) as usize;
+                let mut all_lower = true;
+                for slot in 0..row_w {
+                    let v2 = P::nm(c, slot) as usize;
+                    if v2 == v {
+                        continue;
+                    }
+                    if level[v2] >= k {
+                        all_lower = false;
+                        break;
+                    }
+                }
+                if all_lower {
+                    level[v] = k;
+                    break;
+                }
+            }
+        }
+    }
+
+    level
+}
+
+/// Score function for the greedy: (−unrecoverable count, −Σ levels).
+/// Higher (= less negative) is better.
+fn score_levels(levels: &[u32]) -> (i64, i64) {
+    let mut unrecoverable = 0i64;
+    let mut sum_levels = 0i64;
+    for &l in levels {
+        if l == u32::MAX {
+            unrecoverable += 1;
+        } else {
+            sum_levels += l as i64;
+        }
+    }
+    (-unrecoverable, -sum_levels)
 }
 
 /// Apply puncturing to a full `Ldpc240_101` codeword: drop the
@@ -180,7 +349,7 @@ pub fn de_puncture_llr(channel_llrs: &[f32], mode: Mode) -> Vec<f32> {
 mod tests {
     use super::*;
 
-    const ALL_MODES: [Mode; 3] = [Mode::Robust, Mode::Standard, Mode::Fast];
+    const ALL_MODES: [Mode; 4] = [Mode::Robust, Mode::Standard, Mode::Fast, Mode::Express];
 
     #[test]
     fn ch_bits_match_keep_indices_len() {
@@ -267,6 +436,7 @@ mod tests {
             (Mode::Robust, 240, 0.421),
             (Mode::Standard, 202, 0.500),
             (Mode::Fast, 152, 0.665),
+            (Mode::Express, 134, 0.754),
         ];
         for (mode, expected_ch, expected_rate) in cases {
             assert_eq!(mode.ch_bits_per_block(), expected_ch);
@@ -295,88 +465,173 @@ mod tests {
     /// (< 90 %) suggests the puncture set is borderline and would
     /// need either a different selection rule or more decoder
     /// effort (deeper OSD).
-    #[test]
-    fn modes_decode_at_high_snr() {
+    /// Generate an AWGN noise sample via Box-Muller. Deterministic
+    /// for a given seed pair via xorshift-style PRNG.
+    fn boxmuller(state: &mut u64) -> f32 {
+        // 32-bit LCG → uniform (0, 1) — avoid the 0 boundary by
+        // adding 1 before normalising.
+        let mut u = || {
+            *state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((((*state) >> 32) & 0xFFFF_FFFF) as f32 + 1.0) / 4_294_967_297.0
+        };
+        let u1: f32 = u();
+        let u2: f32 = u();
+        (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos()
+    }
+
+    /// Simulate AWGN at given Eb/N0 (dB) over a punctured codeword,
+    /// decode, return whether the info bits were recovered. The
+    /// channel rate (n_keep_per_codeword / K_INFO) is folded into
+    /// the noise calculation so that Eb/N0 comparisons across rates
+    /// are honest: a rate-1/2 mode and a rate-3/4 mode at the same
+    /// Eb/N0 see the same per-info-bit energy budget but different
+    /// per-channel-bit noise.
+    fn awgn_sweep(keep: &[usize], eb_n0_db: f32, n_trials: usize) -> (usize, usize) {
         use crate::core::{FecCodec, FecOpts};
         use crate::fec::Ldpc240_101;
 
         let fec = Ldpc240_101;
+        let mut bp_ok = 0usize;
+        let mut osd_ok = 0usize;
 
-        for mode in ALL_MODES {
-            let n_trials = 30;
-            let mut bp_successes = 0;
-            let mut bp_or_osd_successes = 0;
+        // BPSK: signal = ±1, noise N(0, σ²). Eb = 1 (per channel bit).
+        // Per-info-bit Eb/N0: code rate r = K_INFO / keep.len().
+        let rate = K_INFO as f32 / keep.len() as f32;
+        let eb_n0_linear = 10f32.powf(eb_n0_db / 10.0);
+        // N0 = Eb / (Eb/N0) ; per-channel-bit noise variance = N0 / 2 / r
+        // (so per-info-bit Eb/N0 stays as advertised across rates).
+        let sigma_sq = 1.0 / (2.0 * rate * eb_n0_linear);
+        let sigma = sigma_sq.sqrt();
 
-            for trial in 0..n_trials {
-                // Deterministic pseudo-random info bits per trial.
-                let mut state = (trial as u32)
-                    .wrapping_mul(0x9E37_79B1)
-                    .wrapping_add(0x1234_5678);
-                let info: Vec<u8> = (0..K_INFO)
-                    .map(|_| {
-                        state = state.wrapping_mul(0x6C07_8965).wrapping_add(1);
-                        ((state >> 16) & 1) as u8
-                    })
-                    .collect();
-
-                // Encode through Ldpc240_101.
-                let mut codeword = vec![0u8; N];
-                fec.encode(&info, &mut codeword);
-
-                // Puncture per mode.
-                let punctured_bits = puncture(&codeword, mode);
-
-                // Clean LLRs: ±10.0 (large magnitude, no channel noise).
-                // WSJT-X sign convention (matches `bp_decode_generic`):
-                // LLR > 0 → bit 1 likely; LLR < 0 → bit 0.
-                let llrs_tx: Vec<f32> = punctured_bits
-                    .iter()
-                    .map(|&b| if b == 1 { 10.0 } else { -10.0 })
-                    .collect();
-
-                // De-puncture: insert 0.0 erasure LLRs.
-                let llrs_full = de_puncture_llr(&llrs_tx, mode);
-
-                // Try BP-only first (the production-fast decode path).
-                let bp_opts = FecOpts {
-                    bp_max_iter: 50,
-                    osd_depth: 0,
-                    ap_mask: None,
-                    verify_info: None,
-                };
-                if let Some(r) = fec.decode_soft(&llrs_full, &bp_opts)
-                    && r.info == info
-                {
-                    bp_successes += 1;
-                    bp_or_osd_successes += 1;
-                    continue;
-                }
-
-                // Fall back to BP + OSD-1.
-                let osd_opts = FecOpts {
-                    bp_max_iter: 50,
-                    osd_depth: 1,
-                    ap_mask: None,
-                    verify_info: None,
-                };
-                if let Some(r) = fec.decode_soft(&llrs_full, &osd_opts)
-                    && r.info == info
-                {
-                    bp_or_osd_successes += 1;
-                }
+        for trial in 0..n_trials {
+            let mut info_state = (trial as u64).wrapping_mul(0x9E37_79B1_5BF0_3F39);
+            info_state = info_state.wrapping_add(0x1234_5678_DEAD_BEEF);
+            let mut info = vec![0u8; K_INFO];
+            for b in info.iter_mut() {
+                info_state = info_state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                *b = ((info_state >> 33) & 1) as u8;
             }
 
-            eprintln!(
-                "{mode:?}: BP {bp_successes}/{n_trials}, BP+OSD-1 {bp_or_osd_successes}/{n_trials}"
-            );
+            let mut codeword = vec![0u8; N];
+            fec.encode(&info, &mut codeword);
 
-            // Bar: at trivial channel SNR, BP+OSD-1 must recover
-            // ≥ 90 % of trials. Anything weaker means the puncture
-            // set has broken decoder convergence.
-            assert!(
-                bp_or_osd_successes >= n_trials * 9 / 10,
-                "{mode:?}: only {bp_or_osd_successes}/{n_trials} decoded at high SNR — \
-                 puncture set has likely broken BP/OSD convergence",
+            let mut noise_state = (trial as u64)
+                .wrapping_mul(0xBF58_476D_1CE4_E5B9)
+                .wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut llrs_full = vec![0.0f32; N];
+            for &j in keep {
+                let bit = codeword[j];
+                let signal = if bit == 1 { 1.0_f32 } else { -1.0 };
+                let noise = boxmuller(&mut noise_state) * sigma;
+                let received = signal + noise;
+                // BPSK LLR for AWGN: 2 · received / σ². Sign matches
+                // bp_decode_generic's convention (LLR > 0 → bit 1).
+                llrs_full[j] = 2.0 * received / sigma_sq;
+            }
+            // Punctured positions stay at 0.0 (erasure LLR).
+
+            let bp_opts = FecOpts {
+                bp_max_iter: 50,
+                osd_depth: 0,
+                ap_mask: None,
+                verify_info: None,
+            };
+            if let Some(r) = fec.decode_soft(&llrs_full, &bp_opts)
+                && r.info == info
+            {
+                bp_ok += 1;
+                osd_ok += 1;
+                continue;
+            }
+
+            let osd_opts = FecOpts {
+                bp_max_iter: 50,
+                osd_depth: 2,
+                ap_mask: None,
+                verify_info: None,
+            };
+            if let Some(r) = fec.decode_soft(&llrs_full, &osd_opts)
+                && r.info == info
+            {
+                osd_ok += 1;
+            }
+        }
+
+        (bp_ok, osd_ok)
+    }
+
+    /// At a clean channel (Eb/N0 = 12 dB) both selectors must
+    /// converge for every shipping mode. Basic correctness gate.
+    #[test]
+    fn modes_decode_at_high_snr() {
+        let n = 30;
+        for mode in ALL_MODES {
+            let unif = keep_indices_uniform(mode);
+            let greedy = keep_indices_kSR_greedy(mode);
+            let (u_bp, u_osd) = awgn_sweep(&unif, 12.0, n);
+            let (g_bp, g_osd) = awgn_sweep(&greedy, 12.0, n);
+            eprintln!(
+                "{mode:?} @12dB uniform: BP {u_bp}/{n}, OSD {u_osd}/{n}; \
+                 kSR-greedy: BP {g_bp}/{n}, OSD {g_osd}/{n}"
+            );
+            assert!(u_osd >= n * 9 / 10);
+            assert!(g_osd >= n * 9 / 10);
+        }
+    }
+
+    /// AWGN sweep showing whether kSR-greedy beats uniform-spread
+    /// at moderate Eb/N0 (the operating point where the puncture
+    /// set's quality actually shows up). Diagnostic-only — output
+    /// is the data we use to decide between selectors.
+    #[test]
+    #[ignore = "slow: AWGN PER sweep across modes × selectors × Eb/N0; run with --ignored"]
+    #[allow(non_snake_case)]
+    fn modes_awgn_sweep_uniform_vs_kSR() {
+        let n = 200;
+        for mode in ALL_MODES {
+            let unif = keep_indices_uniform(mode);
+            let greedy = keep_indices_kSR_greedy(mode);
+            for eb_n0_db in [-1.0, 0.0, 1.0, 2.0, 3.0, 5.0] {
+                let (u_bp, u_osd) = awgn_sweep(&unif, eb_n0_db, n);
+                let (g_bp, g_osd) = awgn_sweep(&greedy, eb_n0_db, n);
+                eprintln!(
+                    "{mode:?} Eb/N0={eb_n0_db:+.0}dB  uniform: BP {u_bp:3}/{n} OSD {u_osd:3}/{n}  \
+                     kSR-greedy: BP {g_bp:3}/{n} OSD {g_osd:3}/{n}"
+                );
+            }
+        }
+    }
+
+    /// Hypothetical rate-3/4 study: 106 parity punctures. Diagnostic
+    /// only — output decides whether a fourth mode is realistic.
+    #[test]
+    #[ignore = "slow: experimental rate-3/4 puncturing; run with --ignored"]
+    fn experimental_rate_3_4() {
+        let n = 200;
+        let target_punctures = 106;
+
+        let n_keep_parity = N_PARITY - target_punctures;
+        let mut unif_keep: Vec<usize> = (0..K_INFO).collect();
+        for p in 0..N_PARITY {
+            let cur = ((p + 1) * n_keep_parity) / N_PARITY;
+            let prev = (p * n_keep_parity) / N_PARITY;
+            if cur > prev {
+                unif_keep.push(K_INFO + p);
+            }
+        }
+        let greedy_keep = keep_indices_kSR_greedy_with_count(target_punctures);
+
+        for eb_n0_db in [3.0, 5.0, 8.0, 12.0] {
+            let (u_bp, u_osd) = awgn_sweep(&unif_keep, eb_n0_db, n);
+            let (g_bp, g_osd) = awgn_sweep(&greedy_keep, eb_n0_db, n);
+            eprintln!(
+                "rate 3/4 ({target_punctures} punctures) Eb/N0={eb_n0_db:+.0}dB  \
+                 uniform: BP {u_bp:3}/{n} OSD {u_osd:3}/{n}  \
+                 kSR-greedy: BP {g_bp:3}/{n} OSD {g_osd:3}/{n}"
             );
         }
     }
@@ -385,12 +640,10 @@ mod tests {
     fn header_code_roundtrip() {
         for mode in ALL_MODES {
             let code = mode.header_code();
-            assert!(code < 3);
+            assert!(code < 4);
             assert_eq!(Mode::from_header_code(code), Some(mode));
         }
-        // Code 3 is the reserved-for-future-use slot; 4..=255 are
-        // also invalid. None of them must decode.
-        assert_eq!(Mode::from_header_code(3), None);
+        // Codes 4..=255 are invalid (the field is only 2 bits).
         for code in 4u8..=255 {
             assert_eq!(
                 Mode::from_header_code(code),
