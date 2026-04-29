@@ -1,5 +1,74 @@
 # Changelog
 
+## 0.3.3 — 2026-04-29
+
+Multi-channel SSB receive + slotted-ALOHA TX primitives for
+uvpacket. The 0.3.2 single-station SSB experience generalises
+to a private group sharing one RF channel (e.g., 430.090 MHz
+USB) where each TX picks a random free audio slot via LBT.
+
+WSJT-family modes and the existing single-channel uvpacket API
+are unchanged.
+
+### Added
+
+- `mfsk-core::uvpacket::rx::decode_multichannel(audio,
+  &mc_opts, &fec_opts) -> Vec<(f32, DecodedFrame)>` — coarse-
+  grid frequency sweep across the configured SSB passband,
+  per-grid-point matched filter + preamble peak detection,
+  frequency-axis NMS to drop adjacent-grid duplicates, and
+  per-peak `(mode × n_blocks)` decode. Returns the detected
+  audio centre alongside each decoded frame.
+- `MultiChannelOpts { band_lo_hz, band_hi_hz, coarse_step_hz,
+  nms_radius_hz, peak_rel_threshold }` with sensible defaults
+  (300–2700 Hz / 25 Hz / 600 Hz / 0.5).
+- `mfsk-core::uvpacket::rx::measure_slot_energies(audio,
+  &mc_opts, slot_spacing_hz) -> Vec<SlotEnergy>` — per-slot
+  mean matched-filter magnitude survey for the LBT step before
+  a slotted-ALOHA TX. Policy-free: the helper just reports
+  energies, the caller picks free-vs-busy by their own rule.
+- `SlotEnergy { audio_centre_hz, mean_mf_magnitude }`.
+
+### Operating concept
+
+A private group shares one RF SSB channel. Inside the audio
+passband the modem recognises a 1200 Hz slot grid (typically
+800 Hz and 2000 Hz centres in 2.4 kHz SSB). Each TX:
+
+1. Listens — captures a short audio buffer, runs
+   `measure_slot_energies` to survey occupancy.
+2. Picks a random free slot — uniform-random from the slots
+   below an application-chosen energy threshold.
+3. Transmits — `tx::encode(&header, &payload, picked_centre)`.
+
+This is **slotted ALOHA on the audio-frequency axis**, plus
+LBT. CSMA/CD proper isn't applicable to half-duplex SSB radio;
+slotted ALOHA + LBT + ARQ at the application layer behaves
+equivalently with much less mechanism, and lines up with the
+natural amateur-radio "watch the frequency, find a clear spot,
+transmit" practice.
+
+mfsk-core supplies the primitives only; the application layer
+owns the RNG, the ARQ ACK + retry state machine, and any
+voice-mode coexistence policy.
+
+### Cost
+
+`decode_multichannel`: ~1 matched-filter pass per coarse-grid
+step. With default settings (300–2700 Hz, 25 Hz step) ≈ 96
+passes ≈ 70 ms in release per second of audio.
+`measure_slot_energies`: 1 MF pass per slot, ~1 ms each at 1
+sec audio. Effectively free.
+
+### Empirical
+
+- 2 simultaneous frames at 800 Hz / 2000 Hz centres in clean
+  audio: both decoded with detected centres within ±50 Hz of
+  truth.
+- Same setup at +8 dB Eb/N0_info AWGN: both decoded.
+- Slot survey with one busy slot at 800 Hz: busy slot's mean
+  MF magnitude is > 5× the free slot's.
+
 ## 0.3.2 — 2026-04-29
 
 Focused single-feature release on top of 0.3.1: **AFC (automatic

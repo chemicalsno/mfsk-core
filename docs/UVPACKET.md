@@ -351,41 +351,73 @@ correct Δf.
 NFM users can keep using `decode_known_layout` (AFC is pure
 overhead on a static-VFO channel).
 
-### 3.6 Multi-channel SSB headroom (0.3.3 candidate)
+### 3.6 Multi-channel SSB + slotted-ALOHA TX (0.3.3)
 
 A single uvpacket signal occupies `R_s · (1+α) = 1200 · 1.5 =
 1800 Hz` end-to-end (RRC roll-off included; the −3 dB main
-lobe is ~600 Hz). Practical adjacent-channel separation for
-< −20 dB inter-channel interference is ~1.2 kHz: at that
-spacing one signal's spectrum lands within the next signal's
-roll-off zero.
+lobe is ~600 Hz). Practical adjacent-slot separation for
+< −20 dB inter-slot interference is **1200 Hz**: at that
+spacing one signal's spectrum lands within the next slot's
+RRC roll-off zero. In a 2.4 kHz SSB passband that's room for
+**two** simultaneous uvpacket frames (typically at 800 Hz
+and 2000 Hz audio centres).
 
-In a 2.4 kHz SSB passband that's room for **two** simultaneous
-uvpacket frames at different audio centres (e.g., 800 Hz and
-2000 Hz). In a 2.7–3 kHz SSB passband, two with margin.
+`mfsk-core::uvpacket::rx` ships two stateless primitives in
+0.3.3:
 
-The 0.3.2 AFC `decode_known_layout_with_afc` is the building
-block: it's exactly a frequency-axis preamble-correlation peak
-search, just narrowed to one peak in the configured ±search_hz
-window. Extending it to **return all local peaks** above a
-threshold across an arbitrary search window is the natural
-0.3.3 deliverable (`decode_multichannel(audio, band_lo_hz,
-band_hi_hz, &afc_opts, &fec_opts) -> Vec<DecodedFrame>`):
+```rust
+// RX: decode every frame in the passband, return each frame's
+// detected audio centre.
+pub fn decode_multichannel(
+    audio: &[f32],
+    mc_opts: &MultiChannelOpts,
+    fec_opts: &FecOpts,
+) -> Vec<(f32, DecodedFrame)>;
 
-- RX side: iterate the AFC's frequency-grid magnitudes across
-  the full SSB passband, pick local maxima ≥ a confidence
-  threshold, dispatch each to `decode_known_layout_with_afc`
-  at its detected centre.
-- TX side: an LBT (listen-before-talk) primitive — scan the
-  passband, find the lowest-energy 1.2 kHz slot, transmit there.
-  Equivalent to **CSMA/CA** in the audio-frequency dimension
-  rather than the usual time dimension. Multi-station private-
-  group messaging on a single SSB channel.
+// TX-side LBT: per-slot mean MF magnitude survey.
+pub fn measure_slot_energies(
+    audio: &[f32],
+    mc_opts: &MultiChannelOpts,
+    slot_spacing_hz: f32,
+) -> Vec<SlotEnergy>;
+```
 
-CSMA/CD proper isn't applicable to half-duplex SSB radio
-(can't reliably listen while transmitting), but CSMA/CA with
-short uvpacket bursts (~270 ms Express, ~440 ms Robust)
-collides rarely if stations re-scan between TX attempts.
+`decode_multichannel` runs a coarse-grid frequency scan
+(default 25 Hz step over 300–2700 Hz), takes per-grid-point
+preamble correlation peaks, applies frequency-axis NMS at
+`nms_radius_hz` (default 600 Hz, half slot spacing), and
+decodes each survivor at its picked centre via the existing
+`decode_known_layout_with_opts` (no inner AFC needed — the
+LMS phase fit absorbs the ≤ 12.5 Hz coarse-grid residual).
+
+`measure_slot_energies` reports the mean matched-filter
+|output|² at each `slot_spacing_hz`-spaced slot centre.
+Policy-free — callers filter by their own threshold (typical:
+≤ 3 dB above band median = "free") and pick uniformly at
+random among free slots for TX.
+
+The TX side keeps the existing
+`tx::encode(&header, &payload, audio_centre_hz)`. Operating
+concept: each TX picks a random free slot via LBT, transmits
+there, waits for an application-layer ARQ ACK. Collisions
+retry with a fresh random pick — **slotted ALOHA on the
+audio-frequency axis**.
+
+This formalises the natural amateur-radio "watch the
+frequency, find a clear spot, transmit" practice. CSMA/**CD**
+proper isn't applicable to half-duplex SSB radio (can't
+reliably listen while keying the transmitter); slotted ALOHA
++ LBT + ARQ at the application layer behaves equivalently
+with much less mechanism.
+
+mfsk-core ships no RNG dependency and no state machine — the
+application supplies randomness (`rand::Rng`, browser
+`crypto.getRandomValues`, …) and owns the ARQ + retry policy.
+
+Empirical: two simultaneous frames at 800/2000 Hz centres
+decode cleanly with detected centres within ±50 Hz of truth;
+same setup at +8 dB Eb/N0_info AWGN: both decoded; slot
+survey with one busy slot: busy mag > 5× free mag.
 
 ## 4. Modem implementation loss
 
