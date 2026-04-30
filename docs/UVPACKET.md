@@ -5,8 +5,8 @@
 `uvpacket` is an in-tree **applied example** of how `mfsk-core`'s
 FEC infrastructure (`Ldpc240_101`, belief propagation, OSD-2/3)
 can be reused outside the WSJT-X family. It targets NFM voice
-channels (HT/mobile, ~3 kHz audio passband) and — with the
-0.3.2 AFC — SSB carriers as well.
+channels (HT/mobile, ~3 kHz audio passband) and — via the
+AFC entry point — SSB carriers as well.
 
 This document covers the modem itself. Application semantics
 (signed QSL exchange, position beacons, short text) are
@@ -35,11 +35,31 @@ they exist only to satisfy the trait signature and the
 and [`docs/LIBRARY.md`](LIBRARY.md) §10.1 as a scope-boundary
 trade-off rather than disguised.
 
-The crate ships **only the modem**: `tx::encode(header, payload,
-audio_centre_hz) -> Vec<f32>` and `rx::decode_known_layout` /
-`decode_known_layout_with_opts` / `decode_known_layout_with_afc`.
-Frame composition, application-level dispatch, key management
-etc. are the embedder's job.
+The crate ships **only the modem**:
+
+- `tx::encode(header, payload, audio_centre_hz) -> Result<Vec<f32>, PackError>`
+  — the convenience wrapper that allocates the output buffer.
+- `tx::encode_into(out, header, payload, audio_centre_hz) -> Result<(), PackError>`
+  + `tx::encode_output_len(mode, n_payload_blocks)` — caller-buffer
+  TX (added in 0.4.1 alongside the embedded port) for I2S DMA-style
+  use without per-burst `Vec` allocations.
+- `rx::decode_known_layout(audio, sample_offset, audio_centre_hz, mode, &fec_opts)`
+  — the basic decode entry; pass `default_fec_opts()` for OSD-2 /
+  bp_max_iter = 50, or build a custom `FecOpts` for OSD-3 and
+  caller-side AP masking.
+- `rx::decode_known_layout_with_afc(.., &afc_opts)` — same but
+  prepends an AFC sweep over `±afc_opts.search_hz` (default ±200 Hz).
+- `rx::decode(audio, audio_centre_hz) -> Vec<DecodedFrame>` —
+  auto-detect entry: scans the passband, identifies sync peaks for
+  any of the four preamble variants, and decodes each at the mode
+  the winning preamble selected.
+- `rx::decode_multichannel(audio, &mc_opts, &fec_opts)` and
+  `rx::measure_slot_energies(audio, &mc_opts, slot_spacing_hz)` —
+  multi-channel passband scan + per-slot energy survey for LBT
+  (see §3.10).
+
+Frame composition, application-level dispatch, key management etc.
+are the embedder's job.
 
 ### 1.2 What this is not
 
@@ -404,11 +424,11 @@ goes away and the modem operates at its true ~−3.7 dB SNR_3kHz
 UltraRobust threshold — a useful weak-signal data envelope,
 especially on HF.
 
-**AFC ships in 0.3.2.** Use
+**AFC entry point.** Use
 [`decode_known_layout_with_afc(audio, .., &AfcOpts)`](https://docs.rs/mfsk-core/latest/mfsk_core/uvpacket/rx/fn.decode_known_layout_with_afc.html)
-for SSB use; the default `decode_known_layout` continues to
-assume `audio_centre_hz` is exact (right for NFM where TX/RX
-share the same audio centre).
+for SSB use; the default `decode_known_layout` assumes
+`audio_centre_hz` is exact (right for NFM where TX/RX share the
+same audio centre).
 
 The AFC algorithm sweeps `audio_centre_hz + Δf_test` in 25 Hz
 steps across `[−search_hz, +search_hz]` (default ±200 Hz),
@@ -430,7 +450,7 @@ correct Δf.
 NFM users can keep using `decode_known_layout` (AFC is pure
 overhead on a static-VFO channel).
 
-### 3.10 Multi-channel SSB + slotted-ALOHA TX (0.3.3)
+### 3.10 Multi-channel SSB + slotted-ALOHA TX
 
 A single uvpacket signal occupies `R_s · (1+α) = 1200 · 1.5 =
 1800 Hz` end-to-end (RRC roll-off included; the −3 dB main
@@ -441,8 +461,7 @@ RRC roll-off zero. In a 2.4 kHz SSB passband that's room for
 **two** simultaneous uvpacket frames (typically at 800 Hz
 and 2000 Hz audio centres).
 
-`mfsk-core::uvpacket::rx` ships two stateless primitives in
-0.3.3:
+`mfsk-core::uvpacket::rx` ships two stateless primitives:
 
 ```rust
 // RX: decode every frame in the passband, return each frame's
@@ -465,9 +484,9 @@ pub fn measure_slot_energies(
 (default 25 Hz step over 300–2700 Hz), takes per-grid-point
 preamble correlation peaks, applies frequency-axis NMS at
 `nms_radius_hz` (default 600 Hz, half slot spacing), and
-decodes each survivor at its picked centre via the existing
-`decode_known_layout_with_opts` (no inner AFC needed — the
-LMS phase fit absorbs the ≤ 12.5 Hz coarse-grid residual).
+decodes each survivor at its picked centre via
+`decode_known_layout` (no inner AFC needed — the LMS phase
+fit absorbs the ≤ 12.5 Hz coarse-grid residual).
 
 `measure_slot_energies` reports the mean matched-filter
 |output|² at each `slot_spacing_hz`-spaced slot centre.
@@ -527,9 +546,10 @@ The current rx implements:
   insertion in the payload; no carrier-phase tracker.
 - **σ-aware LLR scaling** from a magnitude-based σ²_n estimator on
   the differential samples.
-- **OSD-2** by default; `decode_known_layout_with_opts` accepts
-  `&FecOpts` for callers who want OSD-3 (~30 × slower per decode,
-  ~10–15 % better PER near threshold for the higher-rate modes).
+- **OSD-2** by default (via `default_fec_opts()`);
+  `decode_known_layout` takes `&FecOpts` for callers who want OSD-3
+  (~30 × slower per decode, ~10–15 % better PER near threshold for
+  the higher-rate modes) or caller-side AP masking.
 - **Dedicated header LDPC block** (Ldpc240_101 unpunctured) so
   header recovery is independent of payload puncturing depth.
 
