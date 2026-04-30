@@ -17,6 +17,16 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
 
+# Cancel in-flight runs on the same ref when a new commit arrives
+# (typical case: a PR force-push or a fast-follow `--amend`). The
+# group key uses `head_ref` for `pull_request` events (the source
+# branch) and falls back to `ref` for `push` events on `main`. This
+# does NOT dedupe the PR-vs-post-merge pair (different refs), but it
+# does prevent run pile-ups on rapid PR iterations.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   # ───────────────────────────────────────────────────────────────
   # Formatting + clippy lint gate. Fast fail so the heavier matrix

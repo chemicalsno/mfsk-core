@@ -24,12 +24,21 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      # Re-run the core test suite — CI already ran on the tagged
-      # commit's push, but a tag push can arrive separately (e.g.
-      # created from the web UI). Cheap insurance against shipping
-      # broken code.
-      - name: Verify tests pass (including slow sweeps)
-        run: cargo test -p mfsk-core --features full --release -- --include-ignored
+      # Tag must be reachable from main. ci.yml has already validated
+      # every commit that landed on main (PRs gated by main
+      # protection); refusing to publish a tag that points outside
+      # main is enough to catch the "tagged a feature branch by
+      # mistake" scenario without re-running the full test suite (the
+      # 0.4.1 release added the embedded port and the slow-sweep
+      # re-run there cost ~3 min per release for zero new signal).
+      - name: Verify tag is reachable from main
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=200 origin main
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" origin/main; then
+            echo "::error::Tag commit ${GITHUB_SHA} is not an ancestor of origin/main; refusing to publish"
+            exit 1
+          fi
 
       # The tag version must match Cargo.toml's version field. Fail
       # fast if someone tags `v0.2.0` while Cargo.toml still says
