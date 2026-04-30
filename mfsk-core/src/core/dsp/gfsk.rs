@@ -50,19 +50,45 @@ fn erf(x: f32) -> f32 {
     sign * (1.0 - poly * (-x * x).exp())
 }
 
-/// Synthesise a PCM waveform from an FSK tone sequence.
+/// Output sample count for [`synth_f32`] / [`synth_f32_into`] given a
+/// tone-sequence length and the per-symbol sample count.
+#[inline]
+pub const fn synth_output_len(nsym: usize, samples_per_symbol: usize) -> usize {
+    nsym * samples_per_symbol
+}
+
+/// Synthesise a PCM waveform from an FSK tone sequence into a caller-
+/// provided output buffer. **No allocation** — `out` must already be
+/// sized to [`synth_output_len`]`(tones.len(), cfg.samples_per_symbol)`.
+/// Two `Vec`s are still allocated internally for the Gaussian pulse
+/// table and the per-sample phase-rate buffer; the [`synth_f32`]
+/// wrapper additionally allocates the output. Embedded callers driving
+/// I2S DMA buffers should prefer this entry point.
 ///
 /// - `tones[j]` is the integer tone index for symbol `j` (0..NTONES).
 /// - `f0_hz` is the carrier (tone-0) frequency.
-/// - `amplitude` is the peak of the returned f32 signal (typically 1.0).
+/// - `amplitude` is the peak of the f32 signal written to `out`
+///   (typically 1.0).
 ///
-/// Output length is `tones.len() · cfg.samples_per_symbol`. The pipeline is:
-/// build a per-sample phase-rate array `dphi` via a 3-symbol Gaussian pulse
-/// shape, add the carrier offset, integrate → phase, take `sin`. Finally, a
-/// half-cosine envelope of length `cfg.ramp_samples` smooths both ends.
-pub fn synth_f32(tones: &[u8], f0_hz: f32, amplitude: f32, cfg: &GfskCfg) -> Vec<f32> {
+/// Pipeline: build a per-sample phase-rate array `dphi` via a 3-symbol
+/// Gaussian pulse shape, add the carrier offset, integrate → phase,
+/// take `sin`. Finally, a half-cosine envelope of length
+/// `cfg.ramp_samples` smooths both ends.
+///
+/// # Panics
+///
+/// Panics if `out.len() != synth_output_len(tones.len(),
+/// cfg.samples_per_symbol)` or if `tones` is empty.
+pub fn synth_f32_into(out: &mut [f32], tones: &[u8], f0_hz: f32, amplitude: f32, cfg: &GfskCfg) {
     let nsps = cfg.samples_per_symbol;
     let nsym = tones.len();
+    assert!(nsym > 0, "synth_f32_into: empty tone sequence");
+    let nwave = synth_output_len(nsym, nsps);
+    assert_eq!(
+        out.len(),
+        nwave,
+        "synth_f32_into: out.len() must equal synth_output_len()"
+    );
     let twopi = 2.0 * PI;
     let dt = 1.0 / cfg.sample_rate;
 
@@ -103,11 +129,9 @@ pub fn synth_f32(tones: &[u8], f0_hz: f32, amplitude: f32, cfg: &GfskCfg) -> Vec
         *d += twopi * f0_hz * dt;
     }
 
-    let nwave = nsym * nsps;
-    let mut wave = vec![0.0f32; nwave];
     let mut phi = 0.0f32;
     for k in 0..nwave {
-        wave[k] = amplitude * phi.sin();
+        out[k] = amplitude * phi.sin();
         phi += dphi[nsps + k];
         if phi > twopi {
             phi -= twopi;
@@ -119,23 +143,95 @@ pub fn synth_f32(tones: &[u8], f0_hz: f32, amplitude: f32, cfg: &GfskCfg) -> Vec
     if nramp > 0 {
         for i in 0..nramp {
             let env = (1.0 - (twopi * i as f32 / (2.0 * nramp as f32)).cos()) / 2.0;
-            wave[i] *= env;
+            out[i] *= env;
         }
         let k1 = nwave - nramp;
         for i in 0..nramp {
             let env = (1.0 + (twopi * i as f32 / (2.0 * nramp as f32)).cos()) / 2.0;
-            wave[k1 + i] *= env;
+            out[k1 + i] *= env;
         }
     }
+}
 
-    wave
+/// Synthesise a PCM waveform from an FSK tone sequence.
+///
+/// Vec-returning convenience wrapper for [`synth_f32_into`]. Allocates
+/// the output, then forwards.
+#[inline]
+pub fn synth_f32(tones: &[u8], f0_hz: f32, amplitude: f32, cfg: &GfskCfg) -> Vec<f32> {
+    let nwave = synth_output_len(tones.len(), cfg.samples_per_symbol);
+    let mut out = vec![0.0f32; nwave];
+    synth_f32_into(&mut out, tones, f0_hz, amplitude, cfg);
+    out
+}
+
+/// i16 variant of [`synth_f32_into`]. The peak value of the PCM written
+/// to `out` equals `amplitude_i16`.
+pub fn synth_i16_into(
+    out: &mut [i16],
+    tones: &[u8],
+    f0_hz: f32,
+    amplitude_i16: i16,
+    cfg: &GfskCfg,
+) {
+    let nsps = cfg.samples_per_symbol;
+    let nwave = synth_output_len(tones.len(), nsps);
+    assert_eq!(
+        out.len(),
+        nwave,
+        "synth_i16_into: out.len() must equal synth_output_len()"
+    );
+    let mut tmp = vec![0.0f32; nwave];
+    synth_f32_into(&mut tmp, tones, f0_hz, 1.0, cfg);
+    let scale = amplitude_i16 as f32;
+    for (dst, &src) in out.iter_mut().zip(tmp.iter()) {
+        *dst = (src * scale) as i16;
+    }
 }
 
 /// i16 variant: peak value of the returned PCM equals `amplitude_i16`.
 #[inline]
 pub fn synth_i16(tones: &[u8], f0_hz: f32, amplitude_i16: i16, cfg: &GfskCfg) -> Vec<i16> {
-    synth_f32(tones, f0_hz, 1.0, cfg)
-        .iter()
-        .map(|&s| (s * amplitude_i16 as f32) as i16)
-        .collect()
+    let nwave = synth_output_len(tones.len(), cfg.samples_per_symbol);
+    let mut out = vec![0i16; nwave];
+    synth_i16_into(&mut out, tones, f0_hz, amplitude_i16, cfg);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ft8_cfg() -> GfskCfg {
+        GfskCfg {
+            sample_rate: 12_000.0,
+            samples_per_symbol: 1920,
+            bt: 2.0,
+            hmod: 1.0,
+            ramp_samples: 240,
+        }
+    }
+
+    #[test]
+    fn synth_into_matches_vec_returning_variant() {
+        // The caller-buffer API must be byte-identical to the
+        // Vec-returning convenience wrapper.
+        let cfg = ft8_cfg();
+        let tones: [u8; 8] = [0, 1, 7, 3, 4, 5, 6, 2];
+        let f0 = 1500.0;
+        let amp = 0.7;
+        let from_vec = synth_f32(&tones, f0, amp, &cfg);
+        let mut into_buf = vec![0.0f32; synth_output_len(tones.len(), cfg.samples_per_symbol)];
+        synth_f32_into(&mut into_buf, &tones, f0, amp, &cfg);
+        assert_eq!(from_vec, into_buf);
+    }
+
+    #[test]
+    #[should_panic(expected = "out.len()")]
+    fn synth_into_panics_on_wrong_buffer_size() {
+        let cfg = ft8_cfg();
+        let tones: [u8; 4] = [0, 1, 2, 3];
+        let mut buf = vec![0.0f32; 100]; // wrong size
+        synth_f32_into(&mut buf, &tones, 1500.0, 1.0, &cfg);
+    }
 }

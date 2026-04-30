@@ -20,30 +20,54 @@ use crate::core::ModulationParams;
 
 use super::Wspr;
 
-/// Synthesize a WSPR transmission as mono `f32` audio samples.
+/// Output sample count for [`synthesize_audio`] /
+/// [`synthesize_audio_into`] at the given sample rate. Embedded callers
+/// allocate (or claim from a pool) `synthesize_audio_len(sample_rate)`
+/// samples and pass them as `out`.
+#[inline]
+pub fn synthesize_audio_len(sample_rate: u32) -> usize {
+    let nsps = (sample_rate as f32 * <Wspr as ModulationParams>::SYMBOL_DT).round() as usize;
+    nsps * 162
+}
+
+/// Synthesize a WSPR transmission into a caller-provided `f32` buffer.
+/// **No allocation** — `out` must be sized to
+/// [`synthesize_audio_len`]`(sample_rate)`.
 ///
 /// `symbols` must be 162 values in `0..=3`. `base_freq_hz` is the
 /// frequency of tone 0; the remaining tones sit at
 /// `base_freq_hz + tone * WSPR::TONE_SPACING_HZ`. Phase is continuous
 /// across symbol boundaries so the receiver's FFT window can land on
 /// any 683 ms stretch without picking up transient spectral spread.
-pub fn synthesize_audio(
+///
+/// # Panics
+///
+/// Panics if `out.len() != synthesize_audio_len(sample_rate)` or if any
+/// symbol is `>= 4`.
+pub fn synthesize_audio_into(
+    out: &mut [f32],
     symbols: &[u8; 162],
     sample_rate: u32,
     base_freq_hz: f32,
     amplitude: f32,
-) -> Vec<f32> {
+) {
     // NSPS scales by the sample rate — the trait constant is for 12 kHz.
     let nsps = (sample_rate as f32 * <Wspr as ModulationParams>::SYMBOL_DT).round() as usize;
+    assert_eq!(
+        out.len(),
+        nsps * 162,
+        "synthesize_audio_into: out.len() must equal synthesize_audio_len()"
+    );
     let tone_spacing = <Wspr as ModulationParams>::TONE_SPACING_HZ;
-    let mut out = Vec::with_capacity(nsps * 162);
     let mut phase = 0.0f32;
+    let mut idx = 0usize;
     for &sym in symbols {
         assert!(sym < 4, "WSPR channel symbol must be in 0..=3");
         let freq = base_freq_hz + sym as f32 * tone_spacing;
         let dphi = TAU * freq / sample_rate as f32;
         for _ in 0..nsps {
-            out.push(amplitude * phase.cos());
+            out[idx] = amplitude * phase.cos();
+            idx += 1;
             phase += dphi;
             if phase > TAU {
                 phase -= TAU;
@@ -52,6 +76,19 @@ pub fn synthesize_audio(
             }
         }
     }
+}
+
+/// Synthesize a WSPR transmission as mono `f32` audio samples.
+/// Vec-returning convenience wrapper for [`synthesize_audio_into`].
+#[inline]
+pub fn synthesize_audio(
+    symbols: &[u8; 162],
+    sample_rate: u32,
+    base_freq_hz: f32,
+    amplitude: f32,
+) -> Vec<f32> {
+    let mut out = alloc::vec![0.0f32; synthesize_audio_len(sample_rate)];
+    synthesize_audio_into(&mut out, symbols, sample_rate, base_freq_hz, amplitude);
     out
 }
 
