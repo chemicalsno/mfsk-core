@@ -61,13 +61,15 @@ etc. are the embedder's job.
 A factual peer comparison for U/VHF private-group messaging at
 ~1 kbps in a 3 kHz audio passband:
 
-| | Channel | FEC | Net bps | 50 % PER threshold | Open source |
+| | Channel | FEC | Net bps | 90 % PER threshold (AWGN) | Open source |
 |---|---|---|---:|---:|:-:|
 | AX.25 / AFSK 1200 | NFM | none | 1200 | +10 dB SNR_3kHz | ✓ |
 | PSK31 | SSB | none | ~50 | −10 dB SNR_2.5kHz | ✓ |
 | Olivia 4/250 | SSB | conv + interleave | ~50 | −13 dB SNR_500Hz | ✓ |
-| **uvpacket Robust** | **NFM or SSB** | **LDPC + OSD** | **1008** | **−3.7 dB SNR_3kHz** | ✓ |
-| uvpacket Express | NFM or SSB | LDPC + OSD | 1800 | ~ −1 dB SNR_3kHz | ✓ |
+| **uvpacket UltraRobust** | **NFM or SSB** | **LDPC + OSD, half-baud** | **504** | **−3.7 dB SNR_3kHz** | ✓ |
+| uvpacket Robust | NFM or SSB | LDPC + OSD | 1008 | +1.3 dB SNR_3kHz | ✓ |
+| uvpacket Standard | NFM or SSB | LDPC + OSD | 1200 | +4.0 dB SNR_3kHz | ✓ |
+| uvpacket Express | NFM or SSB | LDPC + OSD | 1800 | +7.8 dB SNR_3kHz | ✓ |
 | M17 4-FSK | 9 kHz | conv | 4800 | +5–7 dB SNR | ✓ |
 | VARA FM | 12.5 kHz | proprietary | ~25000 | +10 dB SNR | ✗ |
 | VARA HF | 2.4 kHz SSB | proprietary | 5000–25000 | varies | ✗ |
@@ -133,36 +135,39 @@ application layer is whatever protocol you bolt on top.
 
 ### 2.1 Modulation
 
-Single-carrier coherent **QPSK at 1200 baud**, root-raised-cosine
-pulse (α = 0.5, span 6 sym), audio centre 1500 Hz at 12 kHz sample
-rate. The QPSK constellation is Gray-mapped:
+Single-carrier **π/4-shifted DQPSK** with root-raised-cosine pulse
+(α = 0.35, span 6 sym), audio centre 1500 Hz at 12 kHz sample rate.
+Symbol rate is **1200 baud** (Robust / Standard / Express) or
+**600 baud** (UltraRobust, see §2.3). Information bits are
+differentially encoded onto the constellation rotation Δφ ∈
+{±π/4, ±3π/4}; the RX recovers bits via 1-symbol conjugate product
+followed by Gray-demapping after −π/4 derotation.
 
-| `(b1, b0)` | constellation point |
-|---:|:--|
-| (0, 0) | +1 + 0j |
-| (0, 1) | 0 + 1j |
-| (1, 0) | 0 − 1j |
-| (1, 1) | −1 + 0j |
+The π/4-DQPSK + differential demod combination removes the need
+for an absolute carrier-phase reference — all phase impairments
+that are slow relative to the symbol period (LO walk, clarifier
+offset within the AFC range, group-delay tilt) cancel in the
+1-symbol product. This is the key change from the 0.3 coherent-QPSK
+pipeline that failed over-the-air despite passing AWGN bench.
 
-The TX peak-normalises the burst envelope to ≤ 1; RMS sits around
-0.2–0.5 (~7 dB PAPR is normal for RRC-shaped QPSK at α = 0.5).
+### 2.2 Preamble — mode-encoded m-sequence + equaliser fit
 
-### 2.2 Preamble + pilots
+Frame head is a **127-chip BPSK m-sequence** (Fibonacci LFSR,
+length-7, one of four primitive polynomials selected by
+[`Mode`]). 127 chips × 1 sym/chip = 106 ms at 1200 baud (212 ms at
+600 baud for UltraRobust). The polynomial choice **encodes the
+mode** in the preamble itself, replacing the 0.3-era brute-force
+LDPC layout sweep — the RX runs four cross-correlations and picks
+the winner, deterministic 1+n_blocks decode cost.
 
-Frame head is a **31-bit BPSK m-sequence** (Fibonacci LFSR,
-polynomial x⁵ + x² + 1, initial state `[0, 0, 0, 0, 1]`). 31 chips
-× 1 sym/chip = 26 ms preamble at 1200 baud. Cyclic autocorrelation
-sidelobes are bounded by 1/31 ≈ −15 dB amplitude — a clean
-correlator peak for symbol-timing acquisition, frame detection,
-and initial carrier-phase reference.
-
-After the preamble, **one known QPSK pilot symbol every 32
-transmitted symbols** (≈ 3 % overhead). The pilot constellation
-point is +1 + 0j. The RX builds a per-symbol phase reference by
-linearly interpolating between consecutive pilot anchors. A
-**per-block decision-directed correction** (see §4) is then applied
-on top of the pilot interpolation to absorb the average within-
-block phase-tracking residual.
+Cyclic autocorrelation sidelobes for length-127 m-sequences are
+bounded by 1/127 ≈ −22 dB amplitude — clean enough to also fit a
+**9-tap T-spaced LMS equaliser** in closed form against the known
+preamble, recovered residual rotation, and pre-rotation timing
+correction during the same preamble window. There are **no pilot
+symbols** in the payload; the equaliser plus the 1-symbol
+differential demod absorbs the residual channel for the entire
+frame.
 
 ### 2.3 FEC
 
@@ -171,27 +176,38 @@ info bits → 240 channel bits per block). The four sub-modes apply
 puncturing chosen by **kSR-greedy puncture-set selection**
 (Ha–McLaughlin) to the 139 parity bits:
 
-| Sub-mode | rate | Puncture | Net bps | Posture |
-|---|---:|---:|---:|---|
-| Robust | 0.42 | 0 % | 1008 | maximum-margin posture |
-| Standard | 0.50 | 30 % | 1200 | typical NFM with fading |
-| Fast | 0.66 | 63 % | 1600 | good-signal default |
-| Express | 0.75 | 76 % | 1800 | strong-signal headline (OSD-3 mandatory) |
+| Sub-mode | Baud | rate | Puncture | Net bps | Posture |
+|---|---:|---:|---:|---:|---|
+| UltraRobust | 600 | 0.42 | 0 % | 504 | weak-signal / marathon QSL (half-baud) |
+| Robust | 1200 | 0.42 | 0 % | 1008 | maximum-margin at full baud |
+| Standard | 1200 | 0.50 | 30 % | 1200 | typical NFM with fading |
+| Express | 1200 | 0.75 | 76 % | 1800 | strong-signal headline (OSD-3 mandatory) |
+
+UltraRobust shares the same FEC rate as Robust but doubles the
+symbol period — every per-symbol energy doubles, fading averaging
+improves, and tap-delay multipath becomes shorter relative to the
+symbol period. The four-mode ladder spans a ~12 dB SNR_3kHz range
+end-to-end (see §3).
 
 kSR-greedy delivers ~1–3 dB Eb/N0 gain over uniform-spread
 puncturing at the deeper rates, which is what makes Express viable
 at all (uniform-spread fails to converge at 76 % parity puncture).
 
+A **dedicated header LDPC block** (Ldpc240_101 unpunctured, equal
+to Robust/UltraRobust rate) carries the 4-byte frame header
+separately from the payload — header recovery is independent of
+payload-block decode order and the puncturing depth.
+
 ### 2.4 Frame structure
 
 - Variable length: 1–32 LDPC blocks per frame.
-- Each LDPC block carries 96 info bits (12 byte) padded to the
-  FEC's 101-bit input. The remaining 5 bits per block carry a
-  **D-iii spread copy** of the 32-bit frame header (header
-  replicated ~7 times across the frame for slow-path recovery —
-  the current fast path simply uses block 0's CRC-validated header).
-- 4-byte frame header: mode (2b) + block count (5b) + app type
-  (4b) + sequence (5b) + CRC-16 (16b).
+- **Header LDPC block** (Ldpc240_101 unpunctured) carries the
+  4-byte frame header. Mode is **identified by the preamble
+  polynomial** and is therefore not stored as a header field —
+  the header carries block_count (5b) + app_type (4b) + sequence
+  (5b) + reserved (2b) + CRC-16 (16b).
+- Each payload LDPC block carries 96 info bits (12 byte) padded
+  to the FEC's 101-bit input.
 - **Block-interleaver** across all codewords in the frame spreads
   fade-burst erasures across every codeword.
 
@@ -212,84 +228,147 @@ the bytes. Suggested allocation:
 
 ## 3. Characterisation
 
-### 3.1 LDPC layer (modem-bypassed reference)
+### 3.1 Mode positioning summary
+
+`tests/uvpacket_per_modes_sweep.rs` (`#[ignore]`, run with
+`cargo test --release --test uvpacket_per_modes_sweep <name>
+-- --ignored --nocapture`), 30 trials per cell, 4-block frame,
+16-byte payload, π/4-DQPSK + LMS equaliser + OSD-2.
+
+**90 % PER threshold (≥ 27/30 decoded), Eb/N0_info / SNR_3kHz dB:**
+
+| Mode (net bps) | AWGN | Rayleigh fd=5 Hz | SSB realistic | FM realistic | Multipath 3-tap |
+|---|---:|---:|---:|---:|---:|
+| **UltraRobust** (504) | **+4 / −3.7** | **+8 / +0.3** | **+4 / −3.7** | **+6 / −1.7** | **+6 / −1.7** |
+| Robust (1008) | +6 / +1.3 | +12 / +7.3 | +8 / +3.3 | +10 / +5.3 | +8 / +3.3 |
+| Standard (1200) | +8 / +4.0 | +12 / +8.0 | +8 / +4.0 | +10 / +6.0 | +10 / +6.0 |
+| Express (1800) | +10 / +7.8 | +20 / +17.8 | >+15 / >+12.8 | +20 / +17.8 | **fail** |
+
+(SNR_3kHz = Eb/N0_info + 10·log₁₀(R_info / 3000); R_info per mode:
+504 / 1008 / 1200 / 1800 bps → −7.74 / −4.74 / −3.98 / −2.22 dB.)
+
+UltraRobust holds a uniform 4 dB margin over Robust on every
+fading channel (Rayleigh, SSB, FM) and a 2 dB margin on AWGN /
+multipath. Express collapses on multi-tap multipath even at +20 dB
+Eb/N0 — the equaliser's 9 taps span ~7.5 ms at 1200 baud and
+cannot resolve the 15 ms tap, while the 600-baud UltraRobust gives
+the equaliser ~13 ms of T-spaced reach.
+
+### 3.2 LDPC layer (modem-bypassed reference)
 
 `tests/uvpacket_ldpc_direct.rs` feeds Gaussian-noise LLRs straight
 into the LDPC decoder, calibrated for `Eb/N0_info` per channel bit.
 This isolates the FEC from the modem and gives the **theoretical
-ceiling** the QPSK end-to-end pipeline aspires to:
+ceiling** the modem end-to-end pipeline aspires to.
+
+50 % PER thresholds: UltraRobust / Robust ≈ +0.5 dB (same FEC),
+Standard ≈ +0.7 dB, Express ≈ +1.5 dB. The mother code's design
+rate is 0.42 so Robust / UltraRobust hold a ~1 dB lead at the FEC
+layer. The π/4-DQPSK end-to-end thresholds in §3.1 sit ~3 dB above
+this LDPC-only ceiling — that 3 dB gap is the irreducible
+**non-coherent-vs-coherent gap** of differential demodulation,
+the price paid for surviving the over-the-air phase-impairment
+stack (see §4).
+
+### 3.3 AWGN sweep
 
 ```
-mode      eb/n0 (dB)  -2  -1   0   1   2   3   4
-─────────────────────────────────────────────────
-Robust                 0   2   6  21  28  30  30
-Standard               0   1   5  20  29  30  30
-Fast                   0   1   6  22  26  30  30
-Express                0   0   0  14  24  29  30
+mode         Eb/N0 (dB)  -2   0   2   4   6   8  10
+─────────────────────────────────────────────────────
+UltraRobust               0   0   6  29  30  30  30
+Robust                    0   0   0   1  25  30  30
+Standard                  0   0   0   0  19  30  30
+Express                   0   0   0   0   0  21  30
 ```
 
-50 % PER thresholds: Robust ≈ +0.5 dB, Standard / Fast ≈ +0.7 dB,
-Express ≈ +1.5 dB. The mother code's design rate is 0.42 so Robust
-holds a ~1 dB lead at the FEC layer.
+90 % PER thresholds: UltraRobust ≈ +4 dB, Robust ≈ +6 dB,
+Standard ≈ +8 dB, Express ≈ +10 dB. The textbook rate ordering
+(lower rate → lower threshold) is recovered, plus a 2 dB
+half-baud bonus for UltraRobust.
 
-### 3.2 QPSK end-to-end (modem + FEC)
-
-`tests/uvpacket_demod_diagnostic::awgn_threshold_finder_per_mode`,
-30 trials per cell, 4-block frame, 44-byte payload, OSD-2 (default):
+### 3.4 Rayleigh flat fading
 
 ```
-mode      eb/n0 (dB)  -2  0  2  4  6  8 10 12 14 16 18 20 22
-─────────────────────────────────────────────────────────────
-Robust                 0  0 14 29 30 30 30 30 30 30 30 30 30
-Standard               0  0 10 30 30 30 30 30 30 30 30 30 30
-Fast                   0  0 12 29 30 30 30 30 30 30 30 30 30
-Express                0  0  3 29 30 30 30 30 30 30 30 30 30
+mode         fd (Hz)  +4   +8  +12  +16  +20  +25   (Eb/N0_info dB)
+────────────────────────────────────────────────────────
+UltraRobust    1       4   22   29   30   30   30
+UltraRobust    5       3   29   30   30   30   30
+UltraRobust   10       4   29   30   30   30   30
+Robust         1       0   10   26   30   30   30
+Robust         5       0    7   29   30   30   30
+Robust        10       0   10   30   30   30   30
+Standard       1       1   11   24   30   30   30
+Standard       5       0    6   26   30   30   30
+Standard      10       0    7   30   30   30   30
+Express        1       0    3   10   20   27   28
+Express        5       0    0    3   18   29   30
+Express       10       0    0    2   22   28   29
 ```
 
-50 % PER thresholds:
+≥ 90 % PER thresholds: UltraRobust ≈ +8 dB across all Doppler;
+Robust / Standard ≈ +12 dB; Express ≈ +20 dB. Doppler dependence
+is mild for the lower three modes (differential demod absorbs
+slow phase drift); Express is the only mode where 1 Hz vs 10 Hz
+matters at threshold.
 
-- **Robust**: ~+1 dB
-- **Standard / Fast**: ~+2 dB
-- **Express**: ~+3 dB
+### 3.5 SSB realistic — clarifier offset + LO walk + light multipath
 
-The textbook rate ordering (lower rate → lower threshold) is
-recovered: Robust beats Express by ~2 dB at the threshold, matching
-the LDPC-layer advantage from §3.1.
-
-100 % PER thresholds: Robust / Standard / Fast / Express all at
-~+4 dB. Modem implementation loss versus the LDPC-only ceiling is
-**~0.5–2 dB** depending on mode (was ~3 dB before the Phase 2'b
-phase-tracker rework — see §4 for the breakdown).
-
-### 3.3 Rayleigh flat fading
-
-`tests/uvpacket_rayleigh.rs`, 30 trials per cell, 4-block frame,
-20-byte payload:
+Channel: BPF (300, 2700) Hz with 100 Hz transition, clarifier
+offset 100 Hz (within AFC range), LO phase walk 2 rad/√s,
+single 5 ms multipath tap at −10 dB.
 
 ```
-mode       Doppler  +10  +12  +15  +20  +25  +30  +35  (Eb/N0_info dB)
-──────────────────────────────────────────────────────────────────
-Robust     1 Hz     —    28   30   30   30   30   —
-Robust     5 Hz     30   30   30   30   30   30   —
-Robust    10 Hz     28   30   30   30   30   30   —
-Standard   1 Hz     27   28   30   30   30   30   —
-Standard   5 Hz     30   30   30   30   30   30   —
-Standard  10 Hz     28   30   30   30   30   30   —
-Fast       1 Hz     —    —    30   30   30   30   30
-Fast       5 Hz     27   —    30   30   30   30   30
-Fast      10 Hz     29   —    30   30   30   30   30
-Express    1 Hz     25   —    29   30   30   30   30
-Express    5 Hz     27   —    30   30   30   30   30
-Express   10 Hz     28   —    30   30   30   30   30
+mode         Eb/N0 (dB)  +4   +6   +8  +10  +12  +15
+─────────────────────────────────────────────────────
+UltraRobust              21   30   30   30   30   30
+Robust                    0    7   28   30   30   30
+Standard                  0    1   23   30   30   30
+Express                   0    0    1    7   17   27
 ```
 
-≥ 90 % PER thresholds (post-LMS phase tracker, OSD-2): **Robust
-≈ +10 dB at 5–10 Hz Doppler, ~+12 dB at 1 Hz**; Standard / Fast /
-Express all at ~+10 dB across most Doppler / a touch higher at
-1 Hz Express. The phase-tracker rework dropped the Rayleigh
-thresholds by 2–5 dB depending on (mode × Doppler).
+UltraRobust is **even with its AWGN threshold (+4 dB)** here —
+the half-baud symbol period gives the equaliser enough time to
+absorb the multipath tap and the differential demod is invariant
+to the LO walk.
 
-### 3.4 The FM-threshold floor — and why it makes the modem
+### 3.6 FM realistic — de-emphasis + discriminator drift + Rician
+
+Channel: 75 µs de-emphasis, discriminator DC drift 50 Hz, LO walk
+1 rad/√s, Rician K = 10 dB, single 5 ms multipath tap at −10 dB.
+
+```
+mode         Eb/N0 (dB)  +6   +8  +10  +12  +15  +20
+─────────────────────────────────────────────────────
+UltraRobust              27   30   30   30   30   30
+Robust                    0    9   28   30   30   30
+Standard                  0    2   24   30   30   30
+Express                   0    0    1    5   17   26
+```
+
+UltraRobust ~4 dB ahead of Robust again. Express is barely usable
+on FM due to the de-emphasis tilt convolved with multipath.
+
+### 3.7 Pure multi-tap multipath (3 + 8 + 15 ms)
+
+Multipath stress test, no other impairments beyond AWGN.
+Isolates the equaliser's reach.
+
+```
+mode         Eb/N0 (dB)  +6   +8  +10  +12  +15  +20
+─────────────────────────────────────────────────────
+UltraRobust              30   30   30   30   30   30
+Robust                    0   20   30   30   30   30
+Standard                  0   19   28   30   30   30
+Express                   0    0    0    0    6    8
+```
+
+UltraRobust is **floor-limited** even at +6 dB Eb/N0 — the 600-baud
+symbol period (~1.67 ms) lets the 9-tap equaliser cover ~13 ms
+T-spaced, comfortably wider than the 15 ms tail tap. Express
+collapses entirely: 9 taps at 1200 baud cover ~7.5 ms and cannot
+resolve the longer taps.
+
+### 3.8 The FM-threshold floor — and why it makes the modem
 ###     implementation loss operationally invisible
 
 The modem sits on top of FM detection. Below CNR ≈ +9–10 dB the
@@ -301,29 +380,29 @@ numbers above are meaningful only above the FM threshold.
 passband) is roughly `CNR_threshold + FM_SNR_improvement ≈ +9 +
 10·log₁₀(B_IF/B_audio · 3) ≈ +9 + 11 ≈ +20 dB SNR_3kHz`.
 
-Translating uvpacket Robust's 50 % PER threshold (+1 dB
+Translating uvpacket UltraRobust's 90 % PER threshold (+4 dB
 Eb/N0_info) to the same units:
 
 ```
-SNR_3kHz_Robust = +1 + 10·log₁₀(1008 / 3000) = −3.7 dB
+SNR_3kHz_UltraRobust = +4 + 10·log₁₀(504 / 3000) = −3.7 dB
 ```
 
-Margin from the FM threshold floor down to the Robust modem
-threshold: **~+24 dB**. The 0.5–2 dB residual modem implementation
-loss in §4 is operationally invisible — it sits well below the
-channel's own irreducible CNR floor, where no audio modem of any
-kind decodes.
+Margin from the FM threshold floor down to the UltraRobust modem
+threshold: **~+24 dB**. The residual modem implementation loss
+is operationally invisible — it sits well below the channel's own
+irreducible CNR floor, where no audio modem of any kind decodes.
 
 The FM threshold is the binding constraint for NFM voice
 channels.
 
-### 3.5 SSB compatibility — and AFC
+### 3.9 SSB compatibility — and AFC
 
-The modem is an audio-domain QPSK + RRC processor (signal
-occupies ~1200–1800 Hz around the 1500 Hz centre, well inside a
-typical SSB passband). On SSB the FM-threshold floor goes away
-and the modem operates at its true ~−3.7 dB SNR_3kHz Robust
-threshold — a useful weak-signal data envelope, especially on HF.
+The modem is an audio-domain π/4-DQPSK + RRC processor (signal
+occupies ~1600 Hz around the 1500 Hz centre at α = 0.35, well
+inside a typical SSB passband). On SSB the FM-threshold floor
+goes away and the modem operates at its true ~−3.7 dB SNR_3kHz
+UltraRobust threshold — a useful weak-signal data envelope,
+especially on HF.
 
 **AFC ships in 0.3.2.** Use
 [`decode_known_layout_with_afc(audio, .., &AfcOpts)`](https://docs.rs/mfsk-core/latest/mfsk_core/uvpacket/rx/fn.decode_known_layout_with_afc.html)
@@ -351,7 +430,7 @@ correct Δf.
 NFM users can keep using `decode_known_layout` (AFC is pure
 overhead on a static-VFO channel).
 
-### 3.6 Multi-channel SSB + slotted-ALOHA TX (0.3.3)
+### 3.10 Multi-channel SSB + slotted-ALOHA TX (0.3.3)
 
 A single uvpacket signal occupies `R_s · (1+α) = 1200 · 1.5 =
 1800 Hz` end-to-end (RRC roll-off included; the −3 dB main
@@ -421,61 +500,63 @@ survey with one busy slot: busy mag > 5× free mag.
 
 ## 4. Modem implementation loss
 
-The gap between the LDPC-only threshold (§3.1) and the QPSK
-end-to-end threshold (§3.2) is the modem implementation loss.
-Phase 2'b reworked the rx phase tracker and brought the gap from
-~3 dB down to **0.5–2 dB** (mode-dependent: lowest for Robust which
-benefits most from coherent integration of all anchors).
+The gap between the LDPC-only threshold (§3.2) and the π/4-DQPSK
+end-to-end threshold (§3.3) is **~3 dB at AWGN** — this is the
+irreducible non-coherent-vs-coherent gap of differential
+demodulation, not engineering slack. The 0.4 redesign accepted
+that gap as the price for surviving the over-the-air
+phase-impairment stack that broke 0.3's coherent QPSK pipeline.
 
 The current rx implements:
 
-- **Weighted-LMS quadratic phase fit** over all anchors (preamble
-  centre + each pilot). Replaces the previous linear interpolation
-  between adjacent pilots; provides global averaging of the noisy
-  pilot phase estimates while still capturing slow Doppler drift
-  via the second-order term. The preamble anchor gets weight √31
-  (number of chips it averages); pilots get weight 1.
-- **σ-aware LLR scaling**:
-  `LLR = (A / σ²_n) · qpsk_max_log(r_derot)`.
-- **Magnitude-based σ²_n estimator** from data symbols:
-  `σ²_n = (E[|r|²] − A²) / 2`. Captures the total noise on data
-  symbols, including any residual phase-tracking jitter.
-- **Per-LDPC-block decision-directed correction (DDPT)** stacked on
-  top of the LMS track: hard-decide each data symbol, accumulate
-  the complex residual per block, take its arg as a per-block
-  constant phase correction.
-- **OSD-2** by default (good cost/performance balance);
-  `decode_known_layout_with_opts` accepts `&FecOpts` for callers
-  who want OSD-3 (~30 × slower per decode, ~10–15 % better PER
-  near threshold for the higher-rate modes).
+- **127-chip BPSK preamble cross-correlation × 4 polynomials** —
+  one cross-correlation per Mode (UltraRobust / Robust / Standard
+  / Express). The polynomial that wins identifies the mode without
+  needing to try all LDPC layouts; decode cost becomes deterministic
+  1+n_blocks regardless of mode confusion.
+- **9-tap T-spaced LMS equaliser** fitted in closed form against
+  the known preamble (least-squares solve, no iterative
+  adaptation). Reach is ~7.5 ms at 1200 baud, ~13 ms at 600 baud
+  — the latter resolves typical multi-tap multipath that 1200-baud
+  modes cannot.
+- **Residual rotation estimate** from the preamble's complex
+  signed mean, applied before the −π/4 derotation. Absorbs
+  clarifier offset within the AFC range without a per-symbol PLL.
+- **1-symbol differential demodulation**: r_diff[n] = r[n] · r[n−1]*.
+  Bits recovered by Gray-demapping after −π/4 derotation. No pilot
+  insertion in the payload; no carrier-phase tracker.
+- **σ-aware LLR scaling** from a magnitude-based σ²_n estimator on
+  the differential samples.
+- **OSD-2** by default; `decode_known_layout_with_opts` accepts
+  `&FecOpts` for callers who want OSD-3 (~30 × slower per decode,
+  ~10–15 % better PER near threshold for the higher-rate modes).
+- **Dedicated header LDPC block** (Ldpc240_101 unpunctured) so
+  header recovery is independent of payload puncturing depth.
 
-The remaining 0.5–2 dB loss is dominated by:
-
-- σ²_n estimator noise at low SNR (the magnitude-based estimator
-  has finite-sample variance that becomes a meaningful fraction of
-  the true variance at threshold-level SNR).
-- Finite-span RRC matching loss (~0.05 dB) plus finite-precision
-  arithmetic accumulating over the LDPC block.
-- Sample-timing rounded to integer samples — addressed by the
-  sub-sample timing recovery (parabolic peak fit on the preamble
-  correlation magnitude → fractional offset applied via linear
-  interpolation of the matched-filter output). Empirical gain at
-  the threshold is ~0.1 dB, at the lower end of the predicted
-  range. Mixed at higher SNR (Rayleigh fading sometimes shows ±1
-  trial of 30, well within statistical noise).
-
-These are sub-1-dB-each engineering knobs rather than structural
-bugs. Closing them is Phase 3+ work; the current modem already
-delivers a meaningful Robust > Standard / Fast > Express ordering
-at the threshold, matching the LDPC theory.
+These choices trade ~3 dB AWGN headroom for the ability to
+operate without an absolute phase reference. On every fading or
+phase-walk channel measured in §3.4–3.7 that trade pays — the
+0.3 coherent pipeline did not survive any of those channels at
+field-realistic settings.
 
 ## 5. Modulation pivot history
 
-The first 0.3.1 design was 4-GFSK at h = 0.5. Phase 2 found the
-orthogonality integral `sinc(0.5) ≈ 0.637` left adjacent tones
-leaking 64 % of their energy, breaking max-likelihood symbol
-detection. The redesign to coherent QPSK + RRC matched filter was
-committed mid-cycle. See `docs/0.3.1_PLAN.md` for the chronology.
+- **0.3.0**: design abandoned after honest AFSK1200 / AX.25
+  comparison showed it ~5–10 × faster on clean channels for the
+  signed-QSL payload.
+- **0.3.1 Phase 1**: 4-GFSK at h = 0.5. Phase 2 found
+  `sinc(0.5) ≈ 0.637` left adjacent tones non-orthogonal under
+  non-coherent detection (textbook condition is h ≥ 1).
+- **0.3.1 Phase 2 → 0.3.3**: pivoted to coherent QPSK + RRC +
+  LMS phase tracker. Bench-passed AWGN / Rayleigh sims but failed
+  over-the-air on SSB and FM voice paths despite repeated
+  patching (AFC, coherence-ratio gate, 1-shot AFC).
+- **0.4.0**: replaced coherent QPSK with **π/4-DQPSK + LMS
+  equaliser + 4-variant 127-chip preamble + dedicated header
+  block + UltraRobust half-baud mode**. The 3 dB non-coherent gap
+  is structural; the 5–10 dB phase-impairment loss it eliminates
+  is much larger. See `docs/0.3.1_PLAN.md` and the pre-0.4 plan
+  files for the chronology.
 
 The σ formula in `tests/common/channel.rs` was also recalibrated
 in Phase 2'a to take per-burst measured signal power, so stated
@@ -516,13 +597,14 @@ shoulders.
 | Frame header + CRC + bit packing | [`mfsk-core/src/uvpacket/framing.rs`](../mfsk-core/src/uvpacket/framing.rs) |
 | Puncture sets (kSR-greedy) | [`mfsk-core/src/uvpacket/puncture.rs`](../mfsk-core/src/uvpacket/puncture.rs) |
 | Block interleaver | [`mfsk-core/src/uvpacket/interleaver.rs`](../mfsk-core/src/uvpacket/interleaver.rs) |
-| Preamble + pilot definitions | [`mfsk-core/src/uvpacket/sync_pattern.rs`](../mfsk-core/src/uvpacket/sync_pattern.rs) |
+| Preamble polynomials (4 variants) | [`mfsk-core/src/uvpacket/sync_pattern.rs`](../mfsk-core/src/uvpacket/sync_pattern.rs) |
 | TX (bytes → audio) | [`mfsk-core/src/uvpacket/tx.rs`](../mfsk-core/src/uvpacket/tx.rs) |
-| RX (audio → bytes) | [`mfsk-core/src/uvpacket/rx.rs`](../mfsk-core/src/uvpacket/rx.rs) |
+| RX (audio → bytes), equaliser | [`mfsk-core/src/uvpacket/rx.rs`](../mfsk-core/src/uvpacket/rx.rs) |
 | AWGN + Rayleigh harness | [`mfsk-core/tests/common/channel.rs`](../mfsk-core/tests/common/channel.rs) |
+| SSB / FM realistic channel sims | [`mfsk-core/tests/common/air_channel.rs`](../mfsk-core/tests/common/air_channel.rs) |
 | LDPC-only sweep (modem-bypassed) | [`mfsk-core/tests/uvpacket_ldpc_direct.rs`](../mfsk-core/tests/uvpacket_ldpc_direct.rs) |
 | Modem TX/RX diagnostics | [`mfsk-core/tests/uvpacket_modem_diag.rs`](../mfsk-core/tests/uvpacket_modem_diag.rs) |
-| AWGN / Rayleigh threshold sweeps | [`mfsk-core/tests/uvpacket_awgn.rs`](../mfsk-core/tests/uvpacket_awgn.rs), [`uvpacket_rayleigh.rs`](../mfsk-core/tests/uvpacket_rayleigh.rs) |
+| 4 modes × 5 channels PER sweep | [`mfsk-core/tests/uvpacket_per_modes_sweep.rs`](../mfsk-core/tests/uvpacket_per_modes_sweep.rs) |
 
 ## 8. License
 

@@ -102,39 +102,22 @@ License matches upstream: **GPL-3.0-or-later**.
 
 ### Applied example: `uvpacket`
 
-The `uvpacket` module (feature-gated, off by default) is **not** a
-WSJT-X family mode — it is an in-tree applied example of how the
-FEC infrastructure (`Ldpc240_101`, BP, OSD-2) can be reused outside
-that family. uvpacket targets a different design point: a packet
-protocol for narrow-FM voice channels (HT/mobile, ~3 kHz audio
-passband) intended for private-group amateur-radio messaging
-(signed QSL exchange, short text, position reports).
+The `uvpacket` module (`--features uvpacket`, off by default) is
+an in-tree example of how the trait abstractions handle a
+non-WSJT mode: a single-carrier π/4-DQPSK packet protocol with
+LMS equaliser and dedicated header LDPC block, fitted to the
+3 kHz audio passband of NFM / SSB voice channels. It reuses the
+shared `Ldpc240_101` codec but otherwise has its own modulation,
+sync (4-variant 127-chip preamble), framing, and byte-pipe API.
 
-It shares the FEC mother code with FST4 but otherwise diverges from
-WSJT-X assumptions in every layer: single-carrier coherent QPSK +
-root-raised-cosine pulse, 31-bit m-sequence preamble, pilot-aided
-phase tracking, byte-pipe API, and a bespoke TX/RX path. Four sub-
-modes (Robust/Standard/Fast/Express, 1008–1800 net bps) trade
-robustness for throughput via puncturing.
-
-Phase 2 characterisation (post LMS phase tracker): 50 % PER at
-**+1 dB** Eb/N0_info Robust (Standard / Fast +2 dB, Express +3 dB);
-100 % PER at +4 dB across modes; ≥ 90 % PER on Rayleigh fading at
-+10–12 dB across all modes / 1–10 Hz Doppler. **24 dB margin from
-the NFM FM-threshold floor** at the Robust threshold — the channel
-binds before the modem.
-
-**SSB use** is supported via `decode_known_layout_with_afc` (0.3.2):
-±200 Hz frequency-grid AFC sidesteps the TX/RX VFO-mismatch problem
-and lets the modem operate to its true threshold on HF/microwave
-SSB channels.
-
-See [`docs/UVPACKET.md`](https://github.com/jl1nie/mfsk-core/blob/main/docs/UVPACKET.md)
+uvpacket is a hobbyist application included as documentation of
+how the abstractions extend beyond WSJT-X. **Its public API may
+change within the 0.4.x line** — pin to an exact version if you
+depend on it. See
+[`docs/UVPACKET.md`](https://github.com/jl1nie/mfsk-core/blob/main/docs/UVPACKET.md)
 ([日本語](https://github.com/jl1nie/mfsk-core/blob/main/docs/UVPACKET.ja.md))
-for the full design narrative, the modulation-pivot history that
-shaped the current implementation, and the characterisation curves
-underlying those headline numbers; representative WAV samples live
-at `audio_samples/uvpacket/`.
+for the full design narrative and per-mode performance
+characterisation.
 
 ## Modules
 

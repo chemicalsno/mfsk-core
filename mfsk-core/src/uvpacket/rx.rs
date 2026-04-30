@@ -18,7 +18,7 @@
 //!    closed-form normal-equations solve). Removes multipath ISI.
 //! 5. **Differential demod** — `r_diff[k] = e[k] · conj(e[k-1])` on
 //!    equaliser output. π/4-rotated to land on the standard QPSK
-//!    constellation axes for [`qpsk_llrs`].
+//!    constellation axes for the QPSK LLR step.
 //! 6. **Amplitude / noise estimate** — joint estimator from the
 //!    long preamble's known pair products; gives `a_sq_est`,
 //!    `residual_rotation`, `sigma_sq_n_diff`.

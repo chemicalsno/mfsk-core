@@ -1,121 +1,111 @@
 # Changelog
 
-## 0.4.0 — uvpacket redesign (post-air-test)
+## 0.4.0 — Q65 + abstraction unification
 
-mfsk-core's WSJT-family library API (FT8 / FT4 / FST4 / WSPR / JT9
-/ JT65 / Q65 protocols, the `Protocol` / `FecCodec` / `MessageCodec`
-traits, the FEC layer including `Ldpc240_101`) is **unchanged**.
-This release rebuilds the in-tree `uvpacket` "applied example"
-module from the ground up after over-the-air loopback testing
-exposed structural problems in the 0.3.x design.
+First release on the 0.4 line; cumulative since the 0.2.1 crates.io
+publish. The headline is **the WSJT-family API surface**: a new
+protocol (Q65-30A), trait-level cleanups that close abstraction
+leaks the multi-protocol port surfaced, and a registry that gives
+every protocol a uniform metadata view. The in-tree `uvpacket`
+applied-example module is also rebuilt end-to-end (separate
+section below) but it is gated behind `--features uvpacket` and
+not part of the default-features API.
 
-### What changed in `uvpacket`
+### WSJT-family additions (BREAKING vs 0.2.1)
 
-The 0.3.x line shipped a single-carrier coherent QPSK modem with a
-31-bit BPSK m-sequence preamble, periodic QPSK pilots, and a
-brute-force receiver that tried every `(mode × n_blocks)` layout
-combination per sync peak (up to 128 LDPC decode attempts per
-peak). Air testing showed:
+- **Q65-30A** — full decode / encode / synthesis port from WSJT-X,
+  including fast-fading log-likelihoods and AP-list handling. New
+  `Q65a30` re-export, `--features q65`. (Cumulative across 0.3.x.)
+- **`MessageCodec::verify_info`** — CRC verification lifted out of
+  the LDPC layer into the message-codec trait, so the FEC code no
+  longer has hard-coded knowledge of CRC-24 vs CRC-14 dispatch.
+  Required because the same `Ldpc240_101` mother code is now
+  shared across FST4 (CRC-24, 77-bit msg) and Q65 (CRC-14, 91-bit
+  msg) and `uvpacket` (CRC-16, 96-bit raw bytes).
+- **`Ldpc240_101` family unified** — single LDPC implementation
+  used by FST4, Q65, and uvpacket (previously each had its own
+  copy with subtle constant divergence).
+- **`ProtocolMeta` registry** — every `Protocol` impl exposes a
+  uniform metadata block (band rate, Costas pattern length,
+  symbol count, …). Cross-protocol invariant tests assert the
+  registry stays internally consistent (`tests/protocol_invariants.rs`).
+- **`PacketBytesMessage`** — variable-length-bytes message codec,
+  exposed as `--features packet-bytes`. Used as the byte-pipe
+  building block for callers that want LDPC + interleaver + sync
+  but do not need WSJT-77's structured-message dispatch.
+- **`mfsk_core::VERSION`** — crate version constant, useful for
+  FFI / WASM consumers verifying which build they linked against.
 
-- **Coherent QPSK fails over real SSB / FM relay paths.** The
-  LMS phase-fit + decision-directed phase tracker can't cope with
-  the compound impairment stack (LO walk, clarifier offset, FM
-  de-emphasis, multi-tap acoustic / outdoor multipath). Sync
-  detection itself collapses below the gate threshold under those
-  impairments.
-- **The brute-force decode pipeline is structurally wrong.** The
-  receiver had no way to know `(mode, n_blocks)` from sync alone,
-  so it tried every combination — ~1 second of LDPC-decode CPU per
-  candidate sync peak in the worst case, and a CRC false-positive
-  risk that grew with the number of trials.
+The trait reshuffle is the breaking part: `MessageCodec` impls
+that were closed against `mfsk-core ≤ 0.2.1` need to add the new
+`verify_info` method. Default implementations cover the common
+"length-then-CRC" cases.
 
-The 0.4.0 redesign addresses both at the architecture level:
+### `uvpacket` applied example (gated, redesigned)
 
-#### Modulation: π/4-DQPSK with adaptive equaliser
+`uvpacket` is an in-tree example of how the abstractions handle a
+non-WSJT mode (3 kHz NFM / SSB voice-channel packet protocol).
+**Breaking changes within `--features uvpacket` are expected
+within the 0.4.x line** — pin the exact patch version if you depend
+on it. ABI consolidation will follow in a future release.
 
-- **127-chip BPSK m-sequence preamble**, with **four distinct
-  primitive-polynomial variants** (one per `Mode`). Sync
-  identifies both the time offset *and* the payload mode in a
-  single matched-filter pass per frequency candidate.
-- **π/4-shifted DQPSK** data symbols (1200 baud, RRC α = 0.5).
-  Differential demodulation is invariant to constant phase
-  rotation and tolerates LO walk / clarifier offset to the limits
-  of the AFC search range. No pilots — the differential chain
-  doesn't need them.
-- **9-tap T-spaced linear equaliser** trained on the long preamble
-  via least-squares (closed-form normal-equations solve).
-  Compensates the principal multipath tap (≤ 4 symbols / ~3.3 ms
-  delay span on each side of the centre tap).
-- **AFC** at sync time, ±200 Hz default search; callers can widen
-  the range for harsher channels.
+The 0.4 redesign replaced the 0.3.x coherent-QPSK pipeline (which
+failed over-the-air despite passing AWGN bench) with a
+single-carrier **π/4-shifted DQPSK** modem at 1200 / 600 baud:
 
-#### Frame structure: dedicated header block
+- 127-chip BPSK m-sequence preamble, **four primitive-polynomial
+  variants** (one per `Mode`). Sync identifies the time offset
+  and the payload mode in one matched-filter pass per centre.
+- **9-tap T-spaced LMS equaliser** trained closed-form on the
+  preamble. Differential demod is invariant to constant phase
+  rotation and tolerates LO walk / clarifier offset to the AFC
+  search-range limit; no pilots needed.
+- **Dedicated header LDPC block** (Robust, unpunctured) carries
+  `(block_count, app_type, sequence)` + CRC-16. Receiver decodes
+  the header first (1 LDPC), reads `n_blocks`, then decodes the
+  payload (`n_blocks` LDPCs). Total `1 + n_blocks` LDPC decodes
+  per frame, vs ≤ 128 brute-force before.
+- **AFC** at sync time, ±200 Hz default; callers widen for
+  harsher channels.
+- **UltraRobust** mode (header_code 0): half-baud (600 Hz)
+  variant of Robust for marathon QSL on weak SSB / V-UHF mountain
+  paths. ~4 dB tougher than Robust on every fading channel
+  measured (Rayleigh, SSB realistic, FM realistic), see the
+  positioning matrix in `docs/UVPACKET.md` §3.1.
+- **WSJT-X-compatible SNR reporting** on every decoded frame
+  (`DecodedFrame.snr_db`, dB / 2.5 kHz reference, −30 dB floor).
+  Per-mode calibrated to ±0.3 dB residual against AWGN truth.
+- **Shared-pair preamble correlator** — auto-detect path shares
+  the differential pair products `aᵢ = mf[k]·conj(mf[k-1])`
+  across the 3 NSPS_BASE preambles, ~36 % per-offset reduction at
+  K=3. Bit-identical PER vs the per-preamble form (verified via
+  `tests/uvpacket_per_modes_sweep`).
 
-```
-[ 127-chip preamble, mode-encoded ]
-[ Header LDPC block — Robust, Ldpc240_101 unpunctured ]
-[ Payload LDPC blocks × n_blocks at the frame mode ]
-```
-
-- Header carries `(block_count, app_type, sequence)` + CRC-16.
-  Mode is conveyed by the preamble pattern, not in any header
-  bits.
-- Receiver decodes the header block first (one LDPC decode), reads
-  `n_blocks`, then decodes the payload blocks at the mode the
-  preamble identified.
-- **`1 + n_blocks` LDPC decodes per frame** (vs ≤ 128 brute-force
-  before). Typical 16-byte payload = 3 LDPC decodes (~30 ms);
-  worst-case 32-block frame = 33 decodes.
-- D-iii spread-header indirection removed; pilot symbols removed.
-
-#### Public API surface
-
-The uvpacket public API is restructured. Because uvpacket is an
-in-tree applied-example module rather than part of the WSJT-family
-library proper, this is **not** a breaking change at the
-`mfsk-core` crate level — the WSJT-family API is unchanged. New
-shape:
-
-- `tx::encode(header, payload, audio_centre_hz)` — single canonical
-  encode function (replaces the multiple Phase A/C iterations:
-  `encode`, `encode_pi4_dqpsk`, `encode_pi4_dqpsk_eq`).
-- `rx::decode_known_layout(audio, sample_offset, audio_centre_hz, mode, fec_opts)`
-  and `rx::decode_known_layout_with_afc(...)` — single canonical
-  decoder per AFC variant.
-- `rx::decode(audio, audio_centre_hz)` — auto-detect (single
-  channel, scans for any of the four preamble variants).
-- `rx::decode_multichannel`, `rx::measure_slot_energies` —
-  unchanged signatures, internally use the new pipeline.
-- Diagnostic helpers `rx::diag_sync_at`,
-  `rx::diag_estimate_freq_offset`.
-
-Removed from `uvpacket`:
-- All coherent-QPSK encode/decode entry points.
-- The `decode_known_layout_pi4_dqpsk` Phase A intermediate.
-- The `decode_known_layout_pi4_dqpsk_eq*` Phase C iteration (kept
-  as the canonical implementation under the renamed
-  `decode_known_layout` family).
-- Pilot-related constants (`PILOT_QPSK_POINT`,
-  `PILOT_SYMBOL_INTERVAL`).
-- Short-preamble constants (`UVPACKET_PREAMBLE_BPSK_BITS`,
-  `PREAMBLE_LEN = 31`); replaced by the four-variant catalogue
-  (`PREAMBLES`, `PREAMBLE_LEN = 127`).
+Removed from the 0.3 uvpacket:
+- All coherent-QPSK encode / decode entry points; pilot symbols
+  and the LMS phase tracker.
+- 31-chip preamble + spread-header indirection (replaced by the
+  4-variant 127-chip preamble + dedicated header block).
+- Brute-force `(mode × n_blocks)` layout sweep.
 - `framing::pack` / `framing::unpack` (replaced by `pack_header` /
-  `unpack_header`); the `mode` field is no longer in the header
-  word (preamble carries it).
+  `unpack_header`; mode field removed from the header word).
+- `UvFast` mode (header_code 2 ≤ 0.3.5); replaced by `UvUltraRobust`.
 
-### Empirical performance (post-redesign)
+### Performance characterisation
 
-| Channel | Eb/N0 | Robust PER threshold |
-|---|---|---|
-| AWGN | +5–6 dB | 50 % |
-| SSB mid-stress (clarifier 100 Hz, walk 2 rad/√s, +6 dB MP) | +10 dB | < 5 % |
-| SSB true-harsh (clarifier 250 Hz, walk 5, multi-tap MP, AFC ±400) | +12 dB | < 20 % |
-| FM true-harsh (de-emphasis + drift 250 + Rician K=8 + MP) | +15 dB | < 30 % |
+PER thresholds (90 %, Eb/N0_info / SNR_2.5kHz dB) for the four
+uvpacket modes on the channel models in
+`mfsk-core/tests/common/air_channel.rs`:
 
-The differential-demod path costs ~5 dB threshold loss vs the
-old coherent path on AWGN, paid back many times over by surviving
-real-channel impairments where the coherent path scored 0/30.
+| Mode (net bps) | AWGN | Rayleigh fd=5 | SSB realistic | FM realistic | Multipath 3-tap |
+|---|---:|---:|---:|---:|---:|
+| **UltraRobust** (504) | +4 / −3.7 | +8 / +0.3 | +4 / −3.7 | +6 / −1.7 | +6 / −1.7 |
+| Robust (1008) | +6 / +1.3 | +12 / +7.3 | +8 / +3.3 | +10 / +5.3 | +8 / +3.3 |
+| Standard (1200) | +8 / +4.0 | +12 / +8.0 | +8 / +4.0 | +10 / +6.0 | +10 / +6.0 |
+| Express (1800) | +10 / +7.8 | +20 / +17.8 | >+15 / >+12.8 | +20 / +17.8 | fail |
+
+Reproduce via `cargo test --release --features uvpacket --test
+uvpacket_per_modes_sweep -- --ignored --nocapture`.
 
 ## 0.3.5 (continued) — 2026-04-29
 
