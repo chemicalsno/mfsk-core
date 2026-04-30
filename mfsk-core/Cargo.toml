@@ -26,7 +26,7 @@ std          = ["alloc", "dep:rustfft"]
 alloc        = []
 
 # Aggregate features.
-full         = ["std", "ft8", "ft4", "fst4", "wspr", "jt9", "jt65", "q65", "packet-bytes", "uvpacket"]
+full         = ["std", "fft-rustfft", "ft8", "ft4", "fst4", "wspr", "jt9", "jt65", "q65", "packet-bytes", "uvpacket"]
 
 # Embedded presets (no_std + alloc, no rustfft, no rayon).
 # `embedded-rx` pulls `fft-extern` so the caller binary supplies an
@@ -48,14 +48,23 @@ esp32s3      = ["embedded-rx"]
 fft-rustfft  = ["std", "dep:rustfft"]
 fft-extern   = ["alloc"]
 
+# Lightweight modes — embedded-port-clean. `fft-rustfft` (host) or
+# `fft-extern` (embedded) is required at the crate level for the
+# decode pipeline; the protocol features themselves only enable the
+# protocol-specific glue.
 ft8          = []
 ft4          = []
-fst4         = []
 wspr         = []
-jt9          = []
-jt65         = []
-q65          = []
 packet-bytes = []
+
+# Heavy modes — these still call `rustfft` directly (out of scope of
+# the embedded port). Pulling them implies the host build via
+# `fft-rustfft` (which transitively requires `std`).
+fst4         = ["fft-rustfft"]
+jt9          = ["fft-rustfft"]
+jt65         = ["fft-rustfft"]
+q65          = ["fft-rustfft"]
+
 # uvpacket pulls in fst4 because it reuses the Ldpc240_101 codec
 # whose `Wsjt77Message::verify_info` length-dispatch logic (CRC-24
 # vs CRC-14) is wired through fst4's path.

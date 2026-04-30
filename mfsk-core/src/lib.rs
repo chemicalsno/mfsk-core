@@ -260,12 +260,12 @@
     clippy::unusual_byte_groupings
 )]
 // `no_std` build is gated on the absence of the default `std` feature.
-// When `alloc` is on we pull in `extern crate alloc` so modules can
-// reach `alloc::vec::Vec` etc. without caring whether they compile
-// against `std` or not.
+// `alloc` is unconditional — every protocol module uses Vec / String,
+// so making it optional would just push the dep up to every caller.
+// (The `alloc` Cargo feature still exists as a no-op alias kept around
+// for back-compat with consumers that listed it explicitly.)
 #![cfg_attr(not(feature = "std"), no_std)]
 
-#[cfg(feature = "alloc")]
 extern crate alloc;
 
 /// Crate version string, taken from Cargo.toml at compile time. Useful

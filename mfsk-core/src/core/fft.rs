@@ -35,7 +35,6 @@
 //! Backends are free to cache plans internally; callers should keep
 //! a single planner per decode session and reuse it across sizes.
 
-#[cfg(feature = "alloc")]
 use alloc::boxed::Box;
 
 use num_complex::Complex32;
@@ -61,7 +60,6 @@ pub trait Fft {
 /// Callers should construct one planner per decode session and reuse
 /// it across calls — backends like `rustfft` cache their twiddle
 /// tables between `plan_*` invocations of the same size.
-#[cfg(feature = "alloc")]
 pub trait FftPlanner {
     /// Plan a forward FFT of length `len`. Returns a boxed instance
     /// the caller drives via [`Fft::process`].
