@@ -17,9 +17,13 @@ pub mod hash_table;
 pub mod jt72;
 #[cfg(feature = "packet-bytes")]
 pub mod packet_bytes;
-// Decoder helper that wires `core::pipeline` (rustfft) — std-gated
-// alongside the other decode-side modules.
-#[cfg(feature = "std")]
+// Decoder helper that wires `core::pipeline` (FFT-trait); gated on
+// the FFT meta-feature so embedded-rx (alloc + microfft) gets it.
+#[cfg(any(
+    feature = "fft-rustfft",
+    feature = "fft-microfft",
+    feature = "fft-extern"
+))]
 pub mod pipeline_ap;
 #[cfg(feature = "q65")]
 pub mod q65;

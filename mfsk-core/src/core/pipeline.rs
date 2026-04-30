@@ -5,8 +5,16 @@
 //! (which depends on the 77-bit WSJT message bit layout) lives in
 //! protocol-specific crates.
 
+use alloc::boxed::Box;
+use alloc::vec;
+use alloc::vec::Vec;
+
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
+
+use num_complex::Complex;
+#[cfg(not(feature = "std"))]
+use num_traits::Float;
 
 use super::dsp::downsample::{DownsampleCfg, build_fft_cache, downsample_cached};
 use super::dsp::subtract::{SubtractCfg, subtract_tones};
@@ -15,7 +23,6 @@ use super::llr::{compute_llr, compute_snr_db, symbol_spectra, sync_quality};
 use super::sync::{SyncCandidate, coarse_sync, fine_sync_power_per_block, refine_candidate};
 use super::tx::codeword_to_itone;
 use super::{FecCodec, FecOpts, MessageCodec, Protocol};
-use num_complex::Complex;
 
 /// FFT cache for the initial large forward transform; reusable across passes.
 pub type FftCache = Vec<Complex<f32>>;

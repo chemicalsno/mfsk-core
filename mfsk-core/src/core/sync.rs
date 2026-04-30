@@ -9,10 +9,16 @@
 //! code handles FT8 (3 identical Costas-7 blocks) and FT4 (4 different
 //! Costas-4 blocks) by iterating over `FrameLayout::SYNC_BLOCKS`.
 
-use super::Protocol;
+use alloc::vec;
+use alloc::vec::Vec;
+use core::f32::consts::PI;
+
 use num_complex::Complex;
-use rustfft::FftPlanner;
-use std::f32::consts::PI;
+#[cfg(not(feature = "std"))]
+use num_traits::Float;
+
+use super::Protocol;
+use crate::core::fft::default_planner;
 
 /// One synchronisation candidate.
 #[derive(Debug, Clone)]
@@ -113,8 +119,8 @@ impl Spectrogram {
 pub fn compute_spectra<P: Protocol>(audio: &[i16]) -> Spectrogram {
     let d = SyncDims::of::<P>();
     let fac = 1.0f32 / 300.0;
-    let mut planner = FftPlanner::<f32>::new();
-    let fft = planner.plan_fft_forward(d.nfft1);
+    let mut planner = default_planner();
+    let fft = planner.plan_forward(d.nfft1);
 
     let mut data = vec![0.0f32; d.nh1 * d.nhsym];
     let mut buf = vec![Complex::new(0.0f32, 0.0); d.nfft1];
@@ -333,8 +339,8 @@ pub fn coarse_sync<P: Protocol>(
             let a_near = (a.freq_hz - fhint).abs() <= 10.0;
             let b_near = (b.freq_hz - fhint).abs() <= 10.0;
             match (a_near, b_near) {
-                (true, false) => std::cmp::Ordering::Less,
-                (false, true) => std::cmp::Ordering::Greater,
+                (true, false) => core::cmp::Ordering::Less,
+                (false, true) => core::cmp::Ordering::Greater,
                 _ => b.score.partial_cmp(&a.score).unwrap(),
             }
         });

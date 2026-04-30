@@ -48,27 +48,56 @@
 //! }
 //! ```
 
-// Decode-side modules pull `rustfft` (directly or via `core::*`).
-// Gated behind `std` for the embedded port; embedded `wave_gen` /
-// `message` / `ldpc` / `params` / `hash_table` stay available for
-// TX-only / FEC-only use cases on RP2350 / ESP32-S3.
-#[cfg(feature = "std")]
+// Decode-side modules go through `core::fft` (FFT trait) and the
+// shared `core::pipeline`; gated on the FFT meta-feature so embedded
+// builds with `fft-microfft` or `fft-extern` get them. `wave_gen`,
+// `message`, `ldpc`, `params`, `hash_table` stay available for TX-only
+// / FEC-only use cases without any FFT backend.
+#[cfg(any(
+    feature = "fft-rustfft",
+    feature = "fft-microfft",
+    feature = "fft-extern"
+))]
 pub mod decode;
-#[cfg(feature = "std")]
+#[cfg(any(
+    feature = "fft-rustfft",
+    feature = "fft-microfft",
+    feature = "fft-extern"
+))]
 pub mod downsample;
-#[cfg(feature = "std")]
+#[cfg(any(
+    feature = "fft-rustfft",
+    feature = "fft-microfft",
+    feature = "fft-extern"
+))]
 pub mod equalizer;
 pub mod hash_table;
 pub mod ldpc;
-#[cfg(feature = "std")]
+#[cfg(any(
+    feature = "fft-rustfft",
+    feature = "fft-microfft",
+    feature = "fft-extern"
+))]
 pub mod llr;
 pub mod message;
 pub mod params;
-#[cfg(feature = "std")]
+#[cfg(any(
+    feature = "fft-rustfft",
+    feature = "fft-microfft",
+    feature = "fft-extern"
+))]
 pub mod resample;
-#[cfg(feature = "std")]
+#[cfg(any(
+    feature = "fft-rustfft",
+    feature = "fft-microfft",
+    feature = "fft-extern"
+))]
 pub mod subtract;
-#[cfg(feature = "std")]
+#[cfg(any(
+    feature = "fft-rustfft",
+    feature = "fft-microfft",
+    feature = "fft-extern"
+))]
 pub mod sync;
 pub mod wave_gen;
 

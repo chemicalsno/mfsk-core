@@ -264,6 +264,25 @@ mod microfft_backend {
 #[cfg(feature = "fft-microfft")]
 pub use microfft_backend::MicroFftPlanner;
 
+// ── Convenience constructor ──────────────────────────────────────────
+
+/// Construct the default [`FftPlanner`] for the active FFT backend
+/// feature. Resolution order: `fft-rustfft` > `fft-microfft`. With
+/// only `fft-extern` enabled the caller must construct their planner
+/// manually; this function is not provided in that mode.
+#[cfg(any(feature = "fft-rustfft", feature = "fft-microfft"))]
+#[inline]
+pub fn default_planner() -> Box<dyn FftPlanner> {
+    #[cfg(feature = "fft-rustfft")]
+    {
+        Box::new(RustFftPlanner::new())
+    }
+    #[cfg(all(not(feature = "fft-rustfft"), feature = "fft-microfft"))]
+    {
+        Box::new(MicroFftPlanner::new())
+    }
+}
+
 // ── tests ────────────────────────────────────────────────────────────
 
 #[cfg(all(test, feature = "fft-rustfft"))]

@@ -6,6 +6,8 @@
 //! single-frequency entry points are not provided here — they can be added
 //! once the generic pipeline grows AP support.
 
+use alloc::vec::Vec;
+
 use super::Ft4;
 use crate::core::dsp::downsample::DownsampleCfg;
 use crate::core::dsp::subtract::SubtractCfg;

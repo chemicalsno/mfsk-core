@@ -6,9 +6,15 @@
 //! normalised variant. Parameterised over any [`Protocol`]: NTONES,
 //! BITS_PER_SYMBOL, and the SYNC_BLOCKS layout drive the inner loops.
 
-use super::Protocol;
+use alloc::vec;
+use alloc::vec::Vec;
+
 use num_complex::Complex;
-use rustfft::FftPlanner;
+#[cfg(not(feature = "std"))]
+use num_traits::Float;
+
+use super::Protocol;
+use crate::core::fft::default_planner;
 
 // ──────────────────────────────────────────────────────────────────────────
 // LLR bundle
@@ -48,8 +54,8 @@ pub fn symbol_spectra<P: Protocol>(cd0: &[Complex<f32>], i_start: usize) -> Vec<
     let n_sym = P::N_SYMBOLS as usize;
     let ds_spb = (P::NSPS / P::NDOWN) as usize;
 
-    let mut planner = FftPlanner::<f32>::new();
-    let fft = planner.plan_fft_forward(ds_spb);
+    let mut planner = default_planner();
+    let fft = planner.plan_forward(ds_spb);
 
     let mut cs = vec![Complex::new(0.0f32, 0.0); n_sym * ntones];
     let mut buf = vec![Complex::new(0.0f32, 0.0); ds_spb];

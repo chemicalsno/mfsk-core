@@ -5,6 +5,10 @@
 //! Internally flattens to the row-major layout used by the generic
 //! implementation, then re-inflates the output.
 
+use alloc::boxed::Box;
+use alloc::vec;
+use alloc::vec::Vec;
+
 use super::Ft8;
 use num_complex::Complex;
 

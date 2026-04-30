@@ -6,6 +6,8 @@
 //! benchmarks) continue working without change. The heavy lifting lives in
 //! `mfsk-core` so FT4 and future LDPC-family modes reuse it.
 
+use alloc::vec::Vec;
+
 use crate::core::dsp::downsample::{self as g, DownsampleCfg};
 use num_complex::Complex;
 

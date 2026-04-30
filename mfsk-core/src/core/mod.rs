@@ -30,15 +30,29 @@
 pub mod dsp;
 pub mod equalize;
 pub mod fft;
-// Decode-side modules that pull `rustfft`. Gated behind `std` for the
-// embedded port; the no_std + alloc build keeps `protocol`, `tx`, and
-// the synthesis-side dsp helpers available so embedded TX builds.
-#[cfg(feature = "std")]
+// Decode-side modules go through the `core::fft` trait abstraction;
+// gated on the meta-feature (true if any of fft-rustfft / fft-microfft
+// / fft-extern is on). Embedded TX-only builds with no FFT backend
+// still get `protocol`, `tx`, equalize, and the synthesis-side dsp
+// helpers (gfsk, resample, subtract).
+#[cfg(any(
+    feature = "fft-rustfft",
+    feature = "fft-microfft",
+    feature = "fft-extern"
+))]
 pub mod llr;
-#[cfg(feature = "std")]
+#[cfg(any(
+    feature = "fft-rustfft",
+    feature = "fft-microfft",
+    feature = "fft-extern"
+))]
 pub mod pipeline;
 pub mod protocol;
-#[cfg(feature = "std")]
+#[cfg(any(
+    feature = "fft-rustfft",
+    feature = "fft-microfft",
+    feature = "fft-extern"
+))]
 pub mod sync;
 pub mod tx;
 

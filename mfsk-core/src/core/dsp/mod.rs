@@ -4,19 +4,26 @@
 //! it operates on raw sample buffers, sample rates, and target frequencies.
 //! Protocol-aware DSP (sync correlators, LLR, etc.) lives outside `dsp`.
 
-// rustfft consumers — gated behind `std` until the FFT trait
-// abstraction lands. Embedded (`alloc`-only) builds still get the
-// synthesis-side helpers (gfsk, resample) below.
-#[cfg(feature = "std")]
+// `downsample` requires an `Fft` backend; gate on the meta-feature
+// (true if any of fft-rustfft / fft-microfft / fft-extern is on).
+// `subtract` is FFT-free now (no rustfft consumer); always available
+// once we have alloc.
+#[cfg(any(
+    feature = "fft-rustfft",
+    feature = "fft-microfft",
+    feature = "fft-extern"
+))]
 pub mod downsample;
 pub mod gfsk;
 pub mod resample;
-#[cfg(feature = "std")]
 pub mod subtract;
 
-#[cfg(feature = "std")]
+#[cfg(any(
+    feature = "fft-rustfft",
+    feature = "fft-microfft",
+    feature = "fft-extern"
+))]
 pub use downsample::{DownsampleCfg, build_fft_cache, downsample, downsample_cached};
 pub use gfsk::{GfskCfg, synth_f32, synth_i16};
 pub use resample::{resample_f32_to_12k, resample_to_12k};
-#[cfg(feature = "std")]
 pub use subtract::{SubtractCfg, subtract_tones};

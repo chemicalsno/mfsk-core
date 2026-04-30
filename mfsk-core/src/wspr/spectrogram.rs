@@ -11,9 +11,15 @@
 //! - n_freq = NSPS/2 = 4096 bins (1.4648 Hz each, Nyquist at 6 kHz)
 //! - Storage: ~700 × 4096 × 4 bytes ≈ 11 MB per slot.
 
-use crate::core::ModulationParams;
+use alloc::vec;
+use alloc::vec::Vec;
+
 use num_complex::Complex;
-use rustfft::FftPlanner;
+#[cfg(not(feature = "std"))]
+use num_traits::Float;
+
+use crate::core::ModulationParams;
+use crate::core::fft::default_planner;
 
 use super::Wspr;
 
@@ -54,9 +60,8 @@ impl Spectrogram {
         let n_time = (audio.len() - nsps) / t_step + 1;
 
         let mut mags_sqr = vec![0f32; n_time * n_freq];
-        let mut planner = FftPlanner::<f32>::new();
-        let fft = planner.plan_fft_forward(nsps);
-        let mut scratch = vec![Complex::new(0f32, 0f32); fft.get_inplace_scratch_len()];
+        let mut planner = default_planner();
+        let fft = planner.plan_forward(nsps);
         let mut buf: Vec<Complex<f32>> = vec![Complex::new(0f32, 0f32); nsps];
 
         for t in 0..n_time {
@@ -64,7 +69,7 @@ impl Spectrogram {
             for (slot, &s) in buf.iter_mut().zip(&audio[start..start + nsps]) {
                 *slot = Complex::new(s, 0.0);
             }
-            fft.process_with_scratch(&mut buf, &mut scratch);
+            fft.process(&mut buf);
             let row = &mut mags_sqr[t * n_freq..(t + 1) * n_freq];
             for (slot, c) in row.iter_mut().zip(buf.iter().take(n_freq)) {
                 *slot = c.norm_sqr();
@@ -75,7 +80,7 @@ impl Spectrogram {
         // discarding the top 5 % to avoid strong signals dragging the
         // estimate up. Cheap approximation of median-filter noise floor.
         let mut sorted = mags_sqr.clone();
-        sorted.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        sorted.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
         let keep = (sorted.len() as f32 * 0.95) as usize;
         let noise_per_bin = if keep > 0 {
             sorted[..keep].iter().sum::<f32>() / keep as f32

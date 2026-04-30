@@ -1,6 +1,12 @@
 /// High-level FT8 decode pipeline.
 ///
 /// Chains: downsample → coarse_sync → fine_sync → LLR → BP decode
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+
+#[cfg(not(feature = "std"))]
+use num_traits::Float;
+
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 

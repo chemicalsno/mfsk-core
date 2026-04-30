@@ -4,6 +4,8 @@
 //! sample, runs demod → deinterleave → Fano → message unpack. No coarse
 //! search here; a later module will wrap this with a (freq × time) scan.
 
+use alloc::vec::Vec;
+
 use crate::msg::WsprMessage;
 
 use super::search::{SearchParams, coarse_search};

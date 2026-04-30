@@ -21,6 +21,11 @@
 //! (sub-bin freq + sub-quarter-symbol time via parabolic interpolation
 //! on the score grid). Not required for typical crowded-band decoding.
 
+use alloc::vec::Vec;
+
+#[cfg(not(feature = "std"))]
+use num_traits::Float;
+
 use crate::core::ModulationParams;
 
 use super::Wspr;
@@ -149,7 +154,7 @@ pub fn coarse_search_on_spec(
     out.sort_unstable_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
+            .unwrap_or(core::cmp::Ordering::Equal)
     });
     out.truncate(params.max_candidates);
     out
