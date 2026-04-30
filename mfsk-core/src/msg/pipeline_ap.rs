@@ -11,6 +11,13 @@
 //! known (CQ + DX scenario) and can exceed that when a specific response
 //! token (RRR / RR73 / 73) is also locked.
 
+use alloc::vec;
+use alloc::vec::Vec;
+
+use num_complex::Complex;
+#[cfg(not(feature = "std"))]
+use num_traits::Float;
+
 use crate::core::dsp::downsample::{DownsampleCfg, build_fft_cache, downsample_cached};
 use crate::core::equalize::{EqMode, equalize_local};
 use crate::core::llr::{compute_llr, compute_snr_db, symbol_spectra, sync_quality};
@@ -18,7 +25,6 @@ use crate::core::pipeline::{DecodeDepth, DecodeResult, DecodeStrictness};
 use crate::core::sync::{SyncCandidate, coarse_sync, fine_sync_power_per_block, refine_candidate};
 use crate::core::tx::codeword_to_itone;
 use crate::core::{FecCodec, FecOpts, Protocol};
-use num_complex::Complex;
 
 use super::ap::{ApHint, WsjtApCompatible};
 use super::wsjt77::{is_plausible_message, unpack77};

@@ -9,6 +9,9 @@
 //! path which calls them directly via `super::ft8::ldpc`'s re-export
 //! façade.
 
+use alloc::vec;
+use alloc::vec::Vec;
+
 use super::bp::check_crc14;
 use super::params::{Ldpc174_91Params, LdpcParams};
 use super::{LDPC_K, LDPC_N};
@@ -648,7 +651,7 @@ pub fn osd_decode_generic<P: LdpcParams>(
         llr[b]
             .abs()
             .partial_cmp(&llr[a].abs())
-            .unwrap_or(std::cmp::Ordering::Equal)
+            .unwrap_or(core::cmp::Ordering::Equal)
     });
 
     // ── Step 2: build permuted generator matrix G'[K][N] (flat) ─────

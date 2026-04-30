@@ -8,6 +8,9 @@
 //! GFSK waveform synthesis lives in [`super::dsp::gfsk`] — the `tones_to_*`
 //! helpers there consume the output of this module.
 
+use alloc::vec;
+use alloc::vec::Vec;
+
 use super::Protocol;
 
 /// Ordered list of `(first_data_symbol, chunk_len_in_symbols)` covering

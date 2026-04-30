@@ -28,6 +28,9 @@ use crate::core::{FrameLayout, ModulationParams, Protocol, ProtocolId, SyncBlock
 use crate::fec::Ldpc174_91;
 use crate::msg::Wsjt77Message;
 
+// Decode pulls `core::pipeline` (FFT trait); gated on the FFT
+// meta-feature. `encode` is FFT-free and always available.
+#[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub mod decode;
 pub mod encode;
 

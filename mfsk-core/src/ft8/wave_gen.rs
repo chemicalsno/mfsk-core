@@ -10,6 +10,8 @@
 //!            →  Gray-map 3 bits/symbol  →  itone[79]
 //!            →  phase accumulation  →  PCM f32 / i16
 //! ```
+use alloc::vec::Vec;
+
 use super::Ft8;
 use super::{
     ldpc::osd::ldpc_encode,
@@ -53,18 +55,43 @@ const FT8_GFSK: crate::core::dsp::gfsk::GfskCfg = crate::core::dsp::gfsk::GfskCf
     ramp_samples: 1920 / 8,
 };
 
-/// Synthesise a 12 000 Hz f32 PCM waveform from an FT8 tone sequence.
+/// Output sample count for FT8 waveform synthesis (79 × 1920 = 151 680).
+pub const TONES_OUTPUT_LEN: usize = NN * 1920;
+
+/// Synthesise a 12 000 Hz f32 PCM waveform from an FT8 tone sequence
+/// into a caller-provided buffer. **No allocation of the output**;
+/// `out` must have length [`TONES_OUTPUT_LEN`].
 ///
 /// Matches WSJT-X `gen_ft8wave.f90`: 3-symbol Gaussian pulse shape with
 /// BT=2.0, dummy ramp-in/out symbols, and a half-cosine envelope on the
-/// outermost `nsps/8` samples. Output length is `79 × 1920 = 151 680`.
+/// outermost `nsps/8` samples.
+///
+/// # Panics
+///
+/// Panics if `out.len() != TONES_OUTPUT_LEN`.
+#[inline]
+pub fn tones_to_f32_into(out: &mut [f32], itone: &[u8; NN], f0: f32, amplitude: f32) {
+    crate::core::dsp::gfsk::synth_f32_into(out, itone, f0, amplitude, &FT8_GFSK)
+}
+
+/// Synthesise a 12 000 Hz f32 PCM waveform from an FT8 tone sequence.
+/// Vec-returning convenience wrapper for [`tones_to_f32_into`].
 #[inline]
 pub fn tones_to_f32(itone: &[u8; NN], f0: f32, amplitude: f32) -> Vec<f32> {
     crate::core::dsp::gfsk::synth_f32(itone, f0, amplitude, &FT8_GFSK)
 }
 
+/// Synthesise into a caller-provided i16 PCM buffer. Peak value
+/// written equals `amplitude_i16` (0..32767). `out.len()` must equal
+/// [`TONES_OUTPUT_LEN`].
+#[inline]
+pub fn tones_to_i16_into(out: &mut [i16], itone: &[u8; NN], f0: f32, amplitude_i16: i16) {
+    crate::core::dsp::gfsk::synth_i16_into(out, itone, f0, amplitude_i16, &FT8_GFSK)
+}
+
 /// Synthesise and return a 16-bit PCM waveform. Peak value of the returned
-/// signal equals `amplitude_i16` (0..32767).
+/// signal equals `amplitude_i16` (0..32767). Vec-returning convenience
+/// wrapper for [`tones_to_i16_into`].
 #[inline]
 pub fn tones_to_i16(itone: &[u8; NN], f0: f32, amplitude_i16: i16) -> Vec<i16> {
     crate::core::dsp::gfsk::synth_i16(itone, f0, amplitude_i16, &FT8_GFSK)

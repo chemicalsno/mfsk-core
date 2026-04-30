@@ -29,9 +29,18 @@
 
 pub mod dsp;
 pub mod equalize;
+pub mod fft;
+// Decode-side modules go through the `core::fft` trait abstraction;
+// gated on the meta-feature (true if any of fft-rustfft / fft-microfft
+// / fft-extern is on). Embedded TX-only builds with no FFT backend
+// still get `protocol`, `tx`, equalize, and the synthesis-side dsp
+// helpers (gfsk, resample, subtract).
+#[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub mod llr;
+#[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub mod pipeline;
 pub mod protocol;
+#[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub mod sync;
 pub mod tx;
 

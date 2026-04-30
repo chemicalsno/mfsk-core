@@ -10,6 +10,14 @@
 //! [`bp_decode`] that pins `P = Ldpc174_91Params` — same behaviour as
 //! before, just routed through the generic body.
 
+use alloc::vec;
+use alloc::vec::Vec;
+
+// Float methods (.atanh / .signum) are inherent on f32 under std but
+// require this trait under no_std (where libm provides them).
+#[cfg(not(feature = "std"))]
+use num_traits::Float;
+
 use super::params::{Ldpc174_91Params, LdpcParams};
 use super::{LDPC_K, LDPC_N};
 

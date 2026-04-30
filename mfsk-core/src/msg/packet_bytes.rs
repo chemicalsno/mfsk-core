@@ -37,6 +37,8 @@
 //! [`MessageCodec::Unpacked = Vec<u8>`] — the codec's `unpack`
 //! returns the payload bytes only (length and CRC fields stripped).
 
+use alloc::vec::Vec;
+
 use crate::core::{DecodeContext, MessageCodec, MessageFields};
 
 /// Maximum payload length in bytes per frame.

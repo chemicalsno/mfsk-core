@@ -27,8 +27,15 @@
 //! strengths. Keeping it in a runtime struct lets callers express values that
 //! are awkward to pin to associated constants.
 
+use alloc::vec;
+use alloc::vec::Vec;
+use core::iter;
+
 use num_complex::Complex;
-use rustfft::FftPlanner;
+#[cfg(not(feature = "std"))]
+use num_traits::Float;
+
+use crate::core::fft::default_planner;
 
 /// Runtime parameters shared by [`downsample`], [`downsample_cached`], and
 /// [`build_fft_cache`]. Callers typically keep one instance per protocol.
@@ -77,11 +84,11 @@ pub fn build_fft_cache(audio: &[i16], cfg: &DownsampleCfg) -> Vec<Complex<f32>> 
     let mut x: Vec<Complex<f32>> = audio
         .iter()
         .map(|&s| Complex::new(s as f32, 0.0))
-        .chain(std::iter::repeat(Complex::new(0.0, 0.0)))
+        .chain(iter::repeat(Complex::new(0.0, 0.0)))
         .take(cfg.fft1_size)
         .collect();
-    let mut planner = FftPlanner::<f32>::new();
-    planner.plan_fft_forward(cfg.fft1_size).process(&mut x);
+    let mut planner = default_planner();
+    planner.plan_forward(cfg.fft1_size).process(&mut x);
     x
 }
 
@@ -109,7 +116,7 @@ pub fn downsample_cached(
     cfg: &DownsampleCfg,
 ) -> Vec<Complex<f32>> {
     debug_assert_eq!(fft_cache.len(), cfg.fft1_size);
-    let mut planner = FftPlanner::<f32>::new();
+    let mut planner = default_planner();
 
     let df = cfg.bin_hz();
     let baud = cfg.tone_spacing_hz;
@@ -134,7 +141,7 @@ pub fn downsample_cached(
     if et > 1 {
         let n = et - 1;
         let taper: Vec<f32> = (0..et)
-            .map(|i| 0.5 * (1.0 + (i as f32 * std::f32::consts::PI / n as f32).cos()))
+            .map(|i| 0.5 * (1.0 + (i as f32 * core::f32::consts::PI / n as f32).cos()))
             .collect();
         for i in 0..et.min(k) {
             c1[i] *= taper[n - i];
@@ -151,7 +158,7 @@ pub fn downsample_cached(
     c1.rotate_left(shift);
 
     // Inverse FFT.
-    planner.plan_fft_inverse(cfg.fft2_size).process(&mut c1);
+    planner.plan_inverse(cfg.fft2_size).process(&mut c1);
 
     // Combined scale factor.
     let fac = 1.0 / ((cfg.fft1_size as f32) * (cfg.fft2_size as f32)).sqrt();

@@ -4,8 +4,10 @@
 //! modulation parameters (tone spacing, samples/symbol, BT) come from
 //! compile-time constants.
 
+use alloc::vec::Vec;
+
 use super::Ft4;
-use crate::core::dsp::gfsk::{GfskCfg, synth_f32, synth_i16};
+use crate::core::dsp::gfsk::{GfskCfg, synth_f32, synth_f32_into, synth_i16, synth_i16_into};
 use crate::core::{FecCodec, FrameLayout, ModulationParams};
 use crate::fec::Ldpc174_91;
 
@@ -43,11 +45,29 @@ pub fn message_to_tones(message77: &[u8; 77]) -> Vec<u8> {
     crate::core::tx::codeword_to_itone::<Ft4>(&cw)
 }
 
-/// Synthesise a 12 kHz f32 PCM waveform from an FT4 tone sequence. Output
-/// length is `N_SYMBOLS × NSPS = 103 × 576 = 59 328` samples.
+/// Output sample count for FT4 waveform synthesis (103 × 576 = 59 328).
+pub const TONES_OUTPUT_LEN: usize = (<Ft4 as FrameLayout>::N_SYMBOLS as usize) * 576;
+
+/// Synthesise into a caller-provided f32 PCM buffer. **No allocation
+/// of the output**; `out.len()` must equal [`TONES_OUTPUT_LEN`].
+pub fn tones_to_f32_into(out: &mut [f32], itone: &[u8], f0: f32, amplitude: f32) {
+    debug_assert_eq!(itone.len(), <Ft4 as FrameLayout>::N_SYMBOLS as usize);
+    synth_f32_into(out, itone, f0, amplitude, &FT4_GFSK)
+}
+
+/// Synthesise a 12 kHz f32 PCM waveform from an FT4 tone sequence.
+/// Vec-returning convenience wrapper for [`tones_to_f32_into`]. Output
+/// length is [`TONES_OUTPUT_LEN`] (= 103 × 576 = 59 328) samples.
 pub fn tones_to_f32(itone: &[u8], f0: f32, amplitude: f32) -> Vec<f32> {
     debug_assert_eq!(itone.len(), <Ft4 as FrameLayout>::N_SYMBOLS as usize);
     synth_f32(itone, f0, amplitude, &FT4_GFSK)
+}
+
+/// Synthesise into a caller-provided i16 PCM buffer. Peak equals
+/// `amplitude_i16`; `out.len()` must equal [`TONES_OUTPUT_LEN`].
+pub fn tones_to_i16_into(out: &mut [i16], itone: &[u8], f0: f32, amplitude_i16: i16) {
+    debug_assert_eq!(itone.len(), <Ft4 as FrameLayout>::N_SYMBOLS as usize);
+    synth_i16_into(out, itone, f0, amplitude_i16, &FT4_GFSK)
 }
 
 /// Synthesise a 16-bit PCM waveform. Peak equals `amplitude_i16`.

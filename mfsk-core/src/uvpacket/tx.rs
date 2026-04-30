@@ -77,6 +77,17 @@ pub fn expected_total_symbols(mode: Mode, n_payload_blocks: u8) -> usize {
     PREAMBLE_LEN + header_sym + payload_sym
 }
 
+/// Output sample count for [`encode`] / [`encode_into`] given a frame
+/// `mode` + `n_payload_blocks`. Embedded callers allocate (or claim
+/// from a pool) `encode_output_len(mode, n_payload_blocks)` samples
+/// and pass them as `out`.
+#[inline]
+pub fn encode_output_len(mode: Mode, n_payload_blocks: u8) -> usize {
+    let nsps = mode.nsps();
+    let rrc_len = RRC_SPAN_SYMS * nsps + 1;
+    expected_total_symbols(mode, n_payload_blocks) * nsps + rrc_len
+}
+
 /// Encode a uvpacket frame to 12 kHz f32 PCM audio.
 ///
 /// `header.mode` selects both the preamble variant and the
@@ -91,12 +102,41 @@ pub fn encode(
     payload: &[u8],
     audio_centre_hz: f32,
 ) -> Result<Vec<f32>, PackError> {
+    let mut audio = vec![0.0f32; encode_output_len(header.mode, header.block_count)];
+    encode_into(&mut audio, header, payload, audio_centre_hz)?;
+    Ok(audio)
+}
+
+/// Encode a uvpacket frame into a caller-provided audio buffer.
+/// **No allocation of the output** — `out` must be sized to
+/// [`encode_output_len`]`(header.mode, header.block_count)`. Internal
+/// scratch buffers (LDPC info / codeword, interleaver staging, RRC
+/// pulse, complex baseband) are still allocated; they total ~few-tens
+/// of KB and matter little next to the I2S DMA buffer the caller
+/// owns.
+///
+/// # Errors / panics
+///
+/// Returns `PackError::PayloadTooLarge` if the payload exceeds the
+/// frame's capacity. Panics if `out.len() != encode_output_len(mode,
+/// block_count)`.
+pub fn encode_into(
+    out: &mut [f32],
+    header: &FrameHeader,
+    payload: &[u8],
+    audio_centre_hz: f32,
+) -> Result<(), PackError> {
     let mode = header.mode;
     let n_blocks = header.block_count as usize;
     let payload_capacity = n_blocks * INFO_BYTES_PER_BLOCK;
     if payload.len() > payload_capacity {
         return Err(PackError::PayloadTooLarge(payload.len()));
     }
+    assert_eq!(
+        out.len(),
+        encode_output_len(mode, header.block_count),
+        "encode_into: out.len() must equal encode_output_len()"
+    );
 
     // 1. Build header bytes (4-byte header word + CRC). The CRC
     //    covers `header_word ++ padded_payload` so the receiver can
@@ -183,25 +223,25 @@ pub fn encode(
         }
     }
 
-    // 10. Upconvert to audio centre, take real part.
-    let mut audio = vec![0.0_f32; total_samples];
+    // 10. Upconvert to audio centre, take real part — written into the
+    //     caller-provided buffer.
     let two_pi_fc_dt = 2.0 * PI * audio_centre_hz / SAMPLE_RATE_HZ;
     for n in 0..total_samples {
         let phase = two_pi_fc_dt * n as f32;
         let (s, c) = phase.sin_cos();
-        audio[n] = baseband[n].re * c - baseband[n].im * s;
+        out[n] = baseband[n].re * c - baseband[n].im * s;
     }
 
     // 11. Peak-normalise to ≤ 1 (the σ-for-Eb/N0 formula assumes
     //     unit peak; RRC + sum-of-symbols can briefly overshoot).
-    let peak = audio.iter().map(|s| s.abs()).fold(0.0_f32, f32::max);
+    let peak = out.iter().map(|s| s.abs()).fold(0.0_f32, f32::max);
     if peak > 1.0 {
         let scale = 1.0 / peak;
-        for s in audio.iter_mut() {
+        for s in out.iter_mut() {
             *s *= scale;
         }
     }
-    Ok(audio)
+    Ok(())
 }
 
 /// Pack `bytes` MSB-first into the leading `8 × bytes.len()` slots

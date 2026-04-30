@@ -7,6 +7,8 @@
 //! agnostic; FT8's tone-7 extrapolation becomes a degenerate linear
 //! extrapolation when any tone is unobserved.
 
+use alloc::vec::Vec;
+
 use super::Ft8;
 use num_complex::Complex;
 

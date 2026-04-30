@@ -22,6 +22,9 @@
 //! distinguish the types; the convenience `to_string()` impl yields the
 //! familiar `"CALL GRID DBM"` tuple layout that WSPRnet expects.
 
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 use core::fmt;
 
 const POWERS: &[i32] = &[

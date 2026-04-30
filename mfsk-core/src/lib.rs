@@ -259,6 +259,14 @@
     clippy::needless_range_loop,
     clippy::unusual_byte_groupings
 )]
+// `no_std` build is gated on the absence of the default `std` feature.
+// `alloc` is unconditional — every protocol module uses Vec / String,
+// so making it optional would just push the dep up to every caller.
+// (The `alloc` Cargo feature still exists as a no-op alias kept around
+// for back-compat with consumers that listed it explicitly.)
+#![cfg_attr(not(feature = "std"), no_std)]
+
+extern crate alloc;
 
 /// Crate version string, taken from Cargo.toml at compile time. Useful
 /// for FFI / WASM consumers that need to verify which mfsk-core they

@@ -508,6 +508,8 @@ impl Rs63_12 {
 // in `jt65-core` and uses `decode_jt65` / `decode_native` directly.
 // ─────────────────────────────────────────────────────────────────────────
 
+use alloc::vec::Vec;
+
 use crate::core::{FecOpts, FecResult};
 
 impl super::FecCodec for Rs63_12 {

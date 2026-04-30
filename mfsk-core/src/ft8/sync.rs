@@ -5,6 +5,8 @@
 //! signatures so `decode`, the bench harness, and any out-of-tree callers
 //! keep working unchanged. All heavy lifting lives in `mfsk-core::sync`.
 
+use alloc::vec::Vec;
+
 use super::Ft8;
 use num_complex::Complex;
 

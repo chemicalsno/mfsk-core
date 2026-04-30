@@ -6,7 +6,11 @@
 //! Protocol-agnostic — the caller supplies tone sequence, sample rate, tone
 //! spacing and timing so the same routine serves FT8/FT4/FT2/FST4.
 
-use std::f32::consts::PI;
+use alloc::vec;
+use alloc::vec::Vec;
+use core::f32::consts::PI;
+#[cfg(not(feature = "std"))]
+use num_traits::Float;
 
 /// Fixed DSP parameters for a single subtraction call.
 #[derive(Clone, Copy, Debug)]

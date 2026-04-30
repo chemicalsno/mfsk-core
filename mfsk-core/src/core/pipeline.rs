@@ -5,8 +5,16 @@
 //! (which depends on the 77-bit WSJT message bit layout) lives in
 //! protocol-specific crates.
 
+use alloc::boxed::Box;
+use alloc::vec;
+use alloc::vec::Vec;
+
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
+
+use num_complex::Complex;
+#[cfg(not(feature = "std"))]
+use num_traits::Float;
 
 use super::dsp::downsample::{DownsampleCfg, build_fft_cache, downsample_cached};
 use super::dsp::subtract::{SubtractCfg, subtract_tones};
@@ -15,7 +23,6 @@ use super::llr::{compute_llr, compute_snr_db, symbol_spectra, sync_quality};
 use super::sync::{SyncCandidate, coarse_sync, fine_sync_power_per_block, refine_candidate};
 use super::tx::codeword_to_itone;
 use super::{FecCodec, FecOpts, MessageCodec, Protocol};
-use num_complex::Complex;
 
 /// FFT cache for the initial large forward transform; reusable across passes.
 pub type FftCache = Vec<Complex<f32>>;
@@ -477,7 +484,14 @@ pub fn decode_frame_subtract<P: Protocol>(
         }
 
         for r in &deduped {
-            let gain = if r.sync_cv > 0.3 { 0.5 } else { 1.0 };
+            // Arithmetic form (1.0 - 0.5*qsb) instead of the obvious
+            // `if cond { 0.5 } else { 1.0 }` to dodge an Xtensa Rust
+            // 1.95.0.0 LLVM instruction-selection SIGSEGV on the
+            // `[2 x float] [1.0, 0.5]` constant pool the select form
+            // generates. See `crate::ft8::decode::qsb_partial_gain`
+            // for the same workaround applied to the FT8 SIC path.
+            let qsb = (r.sync_cv > 0.3) as u32 as f32;
+            let gain = 1.0 - 0.5 * qsb;
             let tones = encode_tones_for_snr::<P>(&r.info, &fec);
             subtract_tones(&mut residual, &tones, r.freq_hz, r.dt_sec, gain, sub_cfg);
         }

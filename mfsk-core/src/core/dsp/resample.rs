@@ -3,6 +3,11 @@
 //! Used at the decode entry point so the rest of the pipeline can
 //! assume a fixed 12 000 Hz sample rate.
 
+use alloc::vec::Vec;
+
+#[cfg(not(feature = "std"))]
+use num_traits::Float;
+
 const TARGET_RATE: f64 = 12_000.0;
 
 /// Resample `samples` from `src_rate` Hz to 12 000 Hz using linear interpolation.

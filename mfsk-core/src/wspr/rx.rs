@@ -25,9 +25,15 @@
 //! the nominal audio start index. A follow-up module will wrap this
 //! with a peak-search over the sync-vector correlation metric.
 
-use crate::core::ModulationParams;
+use alloc::vec;
+use alloc::vec::Vec;
+
 use num_complex::Complex;
-use rustfft::FftPlanner;
+#[cfg(not(feature = "std"))]
+use num_traits::Float;
+
+use crate::core::ModulationParams;
+use crate::core::fft::default_planner;
 
 use super::{WSPR_SYNC_VECTOR, Wspr};
 
@@ -61,9 +67,8 @@ pub fn extract_tone_magnitudes(
         return None;
     }
 
-    let mut planner = FftPlanner::<f32>::new();
-    let fft = planner.plan_fft_forward(nsps);
-    let mut scratch = vec![Complex::new(0.0f32, 0.0); fft.get_inplace_scratch_len()];
+    let mut planner = default_planner();
+    let fft = planner.plan_forward(nsps);
     let mut buf: Vec<Complex<f32>> = vec![Complex::new(0.0f32, 0.0); nsps];
 
     let mut mags = Vec::with_capacity(162);
@@ -75,7 +80,9 @@ pub fn extract_tone_magnitudes(
         for (slot, &s) in buf.iter_mut().zip(&audio[sym_start..sym_start + nsps]) {
             *slot = Complex::new(s, 0.0);
         }
-        fft.process_with_scratch(&mut buf, &mut scratch);
+        // The trait does in-place; allocates its own scratch internally
+        // (rustfft) or operates true in-place (microfft).
+        fft.process(&mut buf);
 
         mags.push([
             buf[base_bin].norm(),

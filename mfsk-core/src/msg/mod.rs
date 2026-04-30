@@ -17,6 +17,9 @@ pub mod hash_table;
 pub mod jt72;
 #[cfg(feature = "packet-bytes")]
 pub mod packet_bytes;
+// Decoder helper that wires `core::pipeline` (FFT-trait); gated on
+// the FFT meta-feature so embedded-rx (alloc + microfft) gets it.
+#[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub mod pipeline_ap;
 #[cfg(feature = "q65")]
 pub mod q65;
@@ -31,6 +34,10 @@ pub use packet_bytes::PacketBytesMessage;
 #[cfg(feature = "q65")]
 pub use q65::Q65Message;
 pub use wspr::{Wspr50Message, WsprMessage};
+
+use alloc::format;
+use alloc::string::String;
+use alloc::vec::Vec;
 
 use crate::core::{DecodeContext, MessageCodec, MessageFields};
 
