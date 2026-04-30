@@ -731,7 +731,7 @@ pub fn decode_frame_subtract(
             // QSB gate: if Costas-array power CV > 0.3 the channel is time-varying
             // and the amplitude estimate is less accurate — use half gain to avoid
             // over-subtraction artefacts that would corrupt later passes.
-            let sub_gain = if r.sync_cv > 0.3 { 0.5 } else { 1.0 };
+            let sub_gain = qsb_partial_gain(r.sync_cv);
             subtract_signal_weighted(&mut residual, r, sub_gain);
         }
         all_results.extend(new);
@@ -790,7 +790,7 @@ pub fn decode_frame_subtract_with_known(
         );
 
         for r in &new {
-            let sub_gain = if r.sync_cv > 0.3 { 0.5 } else { 1.0 };
+            let sub_gain = qsb_partial_gain(r.sync_cv);
             subtract_signal_weighted(&mut residual, r, sub_gain);
         }
         all_results.extend(new);
@@ -872,6 +872,23 @@ pub fn decode_sniper_ap(
 /// This is particularly effective when 2–3 stronger stations reside within the
 /// 500 Hz BPF window alongside the target.  Falls back to a single-pass result
 /// when no interferers are found (zero extra cost).
+/// Pick the partial-subtraction gain for QSB-affected hits: 0.5 if
+/// `sync_cv > 0.3`, else 1.0.
+///
+/// Written as `1.0 - 0.5 * (cond as f32)` instead of the obvious
+/// `if cond { 0.5 } else { 1.0 }` to dodge an Xtensa Rust 1.95.0.0
+/// LLVM bug (instruction-selection SIGSEGV on the `[2 x float]
+/// [1.0, 0.5]` constant pool that LLVM materialises for the
+/// f32-valued select). The arithmetic form keeps the two constants
+/// as immediates (or at least in separate single-element pools) and
+/// LLVM lowers it to a normal compare + multiply + subtract on the
+/// Xtensa FPU.
+#[inline]
+fn qsb_partial_gain(sync_cv: f32) -> f32 {
+    let qsb = (sync_cv > 0.3) as u32 as f32;
+    1.0 - 0.5 * qsb
+}
+
 pub fn decode_sniper_sic(
     audio: &[i16],
     target_freq: f32,
@@ -889,7 +906,7 @@ pub fn decode_sniper_sic(
     for r in &pass1 {
         if (r.freq_hz - target_freq).abs() > 25.0 {
             // QSB gate: partial subtraction for time-varying channels.
-            let gain = if r.sync_cv > 0.3 { 0.5 } else { 1.0 };
+            let gain = qsb_partial_gain(r.sync_cv);
             subtract_signal_weighted(&mut residual, r, gain);
             subtracted = true;
         }
