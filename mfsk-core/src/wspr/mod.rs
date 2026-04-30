@@ -38,50 +38,22 @@ use crate::msg::Wspr50Message;
 // Decode-side modules go through `core::fft` (FFT trait); gated on
 // the FFT meta-feature. `tx` (synthesis) and `sync_vector` (a const
 // table) stay available for TX-only embedded WSPR beacons.
-#[cfg(any(
-    feature = "fft-rustfft",
-    feature = "fft-microfft",
-    feature = "fft-extern"
-))]
+#[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub mod decode;
-#[cfg(any(
-    feature = "fft-rustfft",
-    feature = "fft-microfft",
-    feature = "fft-extern"
-))]
+#[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub mod rx;
-#[cfg(any(
-    feature = "fft-rustfft",
-    feature = "fft-microfft",
-    feature = "fft-extern"
-))]
+#[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub mod search;
-#[cfg(any(
-    feature = "fft-rustfft",
-    feature = "fft-microfft",
-    feature = "fft-extern"
-))]
+#[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub mod spectrogram;
 pub mod sync_vector;
 pub mod tx;
 
-#[cfg(any(
-    feature = "fft-rustfft",
-    feature = "fft-microfft",
-    feature = "fft-extern"
-))]
+#[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub use decode::{WsprDecode, decode_at};
-#[cfg(any(
-    feature = "fft-rustfft",
-    feature = "fft-microfft",
-    feature = "fft-extern"
-))]
+#[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub use rx::demodulate_aligned;
-#[cfg(any(
-    feature = "fft-rustfft",
-    feature = "fft-microfft",
-    feature = "fft-extern"
-))]
+#[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub use search::{SearchParams, SyncCandidate, coarse_search};
 pub use sync_vector::WSPR_SYNC_VECTOR;
 pub use tx::{synthesize_audio, synthesize_type1};

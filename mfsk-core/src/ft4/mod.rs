@@ -30,11 +30,7 @@ use crate::msg::Wsjt77Message;
 
 // Decode pulls `core::pipeline` (FFT trait); gated on the FFT
 // meta-feature. `encode` is FFT-free and always available.
-#[cfg(any(
-    feature = "fft-rustfft",
-    feature = "fft-microfft",
-    feature = "fft-extern"
-))]
+#[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub mod decode;
 pub mod encode;
 

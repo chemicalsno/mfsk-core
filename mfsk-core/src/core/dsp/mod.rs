@@ -8,21 +8,13 @@
 // (true if any of fft-rustfft / fft-microfft / fft-extern is on).
 // `subtract` is FFT-free now (no rustfft consumer); always available
 // once we have alloc.
-#[cfg(any(
-    feature = "fft-rustfft",
-    feature = "fft-microfft",
-    feature = "fft-extern"
-))]
+#[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub mod downsample;
 pub mod gfsk;
 pub mod resample;
 pub mod subtract;
 
-#[cfg(any(
-    feature = "fft-rustfft",
-    feature = "fft-microfft",
-    feature = "fft-extern"
-))]
+#[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub use downsample::{DownsampleCfg, build_fft_cache, downsample, downsample_cached};
 pub use gfsk::{GfskCfg, synth_f32, synth_i16};
 pub use resample::{resample_f32_to_12k, resample_to_12k};

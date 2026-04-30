@@ -53,51 +53,23 @@
 // builds with `fft-microfft` or `fft-extern` get them. `wave_gen`,
 // `message`, `ldpc`, `params`, `hash_table` stay available for TX-only
 // / FEC-only use cases without any FFT backend.
-#[cfg(any(
-    feature = "fft-rustfft",
-    feature = "fft-microfft",
-    feature = "fft-extern"
-))]
+#[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub mod decode;
-#[cfg(any(
-    feature = "fft-rustfft",
-    feature = "fft-microfft",
-    feature = "fft-extern"
-))]
+#[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub mod downsample;
-#[cfg(any(
-    feature = "fft-rustfft",
-    feature = "fft-microfft",
-    feature = "fft-extern"
-))]
+#[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub mod equalizer;
 pub mod hash_table;
 pub mod ldpc;
-#[cfg(any(
-    feature = "fft-rustfft",
-    feature = "fft-microfft",
-    feature = "fft-extern"
-))]
+#[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub mod llr;
 pub mod message;
 pub mod params;
-#[cfg(any(
-    feature = "fft-rustfft",
-    feature = "fft-microfft",
-    feature = "fft-extern"
-))]
+#[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub mod resample;
-#[cfg(any(
-    feature = "fft-rustfft",
-    feature = "fft-microfft",
-    feature = "fft-extern"
-))]
+#[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub mod subtract;
-#[cfg(any(
-    feature = "fft-rustfft",
-    feature = "fft-microfft",
-    feature = "fft-extern"
-))]
+#[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub mod sync;
 pub mod wave_gen;
 

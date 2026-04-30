@@ -35,24 +35,12 @@ pub mod fft;
 // / fft-extern is on). Embedded TX-only builds with no FFT backend
 // still get `protocol`, `tx`, equalize, and the synthesis-side dsp
 // helpers (gfsk, resample, subtract).
-#[cfg(any(
-    feature = "fft-rustfft",
-    feature = "fft-microfft",
-    feature = "fft-extern"
-))]
+#[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub mod llr;
-#[cfg(any(
-    feature = "fft-rustfft",
-    feature = "fft-microfft",
-    feature = "fft-extern"
-))]
+#[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub mod pipeline;
 pub mod protocol;
-#[cfg(any(
-    feature = "fft-rustfft",
-    feature = "fft-microfft",
-    feature = "fft-extern"
-))]
+#[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub mod sync;
 pub mod tx;
 

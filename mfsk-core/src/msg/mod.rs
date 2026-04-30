@@ -19,11 +19,7 @@ pub mod jt72;
 pub mod packet_bytes;
 // Decoder helper that wires `core::pipeline` (FFT-trait); gated on
 // the FFT meta-feature so embedded-rx (alloc + microfft) gets it.
-#[cfg(any(
-    feature = "fft-rustfft",
-    feature = "fft-microfft",
-    feature = "fft-extern"
-))]
+#[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub mod pipeline_ap;
 #[cfg(feature = "q65")]
 pub mod q65;

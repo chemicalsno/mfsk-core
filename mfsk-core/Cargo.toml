@@ -29,24 +29,23 @@ alloc        = []
 full         = ["std", "ft8", "ft4", "fst4", "wspr", "jt9", "jt65", "q65", "packet-bytes", "uvpacket"]
 
 # Embedded presets (no_std + alloc, no rustfft, no rayon).
-# Plumb caller-provided FFT via the `fft-*` features below.
+# `embedded-rx` pulls `fft-extern` so the caller binary supplies an
+# FftPlanner impl (esp-dsp on ESP32-S3, CMSIS-DSP on RP2350, etc).
 embedded-tx  = ["alloc", "ft8", "ft4", "wspr"]
-embedded-rx  = ["alloc", "ft8", "ft4", "wspr", "fft-microfft"]
+embedded-rx  = ["alloc", "ft8", "ft4", "wspr", "fft-extern"]
 
 # Target-specific presets. ESP32-S3 (Xtensa LX7 + HW FPU + esp-dsp ASM,
 # typical 8 MB PSRAM module) is the embedded reference platform; this
 # alias bundles the right baseline so caller crates only have to flip
-# one feature. ESP-IDF callers can plug in esp-dsp as the FFT backend
-# via the `fft-extern` feature (caller provides the `Fft` trait impl).
+# one feature.
 esp32s3      = ["embedded-rx"]
 
-# FFT backend selection. `mfsk-core::core::fft::Fft` is the trait
-# every decode-side caller talks to; one of these features must be on
-# whenever a feature pulling decode is active (rustfft default for
-# std builds; microfft for embedded narrow-band; extern when caller
-# provides its own impl, e.g. esp-dsp via esp-idf-sys on ESP32-S3).
+# FFT backend selection. `mfsk-core::core::fft::FftPlanner` is the
+# trait every decode-side caller talks to; one of these features must
+# be on whenever decode-side code is compiled (host gets rustfft;
+# embedded targets bring their own backend through the extern Rust
+# factory `mfsk_core_make_default_fft_planner` — see core::fft docs).
 fft-rustfft  = ["std", "dep:rustfft"]
-fft-microfft = ["alloc", "dep:microfft"]
 fft-extern   = ["alloc"]
 
 ft8          = []
@@ -76,18 +75,12 @@ num-complex = { version = "0.4", default-features = false, features = ["libm"] }
 # no-op forwards to the f32 inherent methods.
 num-traits  = { version = "0.2", default-features = false, features = ["libm"] }
 rustfft     = { version = "6", optional = true }
-# Pure-Rust no_std FFT for embedded narrow-band paths. Power-of-2
-# only, ≤ 8192-point with the size feature we enable. Adequate for
-# sniper-mode decoders and WSPR aligned-decode; wide-band FT8/FT4
-# (192k / 92k fft1_size) still needs a vendor backend (esp-dsp on
-# ESP32-S3 via the `fft-extern` feature).
-microfft    = { version = "0.6", optional = true, default-features = false, features = ["size-8192"] }
 crc         = { version = "3", default-features = false }
 rayon       = { version = "1", optional = true }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = [
-    'cfg(feature, values("std","alloc","ft8","ft4","fst4","wspr","jt9","jt65","q65","packet-bytes","uvpacket","parallel","osd-deep","eq-fallback","full","embedded-tx","embedded-rx","esp32s3","fft-rustfft","fft-microfft","fft-extern"))',
+    'cfg(feature, values("std","alloc","ft8","ft4","fst4","wspr","jt9","jt65","q65","packet-bytes","uvpacket","parallel","osd-deep","eq-fallback","full","embedded-tx","embedded-rx","esp32s3","fft-rustfft","fft-extern"))',
 ] }
 
 # Build docs.rs with every protocol feature enabled so users browsing
