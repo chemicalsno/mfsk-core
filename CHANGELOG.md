@@ -1,5 +1,80 @@
 # Changelog
 
+## 0.4.1 — embedded port (no_std + alloc, FFT trait, ESP32-S3 PoC)
+
+Adds an embedded-target port without breaking the existing host
+API. Host builds (`--features full`) are byte-identical to 0.4.0.
+
+### What's new
+
+- **`no_std + alloc` builds work end-to-end.** Default features
+  still pull `std` so existing users see no behaviour change; new
+  presets `embedded-tx` (TX synthesis only) and `embedded-rx`
+  (full decode pipeline, requires caller-supplied FFT) build with
+  `--no-default-features` against `xtensa-esp32s3-espidf`,
+  `thumbv8m.main-none-eabihf`, etc.
+- **Pluggable FFT backend via `mfsk_core::core::fft`.** New
+  `Fft` / `FftPlanner` trait pair; the rustfft path stays the host
+  default, embedded callers plug in their own impl through the
+  `fft-extern` feature + an `extern "Rust"` factory function.
+- **Caller-buffer TX APIs.** `*_into(out, …)` variants for FT8 /
+  FT4 / WSPR / uvpacket synthesisers + `*_OUTPUT_LEN` constants
+  let embedded callers drive I2S DMA buffers without per-burst
+  `Vec` allocations. Vec-returning convenience wrappers preserved.
+- **ESP32-S3 PoC binary** at `embedded-poc/esp32s3/` (excluded
+  from the host workspace; uses `+esp` toolchain). Wires
+  `mfsk-core --features fft-extern` to esp-dsp's hand-written
+  Xtensa FFT (`dsps_fft2r_fc32_ae32_`) via `esp-idf-sys`'s
+  managed-component pipeline. Validates the embedded port
+  builds-and-links on real hardware.
+
+### Workarounds bundled
+
+- **Xtensa LLVM 19.1.2 codegen bug**: `if cond { 0.5_f32 }
+  else { 1.0_f32 }` triggers `XtensaISD::PCREL_WRAPPER`
+  instruction-selection SIGSEGV. `mfsk_core::ft8::decode` and
+  `mfsk_core::core::pipeline` rewrite the gain calculation as
+  `1.0 - 0.5 * (cond as u32 as f32)` (functionally identical;
+  PER-sweep tests unchanged).
+
+### New / changed features
+
+| Feature | Default | Notes |
+|---|:---:|---|
+| `std` | ✓ | Already-on for host builds; bundles `alloc`. |
+| `alloc` |   | Bare `no_std + alloc`. |
+| `embedded-tx` |   | `alloc + ft8 + ft4 + wspr` (synth-only). |
+| `embedded-rx` |   | `embedded-tx + fft-extern` (decode-capable). |
+| `esp32s3` |   | Alias for `embedded-rx`. |
+| `fft-rustfft` | ✓ | Host default; pulls `rustfft`. |
+| `fft-extern` |   | Caller supplies `mfsk_core_make_default_fft_planner`. |
+| `parallel` | ✓ | Now requires `std` (rayon is std-only). |
+
+### Implementation notes
+
+- `num-complex` and `crc` switched to `default-features = false`;
+  `num-traits = "0.2", features = ["libm"]` added so call sites
+  can `use num_traits::Float` under no_std.
+- `std::*` references in the decode-side modules replaced with
+  `core::*` / `alloc::*` equivalents. `std::collections::HashMap`
+  in `msg::hash_table` swapped for `alloc::collections::BTreeMap`
+  (small LRU bounded at 1000 entries; O(log n) lookups dwarfed
+  by surrounding LDPC cost).
+- `core::dsp::{downsample, subtract}`, `core::{sync, llr,
+  pipeline}`, `wspr::{rx, spectrogram}`, etc. moved to the FFT
+  trait via `core::fft::default_planner()`.
+
+### Verified
+
+- `cargo test --features full --release -- --include-ignored`
+  passes (262 tests + the PER sweep cells unchanged).
+- `cargo +esp build --target xtensa-esp32s3-espidf
+   --no-default-features --features esp32s3 -Zbuild-std=core,alloc` ✓
+- `cargo build --target thumbv8m.main-none-eabihf
+   --no-default-features --features esp32s3` ✓
+- ESP32-S3 PoC links the esp-dsp ASM FFT through the trait,
+  ELF ~1.5 MB total / ~440 KB code.
+
 ## 0.4.0 — Q65 + abstraction unification
 
 First release on the 0.4 line; cumulative since the 0.2.1 crates.io

@@ -3,7 +3,15 @@ name: CI
 on:
   push:
     branches: [main]
+    # `embedded-poc/**` are stand-alone xtensa / cortex-m binary
+    # crates with their own toolchains. Excluded from the host
+    # workspace and not built by host CI; skip the workflow if the
+    # only changes are inside that tree.
+    paths-ignore:
+      - 'embedded-poc/**'
   pull_request:
+    paths-ignore:
+      - 'embedded-poc/**'
 
 env:
   CARGO_TERM_COLOR: always
