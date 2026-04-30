@@ -1,0 +1,55 @@
+[package]
+name = "mfsk-core-esp32s3"
+version = "0.1.0"
+authors = ["Minoru Tomobe <minoru.tomobe@gmail.com>"]
+edition = "2021"
+resolver = "2"
+rust-version = "1.82"
+
+[[bin]]
+name = "mfsk-core-esp32s3"
+harness = false # do not use the built-in cargo test harness -> resolve rust-analyzer errors
+
+[profile.release]
+# `opt-level = 1` is conservative — Xtensa Rust 1.95.0.0 had an
+# LLVM bug at opt-level = "s"/"z" triggered by certain f32 select
+# patterns. The mfsk-core source was rewritten to dodge the trigger
+# (see `mfsk_core::ft8::decode::qsb_partial_gain`), so size-optimised
+# builds *should* now work; revisit when there's a reason to shrink
+# the ELF further.
+opt-level = 1
+
+[profile.dev]
+debug = true    # Symbols are nice, and they don't increase the size on Flash
+opt-level = 1
+[patch.crates-io]
+esp-idf-sys = { git = "https://github.com/esp-rs/esp-idf-sys.git" }
+esp-idf-hal = { git = "https://github.com/esp-rs/esp-idf-hal.git" }
+esp-idf-svc = { git = "https://github.com/esp-rs/esp-idf-svc.git" }
+
+[dependencies]
+log = "0.4"
+esp-idf-svc = { version = "0.52.1", features = ["critical-section", "embassy-time-driver", "embassy-sync"] }
+# Remove `generic-queue-8` if you plan to use `embassy-time` WITH `embassy-executor`
+embassy-time = { version = "0.5", features = ["generic-queue-8"] }
+
+# Sibling crate inside this repo. Excluded from the host workspace
+# (see top-level Cargo.toml `exclude`) so `cargo build` from the
+# repo root only touches mfsk-core / mfsk-ffi against the host
+# stable toolchain. `fft-extern` lets this binary supply its own
+# FftPlanner (esp-dsp-backed; see `src/esp_dsp_fft.rs`) without
+# mfsk-core pulling rustfft.
+mfsk-core = { path = "../../mfsk-core", default-features = false, features = ["alloc", "ft8", "ft4", "wspr", "fft-extern"] }
+num-complex = { version = "0.4", default-features = false }
+
+[build-dependencies]
+embuild = "0.33"
+
+# Pull in esp-dsp (Espressif's managed component) so the build links
+# its DSP routines (FFT / FIR / dot-product) into the final binary.
+# `esp-idf-sys` will auto-generate the underlying `idf_component.yml`
+# entry and bindgen the C headers we list in `bindings_header`.
+[[package.metadata.esp-idf-sys.extra_components]]
+remote_component = { name = "espressif/esp-dsp", version = "^1.4" }
+bindings_header = "src/bindings.h"
+bindings_module = "esp_dsp"

@@ -1,3 +1,9 @@
 [workspace]
 members  = ["mfsk-core", "mfsk-ffi"]
+# `embedded-poc/*` are stand-alone Cargo projects targeting embedded
+# MCUs (ESP32-S3, RP2350, …) with their own toolchain (`+esp` for
+# Xtensa, etc). They depend on mfsk-core via a path dep but must not
+# be part of the host workspace — otherwise host `cargo build` would
+# try to compile them against the stable toolchain and fail.
+exclude  = ["embedded-poc"]
 resolver = "2"
