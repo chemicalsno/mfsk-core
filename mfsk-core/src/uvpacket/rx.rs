@@ -102,13 +102,17 @@ pub enum DecodeError {
 }
 
 /// Result of a successful frame decode.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DecodedFrame {
     pub app_type: u8,
     pub sequence: u8,
     pub mode: Mode,
     pub block_count: u8,
     pub payload: Vec<u8>,
+    /// WSJT-X-compatible SNR estimate (dB, 2.5 kHz reference
+    /// bandwidth). Floor at −30 dB. Computed from the joint
+    /// amplitude / noise estimator on the long preamble.
+    pub snr_db: f32,
 }
 
 /// AFC configuration.
@@ -499,12 +503,14 @@ fn decode_at_inner(
     all_bytes.extend_from_slice(&decoded_info_bytes);
     let (frame_header, payload_slice) =
         unpack_header(&all_bytes, mode).map_err(DecodeError::Crc)?;
+    let snr_db = compute_snr_2500hz(&stats_full, mode);
     Ok(DecodedFrame {
         app_type: frame_header.app_type,
         sequence: frame_header.sequence,
         mode,
         block_count: frame_header.block_count,
         payload: payload_slice.to_vec(),
+        snr_db,
     })
 }
 
@@ -1077,6 +1083,47 @@ fn estimate_diff_stats(r_diff_preamble: &[Complex32], preamble_bits: &[bool]) ->
         sigma_sq_n_diff,
         residual_rotation,
     }
+}
+
+/// Per-mode calibration constant (dB) absorbing the differential-demod
+/// noise enhancement (`n·n*` term still contributes near threshold)
+/// plus residual MF / RRC scaling not captured in `2·a²/σ²`. Calibrated
+/// against AWGN truth via `tests/uvpacket_snr_calibration.rs`: 20
+/// trials per `(mode, Eb/N0)` cell over `Eb/N0 ∈ {6 .. 22} dB`,
+/// residual `(reported − truth_2500)` averaged within ±0.2 dB across
+/// the sweep range. Indexed by `Mode::header_code()`
+/// — `[UltraRobust, Robust, Standard, Express]`.
+const SNR_CALIBRATION_DB: [f32; 4] = [-6.2, -3.0, -3.0, -3.4];
+
+/// Compute WSJT-X-compatible SNR (dB, 2.5 kHz reference bandwidth)
+/// from the joint amplitude / noise estimator on the long preamble.
+///
+/// Approach (single-carrier π/4-DQPSK has no "opposite tone" the way
+/// FSK does, so we cannot reuse the FT8 / Q65 noise-tone estimator):
+///
+/// 1. Symbol SNR ≈ `2·a²/σ²` from the differential-pair statistics.
+///    Exact at `Eb/N0 ≥ ~+5 dB`; slight optimistic bias at threshold
+///    where the `n·n*` term in `σ²_diff` becomes a meaningful fraction
+///    of the `2A²σ²` signal-cross-noise term.
+/// 2. Convert MF-output SNR to 2.5 kHz reference using the mode's
+///    symbol rate as the matched-filter equivalent noise bandwidth:
+///    `+10·log10(baud / 2500)`.
+/// 3. Subtract the empirical per-mode calibration (above) so the
+///    reported SNR matches the WSJT-X convention at known Eb/N0.
+///
+/// Floor at −30 dB (matches WSJT-X's clamping convention).
+fn compute_snr_2500hz(stats: &DiffStats, mode: Mode) -> f32 {
+    let a = stats.a_sq_est.max(1e-9);
+    let sigma_sq = stats.sigma_sq_n_diff.max(1e-9);
+    let symbol_snr = 2.0 * a * a / sigma_sq;
+    if symbol_snr <= 1e-9 {
+        return -30.0;
+    }
+    let baud = SAMPLE_RATE_HZ / mode.nsps() as f32;
+    let bw_correction = 10.0 * (baud / 2500.0).log10();
+    let cal = SNR_CALIBRATION_DB[mode.header_code() as usize];
+    let snr_db = 10.0 * symbol_snr.log10() + bw_correction + cal;
+    snr_db.max(-30.0)
 }
 
 fn compute_llrs(r_diff: &[Complex32], stats: &DiffStats, n_data: usize) -> Vec<f32> {
