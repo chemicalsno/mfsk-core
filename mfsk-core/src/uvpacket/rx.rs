@@ -45,8 +45,8 @@ use crate::fec::Ldpc240_101;
 use super::framing::{HEADER_BYTES, INFO_BYTES_PER_BLOCK, UnpackError, unpack_header};
 use super::interleaver::deinterleave_llr;
 use super::puncture::{Mode, de_puncture_llr};
-use super::sync_pattern::{NUM_PREAMBLES, PREAMBLE_LEN, PREAMBLES, mode_for_index, preamble_for};
-use super::tx::{NSPS, RRC_ALPHA, RRC_SPAN_SYMS, SAMPLE_RATE_HZ, rrc_pulse};
+use super::sync_pattern::{NUM_PREAMBLES, PREAMBLE_LEN, mode_for_index, preamble_for};
+use super::tx::{RRC_ALPHA, RRC_SPAN_SYMS, SAMPLE_RATE_HZ, rrc_pulse};
 
 /// LDPC mother-codeword length.
 const N_LDPC: usize = 240;
@@ -54,11 +54,27 @@ const N_LDPC: usize = 240;
 const K_LDPC: usize = 101;
 /// Symbols carrying one full unpunctured LDPC codeword (240 ch bits / 2 bit/sym).
 const HEADER_BLOCK_SYMS: usize = N_LDPC / 2;
-/// RRC pulse length in samples (`span × NSPS + 1` = 61).
-const RRC_LEN: usize = RRC_SPAN_SYMS * NSPS + 1;
+
+/// Canonical 1200-baud per-symbol sample count. Used by every mode
+/// except [`Mode::UltraRobust`] which runs at half baud (NSPS=20).
+/// All auto-detect entry points compute one matched-filter output
+/// per distinct nsps value (currently 10 and 20).
+const NSPS_BASE: usize = 10;
+/// Half-baud (600-baud) per-symbol sample count for UltraRobust.
+const NSPS_ULTRA: usize = 20;
+/// Both nsps variants the auto-detect path needs to scan.
+const ALL_NSPS: [usize; 2] = [NSPS_BASE, NSPS_ULTRA];
+
+/// RRC pulse length in samples for a given nsps (`span × nsps + 1`).
+const fn rrc_len_for(nsps: usize) -> usize {
+    RRC_SPAN_SYMS * nsps + 1
+}
+
 /// Symbol-peak position offset within the matched-filter output for
-/// a transmitted symbol at TX baseband index 0.
-const SYM_PEAK_OFFSET: usize = RRC_LEN - 1;
+/// a transmitted symbol at TX baseband index 0, given nsps.
+const fn sym_peak_offset_for(nsps: usize) -> usize {
+    rrc_len_for(nsps) - 1
+}
 
 /// Equaliser tap count. 9 T-spaced (NSPS-spaced in baseband) taps,
 /// centred (4 past + 1 centre + 4 future).
@@ -148,7 +164,8 @@ pub fn decode_known_layout_with_afc(
     afc_opts: &AfcOpts,
 ) -> Result<DecodedFrame, DecodeError> {
     // AFC needs at least preamble + header-block worth of samples.
-    let needed = (PREAMBLE_LEN + HEADER_BLOCK_SYMS) * NSPS + RRC_LEN;
+    let nsps = mode.nsps();
+    let needed = (PREAMBLE_LEN + HEADER_BLOCK_SYMS) * nsps + rrc_len_for(nsps);
     if sample_offset + needed > audio.len() {
         return Err(DecodeError::Truncated);
     }
@@ -230,10 +247,13 @@ pub fn measure_slot_energies(
     if audio.is_empty() {
         return out;
     }
+    // Slot-energy survey is mode-agnostic — use the canonical NSPS=10
+    // MF; UltraRobust signals would still light up this filter (just
+    // with ~3 dB MF mismatch loss, irrelevant for an energy survey).
     let half = slot_spacing_hz / 2.0;
     let mut centre = mc_opts.band_lo_hz + half;
     while centre <= mc_opts.band_hi_hz {
-        let mf_out = downconvert_and_matched_filter(audio, centre);
+        let mf_out = downconvert_and_matched_filter(audio, centre, NSPS_BASE);
         let mean_mag = if mf_out.is_empty() {
             0.0
         } else {
@@ -270,23 +290,36 @@ pub struct SyncStats {
 /// callers that want to inspect sync quality without running a full
 /// LDPC decode.
 pub fn diag_sync_at(audio: &[f32], audio_centre_hz: f32) -> Option<(Mode, SyncStats)> {
-    if audio.len() < PREAMBLE_LEN * NSPS + RRC_LEN {
-        return None;
-    }
-    let mf_out = downconvert_and_matched_filter(audio, audio_centre_hz);
-    let max_corr_offset = mf_out.len().saturating_sub((PREAMBLE_LEN - 1) * NSPS + 1);
-    if max_corr_offset == 0 {
+    // Need enough audio for the longest preamble (UltraRobust at
+    // NSPS=20 = 127·20 + 121 = 2 661 samples, ≈ 222 ms at 12 kHz).
+    let min_needed = PREAMBLE_LEN * NSPS_ULTRA + rrc_len_for(NSPS_ULTRA);
+    if audio.len() < min_needed {
         return None;
     }
     let mut per_mode_max: [f32; NUM_PREAMBLES] = [0.0; NUM_PREAMBLES];
-    let mut all_scores: Vec<f32> = Vec::with_capacity(max_corr_offset * NUM_PREAMBLES);
-    for offset in 0..max_corr_offset {
-        for (mode_idx, p) in PREAMBLES.iter().enumerate() {
-            let s = preamble_differential_score(&mf_out, offset, &p[..]);
-            if s > per_mode_max[mode_idx] {
-                per_mode_max[mode_idx] = s;
+    let mut all_scores: Vec<f32> = Vec::new();
+    let mut total_offsets = 0usize;
+    // Compute one MF per nsps variant; correlate the matching
+    // preambles against it.
+    for &nsps in ALL_NSPS.iter() {
+        let mf_out = downconvert_and_matched_filter(audio, audio_centre_hz, nsps);
+        let max_corr_offset = mf_out.len().saturating_sub((PREAMBLE_LEN - 1) * nsps + 1);
+        if max_corr_offset == 0 {
+            continue;
+        }
+        for (mode_idx, m) in (0..NUM_PREAMBLES).filter_map(|i| mode_for_index(i).map(|m| (i, m))) {
+            if m.nsps() != nsps {
+                continue;
             }
-            all_scores.push(s);
+            let p = preamble_for(m);
+            for offset in 0..max_corr_offset {
+                let s = preamble_differential_score(&mf_out, offset, &p[..], nsps);
+                if s > per_mode_max[mode_idx] {
+                    per_mode_max[mode_idx] = s;
+                }
+                all_scores.push(s);
+                total_offsets += 1;
+            }
         }
     }
     let (best_mode_idx, &best_score) = per_mode_max
@@ -306,7 +339,7 @@ pub fn diag_sync_at(audio: &[f32], audio_centre_hz: f32) -> Option<(Mode, SyncSt
             global_max: best_score,
             median,
             ratio,
-            n_scores: max_corr_offset * NUM_PREAMBLES,
+            n_scores: total_offsets,
         },
     ))
 }
@@ -321,7 +354,8 @@ pub fn diag_estimate_freq_offset(
     mode: Mode,
     afc_opts: &AfcOpts,
 ) -> Option<f32> {
-    let needed = (PREAMBLE_LEN + HEADER_BLOCK_SYMS) * NSPS + RRC_LEN;
+    let nsps = mode.nsps();
+    let needed = (PREAMBLE_LEN + HEADER_BLOCK_SYMS) * nsps + rrc_len_for(nsps);
     if sample_offset + needed > audio.len() {
         return None;
     }
@@ -346,12 +380,14 @@ fn decode_at_inner(
     mode: Mode,
     fec_opts: &FecOpts,
 ) -> Result<DecodedFrame, DecodeError> {
+    let nsps = mode.nsps();
+    let rrc_len = rrc_len_for(nsps);
     // We don't yet know n_blocks. Phase 1: decode header. Phase 2:
     // once header reveals n_blocks, decode payload. The equaliser's
     // future-tap window past the last sampled symbol is zero-padded
     // by `sample_symbols`, so we only require the audio span for the
     // symbols themselves (preamble + header block).
-    let need_for_header = (PREAMBLE_LEN + HEADER_BLOCK_SYMS) * NSPS + RRC_LEN;
+    let need_for_header = (PREAMBLE_LEN + HEADER_BLOCK_SYMS) * nsps + rrc_len;
     if sample_offset + need_for_header > audio.len() {
         return Err(DecodeError::Truncated);
     }
@@ -360,16 +396,17 @@ fn decode_at_inner(
     // header. Payload extraction will re-MF the full span once we
     // know n_blocks. (MF cost is small vs LDPC cost.)
     let header_slice = &audio[sample_offset..sample_offset + need_for_header];
-    let mf_out_header = downconvert_and_matched_filter(header_slice, audio_centre_hz);
+    let mf_out_header = downconvert_and_matched_filter(header_slice, audio_centre_hz, nsps);
 
     // Coherent integer-sample sync inside the ±NSPS jitter window
     // for the supplied mode's preamble.
     let preamble_bits = preamble_for(mode);
-    let (best_off, best_mag2) = best_preamble_offset(&mf_out_header, preamble_bits);
+    let (best_off, best_mag2) = best_preamble_offset(&mf_out_header, preamble_bits, nsps);
     if best_mag2 <= 0.0 {
         return Err(DecodeError::HeaderFecFailed);
     }
-    let frac_off = parabolic_subsample_refine(&mf_out_header, best_off, preamble_bits, best_mag2);
+    let frac_off =
+        parabolic_subsample_refine(&mf_out_header, best_off, preamble_bits, best_mag2, nsps);
 
     // Train equaliser on preamble + decode header block.
     let header_syms_total = PREAMBLE_LEN + HEADER_BLOCK_SYMS;
@@ -378,6 +415,7 @@ fn decode_at_inner(
         best_off,
         frac_off,
         header_syms_total + EQ_TAP_HALF,
+        nsps,
     );
     let weights = train_ls_equaliser(&symbols_header, preamble_bits);
     let equalised_header = apply_equaliser(&symbols_header, &weights, header_syms_total);
@@ -404,15 +442,21 @@ fn decode_at_inner(
     let block_ch_bits = mode.ch_bits_per_block();
     let payload_syms = (proto_n_blocks as usize) * block_ch_bits / 2;
     let total_syms = PREAMBLE_LEN + HEADER_BLOCK_SYMS + payload_syms;
-    let need_full = total_syms * NSPS + RRC_LEN;
+    let need_full = total_syms * nsps + rrc_len;
     if sample_offset + need_full > audio.len() {
         return Err(DecodeError::PayloadTruncated {
             needed_samples: need_full,
         });
     }
     let full_slice = &audio[sample_offset..sample_offset + need_full];
-    let mf_out_full = downconvert_and_matched_filter(full_slice, audio_centre_hz);
-    let symbols_full = sample_symbols(&mf_out_full, best_off, frac_off, total_syms + EQ_TAP_HALF);
+    let mf_out_full = downconvert_and_matched_filter(full_slice, audio_centre_hz, nsps);
+    let symbols_full = sample_symbols(
+        &mf_out_full,
+        best_off,
+        frac_off,
+        total_syms + EQ_TAP_HALF,
+        nsps,
+    );
     let equalised_full = apply_equaliser(&symbols_full, &weights, total_syms);
     let r_diff_full = differential(&equalised_full);
 
@@ -490,25 +534,38 @@ const MAX_PICKED_PEAKS: usize = 3;
 const SYNC_GATE_RATIO: f32 = 30.0;
 
 fn decode_inner(audio: &[f32], audio_centre_hz: f32, fec_opts: &FecOpts) -> Vec<DecodedFrame> {
-    if audio.len() < PREAMBLE_LEN * NSPS + RRC_LEN {
-        return Vec::new();
-    }
-    let mf_out = downconvert_and_matched_filter(audio, audio_centre_hz);
-    let max_corr_offset = mf_out.len().saturating_sub((PREAMBLE_LEN - 1) * NSPS + 1);
-    if max_corr_offset == 0 {
+    let min_needed = PREAMBLE_LEN * NSPS_ULTRA + rrc_len_for(NSPS_ULTRA);
+    if audio.len() < min_needed {
         return Vec::new();
     }
 
-    // Score every offset against every preamble variant. Keep the
-    // best (mode, offset, score) entries that pass the sync gate.
+    // Score every offset against every preamble variant, with the
+    // matching MF per nsps. Keep peaks in the audio-domain offset
+    // (mf_offset − sym_peak_offset_for(nsps)) so the cross-mode NMS
+    // compares like with like.
     let mut peaks: Vec<(usize, Mode, f32)> = Vec::new();
-    let mut all_scores: Vec<f32> = Vec::with_capacity(max_corr_offset * NUM_PREAMBLES);
-    for offset in 0..max_corr_offset {
-        for (mode_idx, p) in PREAMBLES.iter().enumerate() {
-            let score = preamble_differential_score(&mf_out, offset, &p[..]);
-            all_scores.push(score);
-            let mode = mode_for_index(mode_idx).unwrap();
-            peaks.push((offset, mode, score));
+    let mut all_scores: Vec<f32> = Vec::new();
+    for &nsps in ALL_NSPS.iter() {
+        let mf_out = downconvert_and_matched_filter(audio, audio_centre_hz, nsps);
+        let max_corr_offset = mf_out.len().saturating_sub((PREAMBLE_LEN - 1) * nsps + 1);
+        if max_corr_offset == 0 {
+            continue;
+        }
+        let peak_off = sym_peak_offset_for(nsps);
+        for (mode_idx, m) in (0..NUM_PREAMBLES).filter_map(|i| mode_for_index(i).map(|m| (i, m))) {
+            if m.nsps() != nsps {
+                continue;
+            }
+            let p = preamble_for(m);
+            for mf_offset in 0..max_corr_offset {
+                let score = preamble_differential_score(&mf_out, mf_offset, &p[..], nsps);
+                all_scores.push(score);
+                // audio_offset = mf_offset − sym_peak_offset_for(nsps)
+                if let Some(audio_off) = mf_offset.checked_sub(peak_off) {
+                    peaks.push((audio_off, m, score));
+                }
+                let _ = mode_idx;
+            }
         }
     }
     let median = robust_median(&all_scores);
@@ -516,16 +573,21 @@ fn decode_inner(audio: &[f32], audio_centre_hz: f32, fec_opts: &FecOpts) -> Vec<
         return Vec::new();
     }
 
-    // Threshold + rank.
     let threshold = median * SYNC_GATE_RATIO;
     peaks.retain(|&(_, _, s)| s >= threshold);
     peaks.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
 
-    // NMS in offset (within ±NSPS) — keep at most MAX_PICKED_PEAKS.
+    // NMS in audio-domain offset (within ±NSPS_BASE samples — half a
+    // canonical symbol period; UltraRobust's longer chip span is
+    // automatically covered since its peaks land at integer-multiples
+    // of 20 samples).
     let mut picked: Vec<(usize, Mode)> = Vec::new();
-    for (offset, mode, _score) in peaks {
-        if picked.iter().all(|&(po, _)| offset.abs_diff(po) > NSPS) {
-            picked.push((offset, mode));
+    for (audio_off, mode, _score) in peaks {
+        if picked
+            .iter()
+            .all(|&(po, _)| audio_off.abs_diff(po) > NSPS_BASE)
+        {
+            picked.push((audio_off, mode));
             if picked.len() >= MAX_PICKED_PEAKS {
                 break;
             }
@@ -533,19 +595,15 @@ fn decode_inner(audio: &[f32], audio_centre_hz: f32, fec_opts: &FecOpts) -> Vec<
     }
     picked.sort_unstable_by_key(|&(o, _)| o);
 
-    // For each kept peak, run the full single-frame decode at the
-    // corrected centre frequency.
     let afc_opts = AfcOpts::default();
     let mut frames: Vec<DecodedFrame> = Vec::new();
     let mut consumed_until: usize = 0;
-    for (mf_off, mode) in picked {
-        let Some(audio_off) = mf_off.checked_sub(SYM_PEAK_OFFSET) else {
-            continue;
-        };
+    for (audio_off, mode) in picked {
         if audio_off < consumed_until {
             continue;
         }
-        let needed = (PREAMBLE_LEN + HEADER_BLOCK_SYMS) * NSPS + RRC_LEN;
+        let nsps = mode.nsps();
+        let needed = (PREAMBLE_LEN + HEADER_BLOCK_SYMS) * nsps + rrc_len_for(nsps);
         if audio_off + needed > audio.len() {
             continue;
         }
@@ -564,7 +622,7 @@ fn decode_inner(audio: &[f32], audio_centre_hz: f32, fec_opts: &FecOpts) -> Vec<
                 + (PREAMBLE_LEN
                     + HEADER_BLOCK_SYMS
                     + (frame.block_count as usize) * mode.ch_bits_per_block() / 2)
-                    * NSPS;
+                    * nsps;
             frames.push(frame);
         }
     }
@@ -576,33 +634,43 @@ fn decode_multichannel_inner(
     mc_opts: &MultiChannelOpts,
     fec_opts: &FecOpts,
 ) -> Vec<(f32, DecodedFrame)> {
-    let mut centre = mc_opts.band_lo_hz;
-    // `peaks` records the strongest (offset, mode, score) at each
-    // centre. `all_scores` accumulates **every** score across every
-    // centre × variant × offset so we can compute a band-wide median
-    // for the sync gate — the same `median × SYNC_GATE_RATIO` rule
-    // the single-channel `decode_inner` uses.
+    // For each centre, find the strongest peak across both nsps
+    // values (NSPS_BASE for Robust/Standard/Express, NSPS_ULTRA for
+    // UltraRobust). Peak audio_offset = mf_offset − sym_peak_offset.
     let mut peaks: Vec<(f32, usize, Mode, f32)> = Vec::new();
     let mut all_scores: Vec<f32> = Vec::new();
+    let mut centre = mc_opts.band_lo_hz;
     while centre <= mc_opts.band_hi_hz {
-        let mf_out = downconvert_and_matched_filter(audio, centre);
-        let max_corr_offset = mf_out.len().saturating_sub((PREAMBLE_LEN - 1) * NSPS + 1);
-        if max_corr_offset > 0 {
-            let mut best_off = 0usize;
-            let mut best_mode = Mode::Robust;
-            let mut best_score = 0.0_f32;
-            for offset in 0..max_corr_offset {
-                for (mode_idx, p) in PREAMBLES.iter().enumerate() {
-                    let s = preamble_differential_score(&mf_out, offset, &p[..]);
+        let mut best_audio_off = 0usize;
+        let mut best_mode = Mode::Robust;
+        let mut best_score = 0.0_f32;
+        for &nsps in ALL_NSPS.iter() {
+            let mf_out = downconvert_and_matched_filter(audio, centre, nsps);
+            let max_corr_offset = mf_out.len().saturating_sub((PREAMBLE_LEN - 1) * nsps + 1);
+            if max_corr_offset == 0 {
+                continue;
+            }
+            let peak_off = sym_peak_offset_for(nsps);
+            for (_, m) in (0..NUM_PREAMBLES).filter_map(|i| mode_for_index(i).map(|m| (i, m))) {
+                if m.nsps() != nsps {
+                    continue;
+                }
+                let p = preamble_for(m);
+                for mf_offset in 0..max_corr_offset {
+                    let s = preamble_differential_score(&mf_out, mf_offset, &p[..], nsps);
                     all_scores.push(s);
-                    if s > best_score {
+                    if s > best_score
+                        && let Some(audio_off) = mf_offset.checked_sub(peak_off)
+                    {
                         best_score = s;
-                        best_off = offset;
-                        best_mode = mode_for_index(mode_idx).unwrap();
+                        best_audio_off = audio_off;
+                        best_mode = m;
                     }
                 }
             }
-            peaks.push((centre, best_off, best_mode, best_score));
+        }
+        if best_score > 0.0 {
+            peaks.push((centre, best_audio_off, best_mode, best_score));
         }
         centre += mc_opts.coarse_step_hz;
     }
@@ -610,11 +678,7 @@ fn decode_multichannel_inner(
         return Vec::new();
     }
 
-    // Band-wide sync gate: drop peaks below `median × SYNC_GATE_RATIO`
-    // before NMS / per-peak decode. Without this, a noise-only audio
-    // buffer triggers ~2-3 NMS-kept peaks, each consuming a full
-    // header + payload LDPC decode pipeline (~500 ms each in WASM)
-    // that returns 0 frames.
+    // Band-wide sync gate.
     let median = robust_median(&all_scores);
     if median <= 0.0 {
         return Vec::new();
@@ -640,11 +704,9 @@ fn decode_multichannel_inner(
     // Per-peak decode.
     let afc_opts = AfcOpts::default();
     let mut out: Vec<(f32, DecodedFrame)> = Vec::new();
-    for (centre, mf_off, mode) in kept {
-        let Some(audio_off) = mf_off.checked_sub(SYM_PEAK_OFFSET) else {
-            continue;
-        };
-        let needed = (PREAMBLE_LEN + HEADER_BLOCK_SYMS) * NSPS + RRC_LEN;
+    for (centre, audio_off, mode) in kept {
+        let nsps = mode.nsps();
+        let needed = (PREAMBLE_LEN + HEADER_BLOCK_SYMS) * nsps + rrc_len_for(nsps);
         if audio_off + needed > audio.len() {
             continue;
         }
@@ -661,7 +723,11 @@ fn decode_multichannel_inner(
 // Internal — DSP helpers (matched filter, sync, equaliser, demod)
 // ────────────────────────────────────────────────────────────────────
 
-fn downconvert_and_matched_filter(audio: &[f32], audio_centre_hz: f32) -> Vec<Complex32> {
+fn downconvert_and_matched_filter(
+    audio: &[f32],
+    audio_centre_hz: f32,
+    nsps: usize,
+) -> Vec<Complex32> {
     let two_pi_fc_dt = 2.0 * PI * audio_centre_hz / SAMPLE_RATE_HZ;
     let mut bb: Vec<Complex32> = Vec::with_capacity(audio.len());
     for (n, &s) in audio.iter().enumerate() {
@@ -669,7 +735,7 @@ fn downconvert_and_matched_filter(audio: &[f32], audio_centre_hz: f32) -> Vec<Co
         let (sin, cos) = phase.sin_cos();
         bb.push(Complex32::new(2.0 * s * cos, -2.0 * s * sin));
     }
-    let rrc = rrc_pulse(RRC_ALPHA, RRC_SPAN_SYMS, NSPS);
+    let rrc = rrc_pulse(RRC_ALPHA, RRC_SPAN_SYMS, nsps);
     let n_out = bb.len() + rrc.len() - 1;
     let mut out = vec![Complex32::new(0.0, 0.0); n_out];
     for (i, &x) in bb.iter().enumerate() {
@@ -680,10 +746,15 @@ fn downconvert_and_matched_filter(audio: &[f32], audio_centre_hz: f32) -> Vec<Co
     out
 }
 
-fn preamble_correlation(mf_out: &[Complex32], offset: usize, bits: &[bool]) -> Complex32 {
+fn preamble_correlation(
+    mf_out: &[Complex32],
+    offset: usize,
+    bits: &[bool],
+    nsps: usize,
+) -> Complex32 {
     let mut acc = Complex32::new(0.0, 0.0);
     for (i, &b) in bits.iter().enumerate() {
-        let pos = offset + i * NSPS;
+        let pos = offset + i * nsps;
         let s = if b { -1.0_f32 } else { 1.0 };
         acc += mf_out[pos] * s;
     }
@@ -695,12 +766,17 @@ fn preamble_correlation(mf_out: &[Complex32], offset: usize, bits: &[bool]) -> C
 /// rotation invariant (cancels in the differential product), so it
 /// survives clarifier offset / LO walk much better than the
 /// coherent score.
-fn preamble_differential_score(mf_out: &[Complex32], offset: usize, bits: &[bool]) -> f32 {
+fn preamble_differential_score(
+    mf_out: &[Complex32],
+    offset: usize,
+    bits: &[bool],
+    nsps: usize,
+) -> f32 {
     let n = bits.len();
     if n < 2 {
         return 0.0;
     }
-    let last_pos = offset + (n - 1) * NSPS;
+    let last_pos = offset + (n - 1) * nsps;
     if last_pos >= mf_out.len() {
         return 0.0;
     }
@@ -709,7 +785,7 @@ fn preamble_differential_score(mf_out: &[Complex32], offset: usize, bits: &[bool
     let mut prev_sample = mf_out[offset];
     let mut prev_sign: f32 = if bits[0] { -1.0 } else { 1.0 };
     for (i, &b) in bits.iter().enumerate().skip(1) {
-        let pos = offset + i * NSPS;
+        let pos = offset + i * nsps;
         let s = mf_out[pos];
         let cur_sign = if b { -1.0_f32 } else { 1.0 };
         let a = s * prev_sample.conj();
@@ -726,11 +802,11 @@ fn preamble_differential_score(mf_out: &[Complex32], offset: usize, bits: &[bool
     }
 }
 
-fn best_preamble_offset(mf_out: &[Complex32], bits: &[bool]) -> (usize, f32) {
-    let radius = NSPS as isize;
-    let base = SYM_PEAK_OFFSET as isize;
+fn best_preamble_offset(mf_out: &[Complex32], bits: &[bool], nsps: usize) -> (usize, f32) {
+    let radius = nsps as isize;
+    let base = sym_peak_offset_for(nsps) as isize;
     let n = bits.len();
-    let mut best_off = SYM_PEAK_OFFSET;
+    let mut best_off = sym_peak_offset_for(nsps);
     let mut best_mag2 = -1.0_f32;
     for jitter in -radius..=radius {
         let off = base + jitter;
@@ -738,10 +814,10 @@ fn best_preamble_offset(mf_out: &[Complex32], bits: &[bool]) -> (usize, f32) {
             continue;
         }
         let off = off as usize;
-        if off + (n - 1) * NSPS >= mf_out.len() {
+        if off + (n - 1) * nsps >= mf_out.len() {
             continue;
         }
-        let mag2 = preamble_correlation(mf_out, off, bits).norm_sqr();
+        let mag2 = preamble_correlation(mf_out, off, bits, nsps).norm_sqr();
         if mag2 > best_mag2 {
             best_mag2 = mag2;
             best_off = off;
@@ -755,15 +831,16 @@ fn parabolic_subsample_refine(
     best_off: usize,
     bits: &[bool],
     best_mag2: f32,
+    nsps: usize,
 ) -> f32 {
     let n = bits.len();
-    let need_minus = best_off > 0 && (best_off - 1) + (n - 1) * NSPS < mf_out.len();
-    let need_plus = (best_off + 1) + (n - 1) * NSPS < mf_out.len();
+    let need_minus = best_off > 0 && (best_off - 1) + (n - 1) * nsps < mf_out.len();
+    let need_plus = (best_off + 1) + (n - 1) * nsps < mf_out.len();
     if !(need_minus && need_plus) {
         return 0.0;
     }
-    let m_minus = preamble_correlation(mf_out, best_off - 1, bits).norm_sqr();
-    let m_plus = preamble_correlation(mf_out, best_off + 1, bits).norm_sqr();
+    let m_minus = preamble_correlation(mf_out, best_off - 1, bits, nsps).norm_sqr();
+    let m_plus = preamble_correlation(mf_out, best_off + 1, bits, nsps).norm_sqr();
     let denom = 2.0 * (m_plus - 2.0 * best_mag2 + m_minus);
     if denom.abs() > 1e-9 {
         ((m_minus - m_plus) / denom).clamp(-0.5, 0.5)
@@ -781,10 +858,11 @@ fn sample_symbols(
     best_off: usize,
     frac_off: f32,
     n_syms: usize,
+    nsps: usize,
 ) -> Vec<Complex32> {
     let mut out: Vec<Complex32> = Vec::with_capacity(n_syms);
     for i in 0..n_syms {
-        let pos = best_off as f32 + frac_off + (i * NSPS) as f32;
+        let pos = best_off as f32 + frac_off + (i * nsps) as f32;
         if pos < 0.0 || pos as usize + 1 >= mf_out.len() {
             out.push(Complex32::new(0.0, 0.0));
         } else {
@@ -999,12 +1077,13 @@ fn estimate_freq_offset_for_mode(
     let n_coarse = (afc_opts.search_hz / coarse_step_hz).ceil() as i32;
     let slice = &audio[sample_offset..sample_offset + needed_samples];
     let preamble_bits = preamble_for(mode);
+    let nsps = mode.nsps();
 
     let mut grid_mags: Vec<(i32, f32)> = Vec::with_capacity(2 * n_coarse as usize + 1);
     for k in -n_coarse..=n_coarse {
         let f_test = audio_centre_hz + k as f32 * coarse_step_hz;
-        let mf_out = downconvert_and_matched_filter(slice, f_test);
-        let (_, mag2) = best_preamble_offset(&mf_out, preamble_bits);
+        let mf_out = downconvert_and_matched_filter(slice, f_test, nsps);
+        let (_, mag2) = best_preamble_offset(&mf_out, preamble_bits, nsps);
         grid_mags.push((k, mag2));
     }
     let (best_k_idx, _) = grid_mags

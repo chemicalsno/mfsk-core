@@ -42,7 +42,7 @@
 //!   Mountain / weak-signal posture.
 //! - [`UvStandard`] — punctured to rate 1/2, 1200 net bps. Typical
 //!   NFM with fading.
-//! - [`UvFast`] — rate 2/3, 1600 net bps (+33 %).
+//! - [`UvUltraRobust`] — rate 2/3, 1600 net bps (+33 %).
 //! - [`UvExpress`] — rate 3/4, 1800 net bps (+50 %). OSD-2 essentially
 //!   mandatory at the BP threshold.
 //!
@@ -124,5 +124,5 @@ pub mod sync_pattern;
 pub mod tx;
 
 pub use message::UvPacketRawMessage;
-pub use protocol::{AUDIO_CENTRE_HZ, UvExpress, UvFast, UvRobust, UvStandard};
+pub use protocol::{AUDIO_CENTRE_HZ, UvExpress, UvRobust, UvStandard, UvUltraRobust};
 pub use puncture::Mode;

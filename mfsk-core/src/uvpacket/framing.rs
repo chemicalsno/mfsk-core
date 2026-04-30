@@ -236,7 +236,12 @@ mod tests {
 
     #[test]
     fn pack_unpack_roundtrip_all_modes() {
-        for mode in [Mode::Robust, Mode::Standard, Mode::Fast, Mode::Express] {
+        for mode in [
+            Mode::Robust,
+            Mode::Standard,
+            Mode::UltraRobust,
+            Mode::Express,
+        ] {
             let h = FrameHeader {
                 mode,
                 block_count: 1,

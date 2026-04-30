@@ -26,7 +26,12 @@ use common::channel::{AwgnChannel, RayleighFlatChannel, awgn_sigma_for_eb_n0_inf
 const N_BLOCKS: u8 = 4;
 const N_TRIALS: usize = 30;
 const PAYLOAD: usize = 16;
-const ALL_MODES: [Mode; 4] = [Mode::Robust, Mode::Standard, Mode::Fast, Mode::Express];
+const ALL_MODES: [Mode; 4] = [
+    Mode::UltraRobust,
+    Mode::Robust,
+    Mode::Standard,
+    Mode::Express,
+];
 
 fn header_for(mode: Mode) -> FrameHeader {
     FrameHeader {

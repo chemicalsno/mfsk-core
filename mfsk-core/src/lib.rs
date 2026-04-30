@@ -316,6 +316,6 @@ pub use crate::jt65::Jt65;
 #[cfg(feature = "q65")]
 pub use crate::q65::Q65a30;
 #[cfg(feature = "uvpacket")]
-pub use crate::uvpacket::{UvExpress, UvFast, UvRobust, UvStandard};
+pub use crate::uvpacket::{UvExpress, UvRobust, UvStandard, UvUltraRobust};
 #[cfg(feature = "wspr")]
 pub use crate::wspr::Wspr;

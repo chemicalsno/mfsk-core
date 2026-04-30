@@ -39,7 +39,7 @@
 //! |----------------|-----:|--------------------------------:|-----|
 //! | [`UvRobust`]   | 0.42 | 1008 | mountain / weak signal / deep fading |
 //! | [`UvStandard`] | 0.50 | 1200 | typical NFM with fading             |
-//! | [`UvFast`]     | 0.66 | 1600 | good-signal default                  |
+//! | [`UvUltraRobust`] | 0.42 | 504 (half baud) | marathon / weakest-signal posture |
 //! | [`UvExpress`]  | 0.75 | 1800 | strong-signal headline-fast mode (OSD-2 essentially mandatory) |
 //!
 //! Higher-rate modes use kSR-greedy puncture-set selection (see
@@ -155,11 +155,15 @@ uvpacket_submode! {
 }
 
 uvpacket_submode! {
-    /// **Fast** — punctured to rate 2/3. 1600 net bps (+33 % vs
-    /// AFSK 1200). Good-signal default. 63 % parity puncturing;
-    /// kSR-greedy puncture selection delivers ~1 dB Eb/N0 gain
-    /// over uniform-spread at the BP threshold.
-    UvFast, mode = Mode::Fast,
+    /// **UltraRobust** — unpunctured `Ldpc240_101` at half the
+    /// canonical symbol rate (600 baud). 504 net bps,
+    /// ≈ −1.75 dB SNR_3kHz threshold. The lowest-threshold mode in
+    /// the lineup; targets the marginal-link niche where Robust
+    /// can't quite hold but a slower-but-tougher path can. Half-
+    /// baud chip duration also halves per-symbol phase walk and
+    /// the relative size of any multipath delay, giving real-
+    /// channel margin on top of the 3 dB symbol-energy gain.
+    UvUltraRobust, mode = Mode::UltraRobust,
 }
 
 uvpacket_submode! {

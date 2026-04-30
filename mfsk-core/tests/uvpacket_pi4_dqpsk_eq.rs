@@ -484,7 +484,12 @@ fn eq_pi4_dqpsk_true_harsh_snr_sweep() {
 fn eq_pi4_dqpsk_awgn_per_sweep() {
     let n = 30;
     eprintln!("mode,eb_n0_db,decoded,total");
-    for mode in [Mode::Robust, Mode::Standard, Mode::Fast, Mode::Express] {
+    for mode in [
+        Mode::Robust,
+        Mode::Standard,
+        Mode::UltraRobust,
+        Mode::Express,
+    ] {
         for eb_n0 in [-2.0_f32, 0.0, 2.0, 4.0, 6.0, 8.0, 10.0] {
             let decoded = eq_per_awgn(mode, 16, eb_n0, n, 0x1234_5678);
             eprintln!("{mode:?},{eb_n0:+.1},{decoded},{n}");

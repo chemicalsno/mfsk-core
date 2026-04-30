@@ -56,9 +56,9 @@ const PAYLOAD_BITS_PER_BLOCK: usize = INFO_BYTES_PER_BLOCK * 8;
 
 /// Sample rate (Hz).
 pub(super) const SAMPLE_RATE_HZ: f32 = 12_000.0;
-/// 1200 baud → 10 samples / symbol at 12 kHz.
-pub(super) const NSPS: usize = 10;
-/// RRC pulse span (symbols on each side of centre tap).
+/// RRC pulse span (symbols on each side of centre tap). Same for
+/// every mode — only the per-symbol sample count varies via
+/// [`Mode::nsps`].
 pub(super) const RRC_SPAN_SYMS: usize = 6;
 /// RRC roll-off factor.
 pub(super) const RRC_ALPHA: f32 = 0.5;
@@ -166,12 +166,15 @@ pub fn encode(
         prev = next;
     }
 
-    // 9. RRC pulse-shape into a complex baseband.
-    let rrc = rrc_pulse(RRC_ALPHA, RRC_SPAN_SYMS, NSPS);
-    let total_samples = symbols.len() * NSPS + rrc.len();
+    // 9. RRC pulse-shape into a complex baseband. The pulse width
+    //    (and per-symbol stride) is mode-dependent: UltraRobust runs
+    //    at half baud and uses NSPS=20, every other mode uses NSPS=10.
+    let nsps = mode.nsps();
+    let rrc = rrc_pulse(RRC_ALPHA, RRC_SPAN_SYMS, nsps);
+    let total_samples = symbols.len() * nsps + rrc.len();
     let mut baseband = vec![Complex32::new(0.0, 0.0); total_samples];
     for (i, &sym) in symbols.iter().enumerate() {
-        let start = i * NSPS;
+        let start = i * nsps;
         for (j, &tap) in rrc.iter().enumerate() {
             let pos = start + j;
             if pos < baseband.len() {
@@ -258,7 +261,12 @@ mod tests {
 
     #[test]
     fn encode_succeeds_all_modes() {
-        for mode in [Mode::Robust, Mode::Standard, Mode::Fast, Mode::Express] {
+        for mode in [
+            Mode::Robust,
+            Mode::Standard,
+            Mode::UltraRobust,
+            Mode::Express,
+        ] {
             for n_blocks in [1u8, 4, 18, 32] {
                 let header = header_for(mode, n_blocks);
                 let cap = (n_blocks as usize) * INFO_BYTES_PER_BLOCK;
@@ -279,15 +287,21 @@ mod tests {
 
     #[test]
     fn encode_sample_count_matches_formula() {
-        for mode in [Mode::Robust, Mode::Standard, Mode::Fast, Mode::Express] {
+        for mode in [
+            Mode::Robust,
+            Mode::Standard,
+            Mode::UltraRobust,
+            Mode::Express,
+        ] {
             let n_blocks = 4u8;
             let header = header_for(mode, n_blocks);
             let cap = (n_blocks as usize) * INFO_BYTES_PER_BLOCK;
             let payload = vec![0xCC_u8; cap];
             let audio = encode(&header, &payload, AUDIO_CENTRE_HZ).unwrap();
             let n_syms = expected_total_symbols(mode, n_blocks);
-            let rrc_len = RRC_SPAN_SYMS * NSPS + 1;
-            let expected = n_syms * NSPS + rrc_len;
+            let nsps = mode.nsps();
+            let rrc_len = RRC_SPAN_SYMS * nsps + 1;
+            let expected = n_syms * nsps + rrc_len;
             assert_eq!(
                 audio.len(),
                 expected,
@@ -326,13 +340,17 @@ mod tests {
         let h_s = header_for(Mode::Standard, 1);
         let a_r = encode(&h_r, &payload, AUDIO_CENTRE_HZ).unwrap();
         let a_s = encode(&h_s, &payload, AUDIO_CENTRE_HZ).unwrap();
-        let diffs = a_r[..PREAMBLE_LEN * NSPS]
+        // Both modes use NSPS=10; UltraRobust would need a different
+        // window since its NSPS=20 audio is twice as long. Use the
+        // matching mode's NSPS here.
+        let nsps = Mode::Robust.nsps();
+        let diffs = a_r[..PREAMBLE_LEN * nsps]
             .iter()
-            .zip(a_s[..PREAMBLE_LEN * NSPS].iter())
+            .zip(a_s[..PREAMBLE_LEN * nsps].iter())
             .filter(|(x, y)| (**x - **y).abs() > 1e-3)
             .count();
         assert!(
-            diffs > PREAMBLE_LEN * NSPS / 4,
+            diffs > PREAMBLE_LEN * nsps / 4,
             "Robust and Standard preambles should differ substantially in preamble window: {diffs}",
         );
     }

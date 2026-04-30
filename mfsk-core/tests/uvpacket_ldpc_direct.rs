@@ -110,7 +110,12 @@ fn per(mode: Mode, eb_n0_db: f32, n_trials: usize, base_seed: u64) -> usize {
 #[test]
 fn direct_ldpc_clean_channel_decodes_every_mode() {
     let n = 10;
-    for mode in [Mode::Robust, Mode::Standard, Mode::Fast, Mode::Express] {
+    for mode in [
+        Mode::Robust,
+        Mode::Standard,
+        Mode::UltraRobust,
+        Mode::Express,
+    ] {
         let decoded = per(mode, 30.0, n, 0xCAFE_BABE);
         assert_eq!(
             decoded, n,
@@ -130,7 +135,12 @@ fn direct_ldpc_threshold_finder_per_mode() {
     let eb_n0_grid: [f32; 11] = [-2.0, -1.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0];
 
     eprintln!("mode,eb_n0_db,decoded,total");
-    for mode in [Mode::Robust, Mode::Standard, Mode::Fast, Mode::Express] {
+    for mode in [
+        Mode::Robust,
+        Mode::Standard,
+        Mode::UltraRobust,
+        Mode::Express,
+    ] {
         for &eb_n0 in &eb_n0_grid {
             let decoded = per(mode, eb_n0, n_trials, 0xC0FFEE);
             eprintln!("{mode:?},{eb_n0:+.1},{decoded},{n_trials}");
