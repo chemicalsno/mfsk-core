@@ -17,6 +17,9 @@ pub mod hash_table;
 pub mod jt72;
 #[cfg(feature = "packet-bytes")]
 pub mod packet_bytes;
+// Decoder helper that wires `core::pipeline` (rustfft) — std-gated
+// alongside the other decode-side modules.
+#[cfg(feature = "std")]
 pub mod pipeline_ap;
 #[cfg(feature = "q65")]
 pub mod q65;
@@ -32,6 +35,8 @@ pub use packet_bytes::PacketBytesMessage;
 pub use q65::Q65Message;
 pub use wspr::{Wspr50Message, WsprMessage};
 
+use alloc::format;
+use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::core::{DecodeContext, MessageCodec, MessageFields};

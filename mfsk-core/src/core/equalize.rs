@@ -14,6 +14,9 @@
 //!   machinery; missing tones are linearly extrapolated from their two
 //!   lower neighbours.
 
+use alloc::vec;
+use alloc::vec::Vec;
+
 use super::Protocol;
 use num_complex::Complex;
 

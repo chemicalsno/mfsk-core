@@ -10,6 +10,8 @@
 
 pub mod fano;
 
+use alloc::vec;
+
 use super::FecCodec;
 use crate::core::{FecOpts, FecResult};
 

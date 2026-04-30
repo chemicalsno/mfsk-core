@@ -61,6 +61,11 @@ eq-fallback  = []
 # we need `libm` to provide sin/cos/sqrt/etc. The std build pulls
 # them via num-traits/std (transitively from rustfft) and ignores libm.
 num-complex = { version = "0.4", default-features = false, features = ["libm"] }
+# Direct dep so call sites can `use num_traits::Float` to get
+# `.atanh()` / `.tanh()` / `.sqrt()` / etc. under no_std. The `libm`
+# feature provides the actual math impls; under std these become
+# no-op forwards to the f32 inherent methods.
+num-traits  = { version = "0.2", default-features = false, features = ["libm"] }
 rustfft     = { version = "6", optional = true }
 crc         = { version = "3", default-features = false }
 rayon       = { version = "1", optional = true }

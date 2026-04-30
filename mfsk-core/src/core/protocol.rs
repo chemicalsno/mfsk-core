@@ -15,6 +15,9 @@
 //! `FrameLayout`, so SIMD optimisations to the shared LDPC decoder
 //! automatically benefit every LDPC-based protocol.
 
+use alloc::string::String;
+use alloc::vec::Vec;
+
 /// Runtime protocol tag — used at FFI boundaries where generics cannot cross
 /// the C ABI. Order is stable; append new variants at the end.
 #[repr(u8)]
@@ -365,7 +368,7 @@ pub struct MessageFields {
 pub struct DecodeContext {
     /// Optional hashed-callsign lookup owned by the caller. Concrete layout is
     /// protocol-defined; interpret via `Any::downcast_ref` inside the codec.
-    pub callsign_hash_table: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+    pub callsign_hash_table: Option<alloc::sync::Arc<dyn core::any::Any + Send + Sync>>,
 }
 
 // ──────────────────────────────────────────────────────────────────────────

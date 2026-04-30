@@ -29,9 +29,15 @@
 
 pub mod dsp;
 pub mod equalize;
+// Decode-side modules that pull `rustfft`. Gated behind `std` for the
+// embedded port; the no_std + alloc build keeps `protocol`, `tx`, and
+// the synthesis-side dsp helpers available so embedded TX builds.
+#[cfg(feature = "std")]
 pub mod llr;
+#[cfg(feature = "std")]
 pub mod pipeline;
 pub mod protocol;
+#[cfg(feature = "std")]
 pub mod sync;
 pub mod tx;
 

@@ -8,7 +8,11 @@
 //!
 //! Ported from WSJT-X `gen_ft8wave.f90` + `gfsk_pulse.f90`.
 
-use std::f32::consts::PI;
+use alloc::vec;
+use alloc::vec::Vec;
+use core::f32::consts::PI;
+#[cfg(not(feature = "std"))]
+use num_traits::Float;
 
 /// Runtime parameters of a GFSK waveform generator.
 #[derive(Clone, Copy, Debug)]

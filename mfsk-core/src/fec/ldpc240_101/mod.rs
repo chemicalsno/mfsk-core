@@ -12,6 +12,8 @@
 
 pub mod tables;
 
+use alloc::vec;
+
 use crate::core::{FecCodec, FecOpts, FecResult};
 use crate::fec::ldpc::bp::bp_decode_generic;
 use crate::fec::ldpc::osd::{ldpc_encode_generic, osd_decode_generic};

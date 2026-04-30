@@ -19,6 +19,13 @@
 //! symbol `sym` (0..=255) when the transmitter sent `bit`. Callers pass in
 //! LLRs per coded bit; `build_mettab_from_llrs` shapes them to match.
 
+#[cfg(test)]
+use alloc::vec;
+use alloc::vec::Vec;
+
+#[cfg(not(feature = "std"))]
+use num_traits::Float;
+
 /// Generator polynomial 1 — Layland–Lushbaugh r=1/2 K=32.
 pub const POLY1: u32 = 0xf2d0_5351;
 /// Generator polynomial 2 — Layland–Lushbaugh r=1/2 K=32.
