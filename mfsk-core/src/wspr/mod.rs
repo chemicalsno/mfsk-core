@@ -29,19 +29,32 @@
 //! }
 //! ```
 
+use alloc::vec;
+
 use crate::core::{FrameLayout, ModulationParams, Protocol, ProtocolId, SyncMode};
 use crate::fec::ConvFano;
 use crate::msg::Wspr50Message;
 
+// Decode-side modules pull `rustfft` (rx, spectrogram) or chain into
+// the std-gated core pipeline. Gated behind `std` for the embedded
+// port; `tx` (synthesis) and `sync_vector` (a const table) stay
+// available for TX-only embedded WSPR beacons.
+#[cfg(feature = "std")]
 pub mod decode;
+#[cfg(feature = "std")]
 pub mod rx;
+#[cfg(feature = "std")]
 pub mod search;
+#[cfg(feature = "std")]
 pub mod spectrogram;
 pub mod sync_vector;
 pub mod tx;
 
+#[cfg(feature = "std")]
 pub use decode::{WsprDecode, decode_at};
+#[cfg(feature = "std")]
 pub use rx::demodulate_aligned;
+#[cfg(feature = "std")]
 pub use search::{SearchParams, SyncCandidate, coarse_search};
 pub use sync_vector::WSPR_SYNC_VECTOR;
 pub use tx::{synthesize_audio, synthesize_type1};

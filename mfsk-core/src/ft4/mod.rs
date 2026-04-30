@@ -28,6 +28,10 @@ use crate::core::{FrameLayout, ModulationParams, Protocol, ProtocolId, SyncBlock
 use crate::fec::Ldpc174_91;
 use crate::msg::Wsjt77Message;
 
+// Decode pulls `core::pipeline` / `core::dsp::downsample` (rustfft).
+// Gated behind `std` for the embedded port; `encode` stays available
+// for TX-only embedded targets.
+#[cfg(feature = "std")]
 pub mod decode;
 pub mod encode;
 

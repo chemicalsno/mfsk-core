@@ -10,6 +10,8 @@
 //!            →  Gray-map 3 bits/symbol  →  itone[79]
 //!            →  phase accumulation  →  PCM f32 / i16
 //! ```
+use alloc::vec::Vec;
+
 use super::Ft8;
 use super::{
     ldpc::osd::ldpc_encode,

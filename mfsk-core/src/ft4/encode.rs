@@ -4,6 +4,8 @@
 //! modulation parameters (tone spacing, samples/symbol, BT) come from
 //! compile-time constants.
 
+use alloc::vec::Vec;
+
 use super::Ft4;
 use crate::core::dsp::gfsk::{GfskCfg, synth_f32, synth_i16};
 use crate::core::{FecCodec, FrameLayout, ModulationParams};

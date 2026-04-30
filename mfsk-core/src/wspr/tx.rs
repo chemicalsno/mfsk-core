@@ -11,7 +11,10 @@
 //! up (pre-compute a pulse table, convolve symbol-boundary regions) but
 //! not required for the decode-roundtrip tests this module enables.
 
+use alloc::vec::Vec;
 use core::f32::consts::TAU;
+#[cfg(not(feature = "std"))]
+use num_traits::Float;
 
 use crate::core::ModulationParams;
 
