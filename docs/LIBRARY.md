@@ -195,6 +195,21 @@ The `mfsk-ffi` sibling crate in this workspace builds a C ABI
 shared library (`libmfsk.{so,a,dylib}` + `mfsk.h`) on top of the
 same crate.
 
+#### `FecCodec` is symbol-agnostic
+
+The `FecCodec` trait surface (`core/protocol.rs`) speaks in **bits**:
+`&[u8]` info / codeword, `&[f32]` bit-LLRs, `K` and `N` counted in
+bits. The four FEC families above include two non-binary codes —
+Reed-Solomon over GF(2⁶) for JT65 and QRA over GF(2⁶) for Q65 — which
+implement the bit-level trait by packing / unpacking bits ↔ symbols
+inside their own `encode`. Their natural symbol-level decode lives
+outside `decode_soft`: `Q65Fec::decode_soft` returns `None` by design,
+and the real Q65 decode runs over GF(64) probability vectors via
+`fec::qra::Q65Codec` from `q65::rx::decode_at_for`. Counting `K` /
+`N` in bits keeps the cross-protocol invariant
+`FecCodec::N ≤ N_DATA × BITS_PER_SYMBOL` meaningful for both binary
+and non-binary codes — see §7.2.
+
 ## 2. Protocol trait hierarchy
 
 Every supported mode is described by a zero-sized type that
@@ -454,6 +469,51 @@ and `mfsk_q65_decode_with_ap_list`, each taking a `MfskQ65SubMode`
 parameter so any of the six sub-modes is reachable from C/C++/Kotlin.
 
 ## 4. Shared primitives (`core`)
+
+### Receive pipeline at a glance
+
+The complete receive flow for any wired protocol — from raw audio
+samples to decoded message text — is a chain of free functions in
+the `core` submodules below, parameterised by `P: Protocol`:
+
+```text
+┌─────────┐  coarse_sync   ┌──────────────┐  refine_candidate  ┌──────────┐
+│ samples │ ─────────────▶ │  candidates  │ ─────────────────▶ │ candidate│
+│ i16/f32 │  (FFT/Costas)  │ (f, dt, snr) │   (fine sync)      │ refined  │
+└─────────┘                └──────────────┘                    └────┬─────┘
+                                                                    │  symbol_spectra
+                                                                    ▼
+                  ┌─────────────┐  compute_llr  ┌──────────────┐  equalize_local
+                  │   LLR vec   │ ◀───────────  │     cs[]     │ ◀──────────┐
+                  │  (4 vars)   │   (per WSJT)  │   Complex    │ (per-tone  │
+                  └──────┬──────┘               │  per-symbol  │  Wiener)   │
+                         │                      └──────────────┘            │
+                         │  P::Fec::decode_soft  (LDPC BP / Fano / RS /     │
+                         │                        QRA-symbol-level)         │
+                         ▼                                                  │
+                  ┌─────────────┐                                           │
+                  │ info bits   │                                           │
+                  └──────┬──────┘                                           │
+                         │  P::Msg::unpack                                  │
+                         ▼                                                  │
+                  ┌─────────────┐                                           │
+                  │ message txt │ ──── (subtract for next iter) ────────────┘
+                  └─────────────┘
+```
+
+There is no `Demodulator` or `Receiver` trait. The receive path is
+realised as free functions in `core::sync`, `core::llr`,
+`core::equalize`, `core::pipeline`, each generic over `P: Protocol`.
+Monomorphisation produces per-protocol code identical to a hand-
+written decoder, without forcing every protocol to implement an
+n-method receive interface. `core::llr::compute_llr<P>` is the soft
+demapper: it lives as a free fn rather than a `Protocol::demap()`
+method because the spectral extraction (`symbol_spectra`), the four
+WSJT-style LLR variants (a/b/c/d) and the equaliser feed into it as
+data, not as trait composition. The same pattern applies to sync,
+equalisation and the pipeline driver — all of them take the
+protocol type as a parameter and read `P`'s associated constants
+(`NTONES`, `NSPS`, `SYNC_MODE`, …) directly.
 
 ### DSP (`mfsk_core::core::dsp`)
 

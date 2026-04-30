@@ -1,5 +1,81 @@
 # Changelog
 
+## 0.4.2 — documentation consistency pass
+
+Patch release. No public-API changes; host builds (`--features full`)
+are byte-identical to 0.4.1. Brings the README, crate docs, mfsk-ffi
+README and `docs/LIBRARY.{md,ja.md}` back in line with the 0.4.x
+reality (embedded port, Q65 family, registry semantics).
+
+### Documentation
+
+- README, lib.rs feature table and CHANGELOG updated to reflect the
+  full feature surface: `fft-rustfft` / `fft-extern` /
+  `embedded-tx` / `embedded-rx` / `esp32s3` are now listed, the
+  example `Cargo.toml` snippet uses `version = "0.4"`, and the
+  `Status` section references the embedded port instead of the
+  retired 0.3.x baseline.
+- `docs/LIBRARY.md` §4 (and the Japanese mirror) gain a single
+  receive-pipeline data-flow diagram covering the
+  `samples → coarse_sync → refine → symbol_spectra → equalize_local
+  → compute_llr → P::Fec::decode_soft → P::Msg::unpack` chain, plus
+  a paragraph spelling out *why* there is no `Demodulator` /
+  `Receiver` trait (the path is realised as free functions generic
+  over `P: Protocol` so monomorphisation produces per-protocol code
+  identical to a hand-written decoder).
+- `FecCodec` trait docstring (`mfsk-core/src/core/protocol.rs`) now
+  has a "Symbol granularity" section: the trait surface is bit-level
+  by contract, non-binary codes (Q65 QRA over GF(2⁶), JT65 RS over
+  GF(2⁶)) pack/unpack symbols inside their own `encode`, and
+  `Q65Fec::decode_soft` returns `None` by design — the real Q65
+  decode runs symbol-level via `crate::fec::qra::Q65Codec` from
+  `crate::q65::rx::decode_at_for`.
+- README adds a "Static set of protocols" callout: `PROTOCOLS` is
+  fixed at compile time by Cargo features; there is no runtime
+  `register_protocol()` API by design (every wired ZST is verified
+  by `tests/protocol_invariants.rs` and that guarantee can't be
+  extended to types unknown at compile time).
+- `mfsk-ffi/README.md` protocol table gains the missing Q65 row
+  plus the dedicated `mfsk_q65_decode{,_with_ap,_fading,_with_ap_list}`
+  + `mfsk_encode_q65` ABI entries that 0.2.0 already shipped.
+
+### Tests
+
+- `tests/protocol_invariants.rs` cross-protocol asserts tightened:
+  - `every_wired_protocol_has_a_unique_protocol_id` now derives the
+    expected distinct-id count imperatively from the active feature
+    flags, so the `unique.len() == expected` assertion is meaningful
+    under any feature combination — not just `--features full`
+    where it was previously gated.
+  - `registry_entries_match_zst_trait_constants` now asserts that
+    the count of verified entries equals `PROTOCOLS.len()`. Adding a
+    new ZST + registry entry but forgetting the matching `check!`
+    line trips this count cross-check instead of silently passing,
+    and uvpacket sub-modes are now covered by their own `check!`
+    lines.
+  - Module doc updated to call out that the per-protocol invariant
+    tests are feature-gated, so `cargo test --features full` is
+    required for full eleven-ZST coverage.
+- `mfsk-core/src/lib.rs` "Trait surface verification" section now
+  reports the actual ~25 invariants split across modulation /
+  frame-layout / codec layers (was "17") and notes the default
+  `cargo test` only exercises FT8 + FT4.
+
+### crates.io metadata
+
+- `mfsk-core/Cargo.toml` `description` rewritten to mention the
+  embedded-port story (`no_std + alloc`, pluggable FFT, ESP32-S3
+  PoC) so the crates.io listing card matches the README.
+- `categories` extended with `embedded` and `no-std` (now 5 of 5
+  slots used).
+
+### CI
+
+- `feature-matrix` job adds `q65`, `uvpacket`, `embedded-tx` and
+  `embedded-rx` rows. The embedded entries build the library
+  no_std + alloc on the Linux host; the standalone `embedded-poc/`
+  Xtensa binaries remain excluded from CI (PoC scope).
+
 ## 0.4.1 — embedded port (no_std + alloc, FFT trait, ESP32-S3 PoC)
 
 Adds an embedded-target port without breaking the existing host

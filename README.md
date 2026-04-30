@@ -68,9 +68,15 @@ Adding a new protocol is a trait impl on a ZST, not a cross-cutting
 refactor: FST4-60A joined the crate post-hoc without changing any
 shared pipeline code.
 
+The receive path is a chain of free functions in `core::sync` →
+`core::llr` → `core::equalize` → `core::pipeline` (each generic
+over `P: Protocol`), not a `Demodulator` / `Receiver` trait. See
+[`docs/LIBRARY.md` §4](https://github.com/jl1nie/mfsk-core/blob/main/docs/LIBRARY.md#4-shared-primitives-core)
+for the data-flow diagram.
+
 ```toml
 [dependencies]
-mfsk-core = { version = "0.3", features = ["ft8", "ft4"] }
+mfsk-core = { version = "0.4", features = ["ft8", "ft4"] }
 ```
 
 ## Attribution
@@ -99,6 +105,24 @@ License matches upstream: **GPL-3.0-or-later**.
 | JT65       | 60 s   | Reed-Solomon(63, 12) GF(2⁶)       | 72 bit  | 63 distributed slots   | `jt65`  |
 | Q65-30A    | 30 s   | QRA(15, 65) GF(2⁶) + CRC-12       | 77 bit  | 22 distributed slots   | `q65`   |
 | Q65-60A‥E  | 60 s   | (same QRA codec)                  | 77 bit  | (same sync layout)     | `q65`   |
+
+Seven protocol families, eleven wired ZSTs in the registry: Q65 contributes one
+30-s sub-mode (Q65-30A) plus five 60-s EME sub-modes (Q65-60A‥E) that share
+the FEC, message codec and sync layout but differ in NSPS / tone spacing.
+[`PROTOCOLS`](https://docs.rs/mfsk-core/latest/mfsk_core/static.PROTOCOLS.html)
+exposes one entry per wired ZST; `uvpacket` (when enabled) adds four
+more for its rate ladder.
+
+### Static set of protocols
+
+`PROTOCOLS` is a `const` slice — the set of supported protocols is
+fixed at compile time by Cargo features. There is no runtime
+`register_protocol()` API by design: every wired ZST is verified by
+`tests/protocol_invariants.rs` to satisfy the trait surface, and that
+guarantee can't be extended to types unknown at compile time. UI /
+FFI consumers should iterate `PROTOCOLS` (or filter via `by_id` /
+`by_name`) at startup; if you need a new protocol, add the ZST + a
+`protocol_meta!` line and rebuild.
 
 ### Applied example: `uvpacket`
 
@@ -154,6 +178,11 @@ characterisation.
 | `parallel`    | ✓       | Rayon-parallel candidate processing          |
 | `osd-deep`    |         | OSD-3 fallback on AP decodes (extra CPU)     |
 | `eq-fallback` |         | Non-EQ fallback inside `EqMode::Adaptive`    |
+| `fft-rustfft` | ✓       | Default host FFT backend (`rustfft`, requires `std`) |
+| `fft-extern`  |         | Pluggable FFT trait — caller binary supplies an `FftPlanner` impl (esp-dsp on ESP32-S3, CMSIS-DSP on RP2350, …) |
+| `embedded-tx` |         | `no_std + alloc` TX-only preset (FT8 + FT4 + WSPR, no FFT backend pulled in) |
+| `embedded-rx` |         | `no_std + alloc` RX preset (FT8 + FT4 + WSPR + `fft-extern`) |
+| `esp32s3`     |         | Alias for `embedded-rx` — used by `embedded-poc/esp32s3/` |
 
 ## Quick example
 
@@ -243,17 +272,26 @@ reference:
 
 ## Status
 
-`0.3.x` — API is deliberately not frozen. Breaking changes follow
-cargo-style minor bumps (`0.3 → 0.4`). Algorithm correctness is
-covered by ~330 tests across the workspace, including end-to-end
-synth → decode roundtrips for every protocol, an AWGN sensitivity
-sweep that confirms Q65-30A hits its WSJT-X-published −24 dB
-threshold, an AP-vs-plain comparison that shows the expected ~2 dB
-gain from a-priori call sign information, an AP-list (template
-matching) comparison that decodes 6/6 frames at SNR −25 dB where
-plain BP fails 0/6, a real 6 m EME recording (W7GJ exchanges from
-the WSJT-X reference set), and a real 10 GHz EME recording that
-the fast-fading metric is required to decode. The trait surface
-itself is pinned by `tests/protocol_invariants.rs` — a single
-generic `<P: Protocol>` checker run across every wired ZST so a
-new protocol gets structural validation without bespoke glue.
+`0.4.x` — API is deliberately not frozen. Breaking changes follow
+cargo-style minor bumps (`0.4 → 0.5`). 0.4.1 added the embedded
+port: `no_std + alloc` builds work end-to-end, the FFT backend is
+pluggable through a trait (`fft-rustfft` for host, `fft-extern` for
+embedded targets that bring their own FFT — esp-dsp, CMSIS-DSP),
+caller-buffer TX APIs (`*_into` variants, `*_OUTPUT_LEN` constants)
+let callers preallocate, and a working ESP32-S3 PoC lives at
+`embedded-poc/esp32s3/`.
+
+Algorithm correctness is covered by the workspace test suite,
+including end-to-end synth → decode roundtrips for every protocol,
+an AWGN sensitivity sweep that confirms Q65-30A hits its
+WSJT-X-published −24 dB threshold, an AP-vs-plain comparison that
+shows the expected ~2 dB gain from a-priori call sign information,
+an AP-list (template matching) comparison that decodes 6/6 frames at
+SNR −25 dB where plain BP fails 0/6, a real 6 m EME recording (W7GJ
+exchanges from the WSJT-X reference set), and a real 10 GHz EME
+recording that the fast-fading metric is required to decode. The
+trait surface itself is pinned by `tests/protocol_invariants.rs` —
+a single generic `<P: Protocol>` checker run across every wired ZST
+so a new protocol gets structural validation without bespoke glue.
+Run with `--features full` for the eleven-ZST coverage; the default
+features (`ft8`, `ft4`) only exercise the two default protocols.

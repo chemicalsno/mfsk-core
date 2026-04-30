@@ -96,7 +96,7 @@ int main() {
 ```
 
 The runnable version lives at `examples/cpp_smoke/main.cpp`; it exercises
-all six protocols + multi-threaded decode stress tests. Build and run
+the wired protocols + multi-threaded decode stress tests. Build and run
 with:
 
 ```
@@ -118,6 +118,11 @@ bash examples/cpp_smoke/build.sh
 | `mfsk_encode_wspr`         | Synthesise a Type-1 WSPR message (`call grid power_dbm`).         |
 | `mfsk_encode_jt9`          | Synthesise a standard JT9 message.                                |
 | `mfsk_encode_jt65`         | Synthesise a standard JT65 message.                               |
+| `mfsk_encode_q65`          | Synthesise a Q65 message (sub-mode selected via `MfskQ65SubMode`). |
+| `mfsk_q65_decode`          | Q65 plain BP decode (basic strategy).                             |
+| `mfsk_q65_decode_with_ap`  | Q65 BP decode with a-priori call-sign / grid hints (~2 dB gain).  |
+| `mfsk_q65_decode_fading`   | Q65 fast-fading metric (Gaussian / Lorentzian) for high-Doppler EME. |
+| `mfsk_q65_decode_with_ap_list` | Q65 AP-list (template-matching) decode (~3 dB gain when call pair is known). |
 | `mfsk_samples_free`        | Release the `f32` buffer returned by an encode.                   |
 | `mfsk_last_error`          | Thread-local last-error string (UTF-8, NUL-terminated).           |
 | `mfsk_version`             | Library version (major << 16 \| minor << 8 \| patch).             |
@@ -169,6 +174,17 @@ decoding:
 | `MFSK_PROTOCOL_WSPR`        | 120 s       | 1 440 000 samples @ 12 kHz   |
 | `MFSK_PROTOCOL_JT9`         | 60 s        | 720 000 samples @ 12 kHz     |
 | `MFSK_PROTOCOL_JT65`        | 60 s        | 720 000 samples @ 12 kHz     |
+| `MFSK_PROTOCOL_Q65A30`      | 30 s        | 360 000 samples @ 12 kHz     |
+
+The Q65 family adds five more 60-s EME sub-modes (Q65-60A‥E,
+×1/×2/×4/×8/×16 tone spacing) reachable through the dedicated
+`mfsk_q65_*` function family with a `MfskQ65SubMode` parameter
+rather than through `mfsk_decoder_new`. Use `mfsk_q65_decode` for
+the basic AWGN strategy, `mfsk_q65_decode_with_ap` for a-priori
+call-sign hints (~2 dB gain), `mfsk_q65_decode_fading` for the
+fast-fading metric required at 5.7 / 10 / 24 GHz EME, and
+`mfsk_q65_decode_with_ap_list` for BP-free AP-list template
+matching (~3 dB gain when the call pair is known up-front).
 
 Non-12 kHz input is resampled internally (linear interpolation).
 Sample rates from 8 000 Hz up to at least 96 000 Hz work.

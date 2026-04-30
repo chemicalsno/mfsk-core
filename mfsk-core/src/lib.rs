@@ -120,10 +120,15 @@
 //! | `jt9`         |          | JT9 (60 s, 9-FSK, conv r=½ K=32 + Fano)      |
 //! | `jt65`        |          | JT65 (60 s, 65-FSK, RS(63,12))               |
 //! | `q65`         |          | Q65-30A + Q65-60A‥E (65-FSK, QRA(15,65) GF(64)) |
-//! | `full`        |          | Aggregate of all seven protocols             |
+//! | `full`        |          | Aggregate of all seven protocols + uvpacket + packet-bytes |
 //! | `parallel`    | yes      | Rayon-parallel candidate processing          |
 //! | `osd-deep`    |          | OSD-3 fallback on AP decodes (extra CPU)     |
 //! | `eq-fallback` |          | Non-EQ fallback inside `EqMode::Adaptive`    |
+//! | `fft-rustfft` | yes      | Default host FFT backend (`rustfft`, requires `std`) |
+//! | `fft-extern`  |          | Pluggable FFT trait — caller binary supplies an `FftPlanner` impl |
+//! | `embedded-tx` |          | `no_std + alloc` TX-only preset (FT8 + FT4 + WSPR) |
+//! | `embedded-rx` |          | `no_std + alloc` RX preset (FT8 + FT4 + WSPR + `fft-extern`) |
+//! | `esp32s3`     |          | Alias for `embedded-rx` (used by `embedded-poc/esp32s3/`) |
 //!
 //! ## Runtime registry
 //!
@@ -153,16 +158,26 @@
 //! `tests/protocol_invariants.rs` runs a single generic
 //! `assert_protocol_invariants::<P: Protocol>` over every wired ZST
 //! (FT8 / FT4 / FST4 / WSPR / JT9 / JT65 plus all six Q65 sub-modes
-//! — 11 in total). It pins 17 trait-level invariants:
-//! `2^BITS_PER_SYMBOL ≤ NTONES`, `SYMBOL_DT × 12000 == NSPS`,
-//! `N_SYMBOLS == N_DATA + N_SYNC`, sync-mode self-consistency,
-//! `FecCodec::K ≥ MessageCodec::PAYLOAD_BITS`, and so on. Adding a
-//! new `Protocol` impl is a one-line registry edit + a one-line
-//! test invocation; the same generic body proves the new ZST's
-//! constants are internally consistent without any per-protocol
-//! glue. Drift between trait doc and implementation is caught
-//! mechanically — the work that landed Q65 surfaced one such
-//! discrepancy in `GRAY_MAP` and fixed it in the same pass.
+//! — 11 in total; uvpacket adds four more under `--features uvpacket`).
+//! It pins ~25 trait-level invariants split across three layers:
+//! modulation (`2^BITS_PER_SYMBOL ≤ NTONES`, `SYMBOL_DT × 12000 ==
+//! NSPS`, GRAY_MAP coverage and uniqueness, GFSK / tone-spacing
+//! positivity), frame layout (`N_SYMBOLS == N_DATA + N_SYNC`, sync
+//! pattern in-range, `T_SLOT_S > 0`), and codec consistency
+//! (`FecCodec::K ≥ MessageCodec::PAYLOAD_BITS`, `FecCodec::N ≤
+//! N_DATA × BITS_PER_SYMBOL`). Adding a new `Protocol` impl is a
+//! one-line registry edit + a one-line test invocation; the same
+//! generic body proves the new ZST's constants are internally
+//! consistent without any per-protocol glue. Drift between trait
+//! doc and implementation is caught mechanically — the work that
+//! landed Q65 surfaced one such discrepancy in `GRAY_MAP` and fixed
+//! it in the same pass.
+//!
+//! The default features (`ft8`, `ft4`) only exercise the two default
+//! protocols; run `cargo test --features full` (or enable a specific
+//! protocol feature) to cover the rest. The registry size and
+//! `ProtocolId` uniqueness checks adapt to whatever feature
+//! combination is active.
 //!
 //! ## Library stack
 //!

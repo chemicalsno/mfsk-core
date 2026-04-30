@@ -96,6 +96,10 @@ jobs:
           - "wspr"
           - "jt9"
           - "jt65"
+          - "q65"
+          - "uvpacket"
+          - "embedded-tx"  # no_std + alloc TX preset (host-side compile only)
+          - "embedded-rx"  # no_std + alloc RX preset (pulls fft-extern)
           - "full"
     steps:
       - uses: actions/checkout@v4

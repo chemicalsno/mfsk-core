@@ -20,6 +20,17 @@
 //! 3. **Documents the trait contract by example**: the assertions
 //!    in this file are the source-of-truth for what "a valid Q65
 //!    sub-mode looks like at the trait level".
+//!
+//! ## Feature coverage
+//!
+//! Each per-protocol test is gated on its protocol feature, so the
+//! default `cargo test` (features `ft8`, `ft4`) only exercises FT8
+//! and FT4 invariants. Run `cargo test --features full --test
+//! protocol_invariants` to validate every wired ZST (the seven WSJT
+//! protocols + four uvpacket sub-modes), or pass an individual
+//! protocol feature to scope the run. The registry-size and
+//! ProtocolId-uniqueness checks adapt to whatever feature
+//! combination is active so they're always meaningful.
 
 use mfsk_core::{
     FecCodec, FrameLayout, MessageCodec, ModulationParams, PROTOCOLS, Protocol, ProtocolId,
@@ -414,11 +425,18 @@ fn registry_entries_match_zst_trait_constants() {
     // its ZST through `assert_meta_matches_trait`. The lookup
     // happens by name (the user-facing handle), so a name typo or
     // a wrong-type macro arg in `registry.rs` is caught here.
-
+    //
+    // After the per-name checks we assert that the *count* of
+    // verified entries equals `PROTOCOLS.len()`. Adding a registry
+    // entry but forgetting the matching `check!` line trips that
+    // count assertion — without it, missing entries would be a
+    // silent gap.
+    let mut checked = 0usize;
     macro_rules! check {
         ($name:literal, $ty:ty) => {{
             let meta = by_name($name).unwrap_or_else(|| panic!("registry missing entry {}", $name));
             assert_meta_matches_trait::<$ty>(meta);
+            checked += 1;
         }};
     }
 
@@ -443,6 +461,21 @@ fn registry_entries_match_zst_trait_constants() {
         check!("Q65-60D", Q65d60);
         check!("Q65-60E", Q65e60);
     }
+    #[cfg(feature = "uvpacket")]
+    {
+        check!("UvRobust", UvRobust);
+        check!("UvStandard", UvStandard);
+        check!("UvUltraRobust", UvUltraRobust);
+        check!("UvExpress", UvExpress);
+    }
+
+    assert_eq!(
+        checked,
+        PROTOCOLS.len(),
+        "registry has {} entries but only {checked} were verified by name; \
+         a `check!` line is missing for some PROTOCOLS entry",
+        PROTOCOLS.len(),
+    );
 }
 
 #[test]
@@ -543,32 +576,60 @@ fn every_wired_protocol_has_a_unique_protocol_id() {
     }
 
     // Distinct protocol families must have distinct IDs.
-    let _unique: Vec<ProtocolId> = {
+    let unique: Vec<ProtocolId> = {
         let mut v: Vec<ProtocolId> = ids.iter().map(|(_, id)| *id).collect();
         v.sort_by_key(|id| *id as u8);
         v.dedup();
         v
     };
 
-    // Q65 + uvpacket each contribute multiple ZSTs but one ID; assert
-    // the dedupe count matches the number of distinct families.
-    #[cfg(all(
-        feature = "ft8",
-        feature = "ft4",
-        feature = "fst4",
-        feature = "wspr",
-        feature = "jt9",
-        feature = "jt65",
-        feature = "q65",
-        feature = "uvpacket"
-    ))]
+    // Expected count of distinct ProtocolId families under the active
+    // feature combination. Q65 contributes one id (6 ZSTs share it);
+    // uvpacket contributes one id (4 ZSTs share it). Every other
+    // wired protocol is one family = one id. Computed imperatively
+    // mirroring `registry_size_matches_wired_protocols` so the check
+    // adapts to any --features combo, not just `--features full`.
+    #[allow(unused_mut)]
+    let mut expected_distinct = 0usize;
+    #[cfg(feature = "ft8")]
+    {
+        expected_distinct += 1;
+    }
+    #[cfg(feature = "ft4")]
+    {
+        expected_distinct += 1;
+    }
+    #[cfg(feature = "fst4")]
+    {
+        expected_distinct += 1;
+    }
+    #[cfg(feature = "wspr")]
+    {
+        expected_distinct += 1;
+    }
+    #[cfg(feature = "jt9")]
+    {
+        expected_distinct += 1;
+    }
+    #[cfg(feature = "jt65")]
+    {
+        expected_distinct += 1;
+    }
+    #[cfg(feature = "q65")]
+    {
+        expected_distinct += 1;
+    }
+    #[cfg(feature = "uvpacket")]
+    {
+        expected_distinct += 1;
+    }
     assert_eq!(
-        _unique.len(),
-        8,
-        "expected 8 distinct ProtocolId values \
-         (FT8, FT4, FST4, WSPR, JT9, JT65, Q65, UvPacket), \
-         got {:?} from {ids:?}",
-        _unique
+        unique.len(),
+        expected_distinct,
+        "distinct ProtocolId count {} != expected {expected_distinct} \
+         under the active feature set; got {:?} from {ids:?}",
+        unique.len(),
+        unique,
     );
 
     // Each ID is a known variant (this is a static guarantee from the enum,
