@@ -184,6 +184,22 @@ mfsk_core
 ワークスペースの兄弟クレート `mfsk-ffi` が同じクレートの上に C ABI
 共有ライブラリ (`libmfsk.{so,a,dylib}` + `mfsk.h`) を構築する。
 
+#### `FecCodec` はシンボル粒度から独立
+
+`FecCodec` trait の表面 (`core/protocol.rs`) は **bit** で語る:
+`&[u8]` info / codeword、`&[f32]` bit-LLR、`K`・`N` も bit 単位。
+上記の 4 系統の FEC のうち 2 系統 — JT65 の Reed-Solomon over
+GF(2⁶) と Q65 の QRA over GF(2⁶) — は非二進符号で、bit 単位の
+trait API を満たすために `encode` の中で bit ↔ シンボル変換を
+内製している。それぞれの本来のシンボル単位デコードは
+`decode_soft` の外側に置かれていて、`Q65Fec::decode_soft` は仕様
+として `None` を返し、実際の Q65 デコードは GF(64) 確率ベクトル上の
+非二進 BP として `fec::qra::Q65Codec` で実行され、エントリポイントは
+`q65::rx::decode_at_for` になっている。`K` / `N` を bit で数えて
+おくことで、二進・非二進どちらの符号にも
+`FecCodec::N ≤ N_DATA × BITS_PER_SYMBOL` という横断的不変条件
+(§7.2) が同じ式で成り立つ。
+
 ## 2. Protocol トレイト階層
 
 対応するすべてのモードは、3 つの合成可能な trait を実装する
@@ -428,6 +444,52 @@ C ABI には同 4 戦略が `mfsk_q65_decode`、`mfsk_q65_decode_with_ap`、
 6 sub-mode のいずれにもアクセス可能。
 
 ## 4. 共有プリミティブ (`core`)
+
+### 受信パイプライン概観
+
+任意の wired プロトコルにおける受信フロー全体 — 生オーディオ
+サンプルから復号メッセージ文字列まで — は、以下に挙げる `core`
+サブモジュール内のフリー関数群を `P: Protocol` でパラメタライズ
+して鎖状に呼び出した形になっている:
+
+```text
+┌─────────┐  coarse_sync   ┌──────────────┐  refine_candidate  ┌──────────┐
+│ samples │ ─────────────▶ │  candidates  │ ─────────────────▶ │ candidate│
+│ i16/f32 │  (FFT/Costas)  │ (f, dt, snr) │   (fine sync)      │ refined  │
+└─────────┘                └──────────────┘                    └────┬─────┘
+                                                                    │  symbol_spectra
+                                                                    ▼
+                  ┌─────────────┐  compute_llr  ┌──────────────┐  equalize_local
+                  │   LLR vec   │ ◀───────────  │     cs[]     │ ◀──────────┐
+                  │  (4 vars)   │   (per WSJT)  │   Complex    │ (per-tone  │
+                  └──────┬──────┘               │  per-symbol  │  Wiener)   │
+                         │                      └──────────────┘            │
+                         │  P::Fec::decode_soft  (LDPC BP / Fano / RS /     │
+                         │                        QRA-symbol-level)         │
+                         ▼                                                  │
+                  ┌─────────────┐                                           │
+                  │ info bits   │                                           │
+                  └──────┬──────┘                                           │
+                         │  P::Msg::unpack                                  │
+                         ▼                                                  │
+                  ┌─────────────┐                                           │
+                  │ message txt │ ──── (subtract for next iter) ────────────┘
+                  └─────────────┘
+```
+
+`Demodulator` や `Receiver` という trait はない。受信経路は
+`core::sync` / `core::llr` / `core::equalize` / `core::pipeline` の
+フリー関数群として実現され、それぞれ `P: Protocol` で generic に
+なっている。Monomorphization により、手書きのプロトコル別デコーダ
+と同等のコードが生成されつつ、各プロトコルに n-method な受信
+trait の実装を強制しないで済む。Soft demap は
+`core::llr::compute_llr<P>` で、`Protocol::demap()` メソッドではなく
+フリー関数になっているのは、スペクトル抽出 (`symbol_spectra`)・
+WSJT 式 4 バリアント LLR (a/b/c/d)・equalizer がデータとして
+組み合わさるためで、trait 合成では表現が冗長になる。Sync /
+equalize / pipeline ドライバも同じスタイルで、プロトコル型を
+パラメータとして受け取り `P` の関連定数 (`NTONES`、`NSPS`、
+`SYNC_MODE` など) を直接参照する。
 
 ### DSP (`mfsk_core::core::dsp`)
 
