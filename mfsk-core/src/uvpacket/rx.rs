@@ -477,7 +477,17 @@ fn peek_header_block_count(header_info: &[u8]) -> Result<(u8, u8, u8), DecodeErr
 // ────────────────────────────────────────────────────────────────────
 
 const MAX_PICKED_PEAKS: usize = 3;
-const SYNC_GATE_RATIO: f32 = 18.0;
+/// Sync gate threshold: a candidate peak passes when
+/// `score >= median × SYNC_GATE_RATIO`. With the new differential
+/// score across 4 preamble variants, pure-noise extreme-value max
+/// vs median ratio sits around 17-22 (empirically measured on
+/// idle-mic snapshots in the deployed PWA, +0.04 amplitude RMS).
+/// 30 cleanly clears that floor; real weak signals at +5-6 dB
+/// Eb/N0 Robust reach 50+. Was 18 in the first iteration of the
+/// 0.4.0 design, which let noise trigger the LDPC decode pipeline
+/// — see `tests/uvpacket_pi4_dqpsk_eq.rs` for the threshold
+/// characterisation.
+const SYNC_GATE_RATIO: f32 = 30.0;
 
 fn decode_inner(audio: &[f32], audio_centre_hz: f32, fec_opts: &FecOpts) -> Vec<DecodedFrame> {
     if audio.len() < PREAMBLE_LEN * NSPS + RRC_LEN {
@@ -567,18 +577,24 @@ fn decode_multichannel_inner(
     fec_opts: &FecOpts,
 ) -> Vec<(f32, DecodedFrame)> {
     let mut centre = mc_opts.band_lo_hz;
+    // `peaks` records the strongest (offset, mode, score) at each
+    // centre. `all_scores` accumulates **every** score across every
+    // centre × variant × offset so we can compute a band-wide median
+    // for the sync gate — the same `median × SYNC_GATE_RATIO` rule
+    // the single-channel `decode_inner` uses.
     let mut peaks: Vec<(f32, usize, Mode, f32)> = Vec::new();
+    let mut all_scores: Vec<f32> = Vec::new();
     while centre <= mc_opts.band_hi_hz {
         let mf_out = downconvert_and_matched_filter(audio, centre);
         let max_corr_offset = mf_out.len().saturating_sub((PREAMBLE_LEN - 1) * NSPS + 1);
         if max_corr_offset > 0 {
-            // Just record the best (offset, mode, score) at this centre.
             let mut best_off = 0usize;
             let mut best_mode = Mode::Robust;
             let mut best_score = 0.0_f32;
             for offset in 0..max_corr_offset {
                 for (mode_idx, p) in PREAMBLES.iter().enumerate() {
                     let s = preamble_differential_score(&mf_out, offset, &p[..]);
+                    all_scores.push(s);
                     if s > best_score {
                         best_score = s;
                         best_off = offset;
@@ -590,6 +606,21 @@ fn decode_multichannel_inner(
         }
         centre += mc_opts.coarse_step_hz;
     }
+    if peaks.is_empty() {
+        return Vec::new();
+    }
+
+    // Band-wide sync gate: drop peaks below `median × SYNC_GATE_RATIO`
+    // before NMS / per-peak decode. Without this, a noise-only audio
+    // buffer triggers ~2-3 NMS-kept peaks, each consuming a full
+    // header + payload LDPC decode pipeline (~500 ms each in WASM)
+    // that returns 0 frames.
+    let median = robust_median(&all_scores);
+    if median <= 0.0 {
+        return Vec::new();
+    }
+    let threshold = median * SYNC_GATE_RATIO;
+    peaks.retain(|&(_, _, _, s)| s >= threshold);
     if peaks.is_empty() {
         return Vec::new();
     }
