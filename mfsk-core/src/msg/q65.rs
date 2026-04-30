@@ -20,6 +20,9 @@
 //! correct `CRC_BITS = 12` for Q65 (the CRC-12 lives at the FEC
 //! layer; see [`crate::fec::qra::Q65Codec`]).
 
+use alloc::string::String;
+use alloc::vec::Vec;
+
 use super::ap::ApHint;
 use super::wsjt77;
 use super::{CallsignHashTable, Wsjt77Message};

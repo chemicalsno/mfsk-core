@@ -29,6 +29,9 @@
 //! less common paths can be ported from `getpfx1` / `getpfx2` when
 //! needed.
 
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 use core::fmt;
 
 /// Base used to pack a 6-character callsign into a 28-bit integer.

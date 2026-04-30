@@ -11,6 +11,10 @@
 //! Type-1 messages use the same `call1 / call2 / grid-or-report / i3` field
 //! positions — so `ApHint` lives in the protocol-agnostic message layer.
 
+use alloc::string::{String, ToString};
+use alloc::vec;
+use alloc::vec::Vec;
+
 use super::wsjt77::{pack_grid4, pack28};
 use crate::core::MessageCodec;
 

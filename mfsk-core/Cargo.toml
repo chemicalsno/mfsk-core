@@ -33,6 +33,13 @@ full         = ["std", "ft8", "ft4", "fst4", "wspr", "jt9", "jt65", "q65", "pack
 embedded-tx  = ["alloc", "ft8", "ft4", "wspr"]
 embedded-rx  = ["alloc", "ft8", "ft4", "wspr"]
 
+# Target-specific presets. ESP32-S3 (Xtensa LX7 + HW FPU + esp-dsp ASM,
+# typical 8 MB PSRAM module) is the embedded reference platform; this
+# alias bundles the right baseline so caller crates only have to flip
+# one feature. The actual FFT backend (esp-dsp FFI shim) lives in the
+# downstream esp32 binary crate to keep mfsk-core target-agnostic.
+esp32s3      = ["embedded-rx"]
+
 ft8          = []
 ft4          = []
 fst4         = []
@@ -50,14 +57,17 @@ osd-deep     = []
 eq-fallback  = []
 
 [dependencies]
-num-complex = { version = "0.4", default-features = false }
+# `num-complex` carries the `Float` trait via num-traits; under no_std
+# we need `libm` to provide sin/cos/sqrt/etc. The std build pulls
+# them via num-traits/std (transitively from rustfft) and ignores libm.
+num-complex = { version = "0.4", default-features = false, features = ["libm"] }
 rustfft     = { version = "6", optional = true }
 crc         = { version = "3", default-features = false }
 rayon       = { version = "1", optional = true }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = [
-    'cfg(feature, values("std","alloc","ft8","ft4","fst4","wspr","jt9","jt65","q65","packet-bytes","uvpacket","parallel","osd-deep","eq-fallback","full","embedded-tx","embedded-rx"))',
+    'cfg(feature, values("std","alloc","ft8","ft4","fst4","wspr","jt9","jt65","q65","packet-bytes","uvpacket","parallel","osd-deep","eq-fallback","full","embedded-tx","embedded-rx","esp32s3"))',
 ] }
 
 # Build docs.rs with every protocol feature enabled so users browsing

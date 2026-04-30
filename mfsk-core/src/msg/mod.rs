@@ -32,6 +32,8 @@ pub use packet_bytes::PacketBytesMessage;
 pub use q65::Q65Message;
 pub use wspr::{Wspr50Message, WsprMessage};
 
+use alloc::vec::Vec;
+
 use crate::core::{DecodeContext, MessageCodec, MessageFields};
 
 /// WSJT 77-bit message codec used by FT8, FT4, FT2 and FST4.

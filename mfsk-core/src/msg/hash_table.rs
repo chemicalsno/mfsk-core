@@ -12,7 +12,10 @@
 //! The table is populated as callsigns are decoded and used to resolve
 //! hashed callsigns in subsequent messages.
 
-use std::collections::HashMap;
+use alloc::collections::BTreeMap as HashMap;
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 
 /// Base-38 alphabet used for callsign hashing (matches WSJT-X).
 const C38: &[u8] = b" 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ/";

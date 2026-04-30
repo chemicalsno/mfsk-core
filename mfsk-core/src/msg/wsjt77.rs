@@ -14,6 +14,10 @@
 //! `<...>` is returned as a placeholder unless a [`CallsignHashTable`] is
 //! provided via [`unpack77_with_hash`].
 
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+
 use super::hash_table::CallsignHashTable;
 
 // ── Character sets (match WSJT-X packjt77.f90) ──────────────────────────────
