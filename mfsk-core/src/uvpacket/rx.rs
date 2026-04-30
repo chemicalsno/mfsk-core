@@ -307,15 +307,26 @@ pub fn diag_sync_at(audio: &[f32], audio_centre_hz: f32) -> Option<(Mode, SyncSt
         if max_corr_offset == 0 {
             continue;
         }
-        for (mode_idx, m) in (0..NUM_PREAMBLES).filter_map(|i| mode_for_index(i).map(|m| (i, m))) {
-            if m.nsps() != nsps {
-                continue;
-            }
-            let p = preamble_for(m);
-            for offset in 0..max_corr_offset {
-                let s = preamble_differential_score(&mf_out, offset, &p[..], nsps);
-                if s > per_mode_max[mode_idx] {
-                    per_mode_max[mode_idx] = s;
+        // Resolve the nsps's preambles via mode_for_index → header_code
+        // index, so per_mode_max[] stays indexed by header_code (the
+        // public mode_idx the caller's per_mode_max snapshot uses).
+        let mut local_idx_to_global = [0usize; NUM_PREAMBLES];
+        let (nsps_modes, nsps_bits, np) = preambles_for_nsps(nsps);
+        for j in 0..np {
+            let m = nsps_modes[j].expect("populated by preambles_for_nsps");
+            local_idx_to_global[j] = m.header_code() as usize;
+        }
+        if np == 0 {
+            continue;
+        }
+        for offset in 0..max_corr_offset {
+            let scores =
+                preamble_differential_scores_multi(&mf_out, offset, &nsps_bits[..np], nsps);
+            for j in 0..np {
+                let s = scores[j];
+                let g = local_idx_to_global[j];
+                if s > per_mode_max[g] {
+                    per_mode_max[g] = s;
                 }
                 all_scores.push(s);
                 total_offsets += 1;
@@ -521,6 +532,34 @@ fn peek_header_block_count(header_info: &[u8]) -> Result<(u8, u8, u8), DecodeErr
 // ────────────────────────────────────────────────────────────────────
 
 const MAX_PICKED_PEAKS: usize = 3;
+
+/// Collect every `(Mode, preamble bits)` pair whose nsps matches the
+/// argument. Returns `(modes, preambles, count)`. Up to 4 entries —
+/// matches `NUM_PREAMBLES`. Lets the auto-detect call sites batch
+/// per-offset preamble correlations through
+/// `preamble_differential_scores_multi`.
+fn preambles_for_nsps(
+    nsps: usize,
+) -> (
+    [Option<Mode>; NUM_PREAMBLES],
+    [&'static [bool]; NUM_PREAMBLES],
+    usize,
+) {
+    let mut modes: [Option<Mode>; NUM_PREAMBLES] = [None; NUM_PREAMBLES];
+    let mut bits: [&'static [bool]; NUM_PREAMBLES] = [&[]; NUM_PREAMBLES];
+    let mut count = 0;
+    for i in 0..NUM_PREAMBLES {
+        if let Some(m) = mode_for_index(i)
+            && m.nsps() == nsps
+        {
+            modes[count] = Some(m);
+            bits[count] = preamble_for(m);
+            count += 1;
+        }
+    }
+    (modes, bits, count)
+}
+
 /// Sync gate threshold: a candidate peak passes when
 /// `score >= median × SYNC_GATE_RATIO`. With the new differential
 /// score across 4 preamble variants, pure-noise extreme-value max
@@ -552,19 +591,20 @@ fn decode_inner(audio: &[f32], audio_centre_hz: f32, fec_opts: &FecOpts) -> Vec<
             continue;
         }
         let peak_off = sym_peak_offset_for(nsps);
-        for (mode_idx, m) in (0..NUM_PREAMBLES).filter_map(|i| mode_for_index(i).map(|m| (i, m))) {
-            if m.nsps() != nsps {
-                continue;
-            }
-            let p = preamble_for(m);
-            for mf_offset in 0..max_corr_offset {
-                let score = preamble_differential_score(&mf_out, mf_offset, &p[..], nsps);
+        let (nsps_modes, nsps_bits, np) = preambles_for_nsps(nsps);
+        if np == 0 {
+            continue;
+        }
+        for mf_offset in 0..max_corr_offset {
+            let scores =
+                preamble_differential_scores_multi(&mf_out, mf_offset, &nsps_bits[..np], nsps);
+            for j in 0..np {
+                let score = scores[j];
+                let m = nsps_modes[j].expect("populated by preambles_for_nsps");
                 all_scores.push(score);
-                // audio_offset = mf_offset − sym_peak_offset_for(nsps)
                 if let Some(audio_off) = mf_offset.checked_sub(peak_off) {
                     peaks.push((audio_off, m, score));
                 }
-                let _ = mode_idx;
             }
         }
     }
@@ -651,20 +691,22 @@ fn decode_multichannel_inner(
                 continue;
             }
             let peak_off = sym_peak_offset_for(nsps);
-            for (_, m) in (0..NUM_PREAMBLES).filter_map(|i| mode_for_index(i).map(|m| (i, m))) {
-                if m.nsps() != nsps {
-                    continue;
-                }
-                let p = preamble_for(m);
-                for mf_offset in 0..max_corr_offset {
-                    let s = preamble_differential_score(&mf_out, mf_offset, &p[..], nsps);
+            let (nsps_modes, nsps_bits, np) = preambles_for_nsps(nsps);
+            if np == 0 {
+                continue;
+            }
+            for mf_offset in 0..max_corr_offset {
+                let scores =
+                    preamble_differential_scores_multi(&mf_out, mf_offset, &nsps_bits[..np], nsps);
+                for j in 0..np {
+                    let s = scores[j];
                     all_scores.push(s);
                     if s > best_score
                         && let Some(audio_off) = mf_offset.checked_sub(peak_off)
                     {
                         best_score = s;
                         best_audio_off = audio_off;
-                        best_mode = m;
+                        best_mode = nsps_modes[j].expect("populated by preambles_for_nsps");
                     }
                 }
             }
@@ -761,45 +803,69 @@ fn preamble_correlation(
     acc
 }
 
-/// Differential preamble correlator: `score = |Σ aᵢ · cᵢ|² / Σ |aᵢ|²`
-/// where `aᵢ = mf[k]·conj(mf[k-1])` and `cᵢ = bᵢ·bᵢ₋₁ ∈ ±1`. Phase-
-/// rotation invariant (cancels in the differential product), so it
-/// survives clarifier offset / LO walk much better than the
-/// coherent score.
-fn preamble_differential_score(
+/// Differential preamble correlator (multi-preamble shared form).
+///
+/// Score formula per preamble: `|Σ aᵢ · cᵢ|² / Σ |aᵢ|²` where
+/// `aᵢ = mf[k]·conj(mf[k-1])` and `cᵢ = bᵢ·bᵢ₋₁ ∈ ±1`. Phase-rotation
+/// invariant (cancels in the differential product) — survives clarifier
+/// offset / LO walk much better than the coherent correlator.
+///
+/// The differential pair products `aᵢ` and the energy `Σ|aᵢ|²` are
+/// preamble-independent, so the auto-detect call sites that score
+/// every offset against multiple preambles at the same nsps share
+/// them via this function. For K=3 preambles (the NSPS_BASE case)
+/// this saves ~36 % per offset vs running an independent scalar
+/// score per preamble. K=1 (NSPS_ULTRA) is slightly slower than the
+/// scalar form would be, but the auto-detect path always batches
+/// per-nsps so the K=1 overhead is irrelevant in practice.
+///
+/// All preambles must share the same length. Up to `NUM_PREAMBLES`
+/// per call.
+fn preamble_differential_scores_multi(
     mf_out: &[Complex32],
     offset: usize,
-    bits: &[bool],
+    preambles: &[&[bool]],
     nsps: usize,
-) -> f32 {
-    let n = bits.len();
+) -> [f32; NUM_PREAMBLES] {
+    let mut out = [0.0_f32; NUM_PREAMBLES];
+    let np = preambles.len().min(NUM_PREAMBLES);
+    if np == 0 {
+        return out;
+    }
+    let n = preambles[0].len();
     if n < 2 {
-        return 0.0;
+        return out;
     }
     let last_pos = offset + (n - 1) * nsps;
     if last_pos >= mf_out.len() {
-        return 0.0;
+        return out;
     }
-    let mut acc = Complex32::new(0.0, 0.0);
+    let mut accs = [Complex32::new(0.0, 0.0); NUM_PREAMBLES];
+    let mut prev_signs = [0.0_f32; NUM_PREAMBLES];
+    for j in 0..np {
+        prev_signs[j] = if preambles[j][0] { -1.0 } else { 1.0 };
+    }
     let mut energy = 0.0_f32;
     let mut prev_sample = mf_out[offset];
-    let mut prev_sign: f32 = if bits[0] { -1.0 } else { 1.0 };
-    for (i, &b) in bits.iter().enumerate().skip(1) {
+    for i in 1..n {
         let pos = offset + i * nsps;
         let s = mf_out[pos];
-        let cur_sign = if b { -1.0_f32 } else { 1.0 };
         let a = s * prev_sample.conj();
-        let c = cur_sign * prev_sign;
-        acc += a * c;
         energy += a.norm_sqr();
+        for j in 0..np {
+            let cur_sign = if preambles[j][i] { -1.0_f32 } else { 1.0 };
+            let c = cur_sign * prev_signs[j];
+            accs[j] += a * c;
+            prev_signs[j] = cur_sign;
+        }
         prev_sample = s;
-        prev_sign = cur_sign;
     }
-    if energy <= 0.0 {
-        0.0
-    } else {
-        acc.norm_sqr() / energy
+    if energy > 0.0 {
+        for j in 0..np {
+            out[j] = accs[j].norm_sqr() / energy;
+        }
     }
+    out
 }
 
 fn best_preamble_offset(mf_out: &[Complex32], bits: &[bool], nsps: usize) -> (usize, f32) {
