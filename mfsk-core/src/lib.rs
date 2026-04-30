@@ -260,6 +260,12 @@
     clippy::unusual_byte_groupings
 )]
 
+/// Crate version string, taken from Cargo.toml at compile time. Useful
+/// for FFI / WASM consumers that need to verify which mfsk-core they
+/// actually linked against (e.g. through a [patch.crates-io] path
+/// override that didn't get re-fingerprinted).
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub mod core;
 pub mod fec;
 pub mod msg;
@@ -310,6 +316,6 @@ pub use crate::jt65::Jt65;
 #[cfg(feature = "q65")]
 pub use crate::q65::Q65a30;
 #[cfg(feature = "uvpacket")]
-pub use crate::uvpacket::{UvExpress, UvFast, UvRobust, UvStandard};
+pub use crate::uvpacket::{UvExpress, UvRobust, UvStandard, UvUltraRobust};
 #[cfg(feature = "wspr")]
 pub use crate::wspr::Wspr;

@@ -236,7 +236,7 @@ fn main() -> std::io::Result<()> {
             0,
             AUDIO_CENTRE_HZ,
             Mode::Robust,
-            n_blocks,
+            &Default::default(),
         );
         write_wav(&path, &audio)?;
         eprintln!(
@@ -264,7 +264,7 @@ fn main() -> std::io::Result<()> {
             0,
             AUDIO_CENTRE_HZ,
             Mode::Robust,
-            n_blocks,
+            &Default::default(),
         );
         write_wav(&path, &audio)?;
         eprintln!(

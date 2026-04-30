@@ -11,18 +11,23 @@
 //! Per-mode keep counts (info kept always; parity kept after
 //! puncture):
 //!
-//! | Mode      | parity kept | total ch bits | rate              |
-//! |-----------|------------:|--------------:|-------------------|
-//! | Robust    | 139         | 240           | 101/240 = 0.421   |
-//! | Standard  | 101         | 202           | 101/202 = 0.500   |
-//! | Fast      |  51         | 152           | 101/152 = 0.665   |
-//! | Express   |  33         | 134           | 101/134 = 0.754   |
+//! | Mode        | parity kept | total ch bits | FEC rate          |
+//! |-------------|------------:|--------------:|-------------------|
+//! | UltraRobust | 139         | 240           | 101/240 = 0.421 † |
+//! | Robust      | 139         | 240           | 101/240 = 0.421   |
+//! | Standard    | 101         | 202           | 101/202 = 0.500   |
+//! | Express     |  33         | 134           | 101/134 = 0.754   |
 //!
-//! `Fast` and `Express` apply aggressive puncturing (63 % and
-//! 76 % of the mother code's 139 parity bits, respectively) — the
-//! WSJT-X authors did not design `Ldpc240_101` for puncturing, so
-//! decoder convergence at these rates is not given. The empirical
-//! AWGN sweep in `tests::modes_awgn_sweep_uniform_vs_kSR` and
+//! † UltraRobust shares Robust's no-puncture pattern; the rate
+//! difference at the modulation layer comes entirely from
+//! UltraRobust's half symbol rate (600 baud → 504 net bps vs
+//! Robust's 1008 net bps).
+//!
+//! `Express` applies aggressive puncturing (76 % of the mother
+//! code's 139 parity bits) — the WSJT-X authors did not design
+//! `Ldpc240_101` for puncturing, so decoder convergence at this
+//! rate is not given. The empirical AWGN sweep in
+//! `tests::modes_awgn_sweep_uniform_vs_kSR` and
 //! `tests::experimental_rate_3_4` characterises the per-mode
 //! behaviour and motivates the kSR-greedy puncture-set selection.
 //!
@@ -78,23 +83,32 @@ const K_INFO: usize = 101;
 /// Parity-bit count = N − K_INFO.
 const N_PARITY: usize = N - K_INFO;
 
-/// Per-mode rate / FEC posture.
+/// Per-mode rate + symbol-rate posture.
+///
+/// All modes share the same `Ldpc240_101` mother code; they differ
+/// in (a) the puncture pattern applied to the parity bits and
+/// (b) the symbol rate at which the channel bits are transmitted.
+/// `UltraRobust` is the only mode that uses a half-baud (600 baud)
+/// symbol rate — the others run at the canonical 1200 baud.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Mode {
-    /// Unpunctured `Ldpc240_101`. Native rate ≈ 0.42, 1008 net bps.
-    /// For mountain / weak-signal / deep-fading channels.
+    /// **Marathon** mode — unpunctured `Ldpc240_101` (native rate
+    /// ≈ 0.42) at **600 baud** (half the canonical symbol rate).
+    /// 504 net bps, ~−1.75 dB SNR_3kHz threshold; the lowest-
+    /// threshold mode in the lineup. The half-baud chip duration
+    /// also halves per-symbol phase walk and the relative size of
+    /// any multipath delay, giving a substantial real-channel
+    /// margin on top of the 3 dB symbol-energy gain over Robust.
+    UltraRobust,
+    /// Unpunctured `Ldpc240_101` at the canonical 1200 baud. Native
+    /// rate ≈ 0.42, 1008 net bps. Standard weak-signal posture.
     Robust,
-    /// Punctured to rate 1/2. 1200 net bps. AFSK 1200 throughput
-    /// parity plus FEC for typical NFM channels.
+    /// Punctured to rate 1/2 at 1200 baud. 1200 net bps. AFSK 1200
+    /// throughput parity plus FEC for typical NFM channels.
     Standard,
-    /// Punctured to rate 2/3. 1600 net bps. Aggressive puncturing
-    /// (63 % of parity bits dropped); BP threshold benefits ~1 dB
-    /// from kSR-greedy puncture-set selection over uniform-spread.
-    Fast,
-    /// Punctured to rate 3/4. 1800 net bps. Headline-fast mode for
-    /// strong signals; 76 % parity puncturing makes OSD-2 essentially
-    /// mandatory at the BP threshold (BP-only convergence needs ~+5 dB
-    /// Eb/N0 vs ~+3 dB with OSD-2).
+    /// Punctured to rate 3/4 at 1200 baud. 1800 net bps. Headline-
+    /// fast mode for strong signals; 76 % parity puncturing makes
+    /// OSD-2 essentially mandatory at the BP threshold.
     Express,
 }
 
@@ -102,41 +116,52 @@ impl Mode {
     /// 2-bit encoding for the frame-header `mode` field.
     pub const fn header_code(self) -> u8 {
         match self {
-            Mode::Robust => 0,
-            Mode::Standard => 1,
-            Mode::Fast => 2,
+            Mode::UltraRobust => 0,
+            Mode::Robust => 1,
+            Mode::Standard => 2,
             Mode::Express => 3,
         }
     }
 
     /// Inverse of [`Self::header_code`]. Returns `None` for any
-    /// value `> 3` (the field is 2 bits wide and all 4 codes are
-    /// valid); kept fallible for forward compatibility.
+    /// value `> 3`.
     pub const fn from_header_code(code: u8) -> Option<Self> {
         match code {
-            0 => Some(Mode::Robust),
-            1 => Some(Mode::Standard),
-            2 => Some(Mode::Fast),
+            0 => Some(Mode::UltraRobust),
+            1 => Some(Mode::Robust),
+            2 => Some(Mode::Standard),
             3 => Some(Mode::Express),
             _ => None,
         }
     }
 
-    /// Channel bits transmitted per LDPC block at this mode. The
-    /// difference between this and the mother codeword length (240)
-    /// is the count of punctured parity bits.
+    /// Channel bits transmitted per LDPC block at this mode.
     pub const fn ch_bits_per_block(self) -> usize {
         match self {
+            // UltraRobust shares Robust's puncture pattern (none) —
+            // the rate difference vs Robust is purely from the
+            // halved symbol rate, not from the FEC layer.
+            Mode::UltraRobust => 240,
             Mode::Robust => 240,
             Mode::Standard => 202,
-            Mode::Fast => 152,
             Mode::Express => 134,
+        }
+    }
+
+    /// Samples per symbol at the modem's 12 kHz sample rate. All
+    /// modes share the same audio bandwidth; UltraRobust just runs
+    /// at half the symbol rate (600 baud → 20 samples/sym), which
+    /// doubles the matched-filter integration window and yields
+    /// 3 dB more symbol energy per info bit.
+    pub const fn nsps(self) -> usize {
+        match self {
+            Mode::UltraRobust => 20,
+            _ => 10,
         }
     }
 
     /// Parity bits kept (transmitted) at this mode.
     const fn parity_kept(self) -> usize {
-        // total channel bits − info bits = parity bits transmitted.
         self.ch_bits_per_block() - K_INFO
     }
 }
@@ -153,13 +178,12 @@ pub fn keep_indices(mode: Mode) -> Vec<usize> {
     use std::sync::OnceLock;
     static ROBUST: OnceLock<Vec<usize>> = OnceLock::new();
     static STANDARD: OnceLock<Vec<usize>> = OnceLock::new();
-    static FAST: OnceLock<Vec<usize>> = OnceLock::new();
     static EXPRESS: OnceLock<Vec<usize>> = OnceLock::new();
 
     let cell = match mode {
-        Mode::Robust => &ROBUST,
+        // UltraRobust shares Robust's no-puncture pattern.
+        Mode::UltraRobust | Mode::Robust => &ROBUST,
         Mode::Standard => &STANDARD,
-        Mode::Fast => &FAST,
         Mode::Express => &EXPRESS,
     };
     cell.get_or_init(|| keep_indices_kSR_greedy(mode)).clone()
@@ -349,7 +373,12 @@ pub fn de_puncture_llr(channel_llrs: &[f32], mode: Mode) -> Vec<f32> {
 mod tests {
     use super::*;
 
-    const ALL_MODES: [Mode; 4] = [Mode::Robust, Mode::Standard, Mode::Fast, Mode::Express];
+    const ALL_MODES: [Mode; 4] = [
+        Mode::Robust,
+        Mode::Standard,
+        Mode::UltraRobust,
+        Mode::Express,
+    ];
 
     #[test]
     fn ch_bits_match_keep_indices_len() {
@@ -433,9 +462,11 @@ mod tests {
         // Sanity check against the per-mode rates documented in the
         // module-level table.
         let cases = [
+            // UltraRobust shares Robust's no-puncture pattern; the
+            // rate difference is in the symbol rate, not the FEC.
+            (Mode::UltraRobust, 240, 0.421),
             (Mode::Robust, 240, 0.421),
             (Mode::Standard, 202, 0.500),
-            (Mode::Fast, 152, 0.665),
             (Mode::Express, 134, 0.754),
         ];
         for (mode, expected_ch, expected_rate) in cases {

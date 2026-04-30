@@ -43,7 +43,7 @@ use mfsk_core::Wspr;
 use mfsk_core::q65::{Q65a30, Q65a60, Q65b60, Q65c60, Q65d60, Q65e60};
 
 #[cfg(feature = "uvpacket")]
-use mfsk_core::{UvExpress, UvFast, UvRobust, UvStandard};
+use mfsk_core::{UvExpress, UvRobust, UvStandard, UvUltraRobust};
 
 /// Invariants that depend only on `<P as ModulationParams>`.
 fn assert_modulation_invariants<P: ModulationParams>(name: &str) {
@@ -306,7 +306,7 @@ fn uvpacket_submodes_satisfy_protocol_invariants() {
     // (inherent) `MODE` puncture-posture constant differs.
     assert_protocol_invariants::<UvRobust>("UvRobust");
     assert_protocol_invariants::<UvStandard>("UvStandard");
-    assert_protocol_invariants::<UvFast>("UvFast");
+    assert_protocol_invariants::<UvUltraRobust>("UvUltraRobust");
     assert_protocol_invariants::<UvExpress>("UvExpress");
 }
 
@@ -538,7 +538,7 @@ fn every_wired_protocol_has_a_unique_protocol_id() {
         // family-level FFI tag, same rationale as Q65.
         ids.push(("UvRobust", <UvRobust as Protocol>::ID));
         ids.push(("UvStandard", <UvStandard as Protocol>::ID));
-        ids.push(("UvFast", <UvFast as Protocol>::ID));
+        ids.push(("UvUltraRobust", <UvUltraRobust as Protocol>::ID));
         ids.push(("UvExpress", <UvExpress as Protocol>::ID));
     }
 

@@ -1,5 +1,233 @@
 # Changelog
 
+## 0.4.0 — Q65 + abstraction unification
+
+First release on the 0.4 line; cumulative since the 0.2.1 crates.io
+publish. The headline is **the WSJT-family API surface**: a new
+protocol (Q65-30A), trait-level cleanups that close abstraction
+leaks the multi-protocol port surfaced, and a registry that gives
+every protocol a uniform metadata view. The in-tree `uvpacket`
+applied-example module is also rebuilt end-to-end (separate
+section below) but it is gated behind `--features uvpacket` and
+not part of the default-features API.
+
+### WSJT-family additions (BREAKING vs 0.2.1)
+
+- **Q65-30A** — full decode / encode / synthesis port from WSJT-X,
+  including fast-fading log-likelihoods and AP-list handling. New
+  `Q65a30` re-export, `--features q65`. (Cumulative across 0.3.x.)
+- **`MessageCodec::verify_info`** — CRC verification lifted out of
+  the LDPC layer into the message-codec trait, so the FEC code no
+  longer has hard-coded knowledge of CRC-24 vs CRC-14 dispatch.
+  Required because the same `Ldpc240_101` mother code is now
+  shared across FST4 (CRC-24, 77-bit msg) and Q65 (CRC-14, 91-bit
+  msg) and `uvpacket` (CRC-16, 96-bit raw bytes).
+- **`Ldpc240_101` family unified** — single LDPC implementation
+  used by FST4, Q65, and uvpacket (previously each had its own
+  copy with subtle constant divergence).
+- **`ProtocolMeta` registry** — every `Protocol` impl exposes a
+  uniform metadata block (band rate, Costas pattern length,
+  symbol count, …). Cross-protocol invariant tests assert the
+  registry stays internally consistent (`tests/protocol_invariants.rs`).
+- **`PacketBytesMessage`** — variable-length-bytes message codec,
+  exposed as `--features packet-bytes`. Used as the byte-pipe
+  building block for callers that want LDPC + interleaver + sync
+  but do not need WSJT-77's structured-message dispatch.
+- **`mfsk_core::VERSION`** — crate version constant, useful for
+  FFI / WASM consumers verifying which build they linked against.
+
+The trait reshuffle is the breaking part: `MessageCodec` impls
+that were closed against `mfsk-core ≤ 0.2.1` need to add the new
+`verify_info` method. Default implementations cover the common
+"length-then-CRC" cases.
+
+### `uvpacket` applied example (gated, redesigned)
+
+`uvpacket` is an in-tree example of how the abstractions handle a
+non-WSJT mode (3 kHz NFM / SSB voice-channel packet protocol).
+**Breaking changes within `--features uvpacket` are expected
+within the 0.4.x line** — pin the exact patch version if you depend
+on it. ABI consolidation will follow in a future release.
+
+The 0.4 redesign replaced the 0.3.x coherent-QPSK pipeline (which
+failed over-the-air despite passing AWGN bench) with a
+single-carrier **π/4-shifted DQPSK** modem at 1200 / 600 baud:
+
+- 127-chip BPSK m-sequence preamble, **four primitive-polynomial
+  variants** (one per `Mode`). Sync identifies the time offset
+  and the payload mode in one matched-filter pass per centre.
+- **9-tap T-spaced LMS equaliser** trained closed-form on the
+  preamble. Differential demod is invariant to constant phase
+  rotation and tolerates LO walk / clarifier offset to the AFC
+  search-range limit; no pilots needed.
+- **Dedicated header LDPC block** (Robust, unpunctured) carries
+  `(block_count, app_type, sequence)` + CRC-16. Receiver decodes
+  the header first (1 LDPC), reads `n_blocks`, then decodes the
+  payload (`n_blocks` LDPCs). Total `1 + n_blocks` LDPC decodes
+  per frame, vs ≤ 128 brute-force before.
+- **AFC** at sync time, ±200 Hz default; callers widen for
+  harsher channels.
+- **UltraRobust** mode (header_code 0): half-baud (600 Hz)
+  variant of Robust for marathon QSL on weak SSB / V-UHF mountain
+  paths. ~4 dB tougher than Robust on every fading channel
+  measured (Rayleigh, SSB realistic, FM realistic), see the
+  positioning matrix in `docs/UVPACKET.md` §3.1.
+- **WSJT-X-compatible SNR reporting** on every decoded frame
+  (`DecodedFrame.snr_db`, dB / 2.5 kHz reference, −30 dB floor).
+  Per-mode calibrated to ±0.3 dB residual against AWGN truth.
+- **Shared-pair preamble correlator** — auto-detect path shares
+  the differential pair products `aᵢ = mf[k]·conj(mf[k-1])`
+  across the 3 NSPS_BASE preambles, ~36 % per-offset reduction at
+  K=3. Bit-identical PER vs the per-preamble form (verified via
+  `tests/uvpacket_per_modes_sweep`).
+
+Removed from the 0.3 uvpacket:
+- All coherent-QPSK encode / decode entry points; pilot symbols
+  and the LMS phase tracker.
+- 31-chip preamble + spread-header indirection (replaced by the
+  4-variant 127-chip preamble + dedicated header block).
+- Brute-force `(mode × n_blocks)` layout sweep.
+- `framing::pack` / `framing::unpack` (replaced by `pack_header` /
+  `unpack_header`; mode field removed from the header word).
+- `UvFast` mode (header_code 2 ≤ 0.3.5); replaced by `UvUltraRobust`.
+
+### Performance characterisation
+
+PER thresholds (90 %, Eb/N0_info / SNR_2.5kHz dB) for the four
+uvpacket modes on the channel models in
+`mfsk-core/tests/common/air_channel.rs`:
+
+| Mode (net bps) | AWGN | Rayleigh fd=5 | SSB realistic | FM realistic | Multipath 3-tap |
+|---|---:|---:|---:|---:|---:|
+| **UltraRobust** (504) | +4 / −3.7 | +8 / +0.3 | +4 / −3.7 | +6 / −1.7 | +6 / −1.7 |
+| Robust (1008) | +6 / +1.3 | +12 / +7.3 | +8 / +3.3 | +10 / +5.3 | +8 / +3.3 |
+| Standard (1200) | +8 / +4.0 | +12 / +8.0 | +8 / +4.0 | +10 / +6.0 | +10 / +6.0 |
+| Express (1800) | +10 / +7.8 | +20 / +17.8 | >+15 / >+12.8 | +20 / +17.8 | fail |
+
+Reproduce via `cargo test --release --features uvpacket --test
+uvpacket_per_modes_sweep -- --ignored --nocapture`.
+
+## 0.3.5 (continued) — 2026-04-29
+
+uvpacket sync detector rewrite — replaces `|⟨preamble, mf_out⟩|²` as
+the per-offset score with the **normalised coherence ratio**
+`|⟨preamble, mf_out⟩|² / Σ|sᵢ|²`, fixing a structural false-sync
+class that the 0.3.4 / 0.3.5 sync gate band-aids couldn't reach.
+
+(In-place 0.3.5 update — no version bump to keep the published-crate
+history clean. The earlier 0.3.5 entry below describes the
+non-zero-median fix that this commit completes.)
+
+### Background
+
+The old detector summed `±sᵢ` for the 31 BPSK preamble bits and used
+`|sum|²` as the match score. By Cauchy-Schwarz that magnitude is
+bounded by `N·Σ|sᵢ|²`, but the bound is reached **only** when `sᵢ ∝
+b̄ᵢ` for all i (the actual coherent-preamble signature). For a single
+dominant sample (microphone click, USB plug-event, fan tick, …) the
+sum is nearly as large as if the whole preamble had aligned, yet
+*only one* sample contributed coherently. The old detector saw
+"large magnitude" and accepted; the LDPC sweep then ran on noise.
+
+uvpacket-web field reports showed `max/median = 139` from a single
+field-amplitude impulse, vs `≤ 17` for proper noise. New direct
+measurement: an isolated single-sample spike of 0.5 amplitude in
+30 k samples of noise gives `max/median = 2209` under the old
+detector — false sync every snapshot in environments with any
+impulsive interference.
+
+### Fixed
+
+- New `preamble_coherence_score(mf_out, offset) -> f32` returns the
+  normalised ratio. Bounded above by `PREAMBLE_LEN = 31`; saturates
+  at 31 for a coherent BPSK preamble; collapses to ~1 for any
+  single-sample dominance or random uncorrelated content.
+- `rx::decode` and `rx::diag_sync_stats` now generate scores via
+  `preamble_coherence_score` instead of `preamble_correlation(...).
+  norm_sqr()`. The downstream `SYNC_PEAK_REL_TO_MEDIAN = 20×` gate
+  and the threshold-relative-NMS peak picking are unchanged — only
+  the *scoring metric* changed.
+
+### Empirical (release, 30 000-sample buffers)
+
+| scenario               | old detector | new detector |
+|------------------------|--------------|--------------|
+| pure white noise       | 13.5         | 12.3         |
+| 1500 Hz tone           | 6.3          | 6.2          |
+| 1200 Hz tone           | 2.5          | 2.8          |
+| **noise + 0.5 click**  | **2 209**    | **10.6**     |
+| AM(1500 Hz, 1200 Hz)   | 8.4          | 8.9          |
+| strong tone @ 1500 Hz  | 6.2          | 7.1          |
+| **real preamble +10 dB**| (varies)    | **46.5**     |
+
+The impulse case dropped from 2 209 to 10.6 (well below the 20×
+gate); the real-preamble case climbed to 46.5 (well above). Clean
+separation, while every other point on the table is roughly
+unchanged. All 271 existing uvpacket tests pass byte-identically —
+the metric is mathematically equivalent for actual preambles.
+
+### Roadmap note
+
+A longer preamble (127 or 255 bits) would push the real-signal
+saturation ratio higher (linear in `N`) without affecting the
+noise floor, giving more headroom. That's a wire-format break and
+deferred for now; the 31-bit + coherence-score combination already
+restores the gate's intended noise rejection.
+
+## 0.3.5 — 2026-04-29
+
+uvpacket sync-gate hardening: 0.3.4's `max/median ≥ 20` rejection
+collapsed to a no-op when the input buffer was partially zero (e.g.
+the first few seconds of a fresh ring-buffer capture in uvpacket-web,
+where the unfilled portion of the worklet's ring buffer was being
+returned as zeros). With > 50 % of correlation scores at exactly 0,
+`median(scores) = 0` and the defensive `if median <= 0 { return true }`
+branch let noise through to the LDPC sweep — the very runaway 0.3.4
+was supposed to fix.
+
+### Fixed
+
+- `global_max_is_sync_outlier` and `diag_sync_stats` now compute the
+  median over **non-zero scores only**. An all-zero buffer (no audio
+  at all) trivially rejects; a partially-zero buffer (e.g. ring-buffer
+  pre-fill) produces a meaningful median from the real-audio portion.
+- Adds `tests/uvpacket_noise_floor.rs::noise_floor_half_zero_buffer`
+  as a regression test (7 s buffer, first half zeros, second half
+  σ=0.003 noise). Confirmed: 0 frames, 2.3 ms decode.
+
+No behaviour change for buffers without zero-padding artefacts (all
+271 existing uvpacket tests still pass byte-identically).
+
+## 0.3.4 — 2026-04-29
+
+uvpacket RX: hard sync-rejection on the auto-detect path, fixing a
+runaway-CPU bug discovered by uvpacket-web (https://jl1nie.github.io/webft8/uvpacket/)
+under steady-state listening on noise-only audio.
+
+### Fixed
+
+- `uvpacket::rx::decode` and `uvpacket::rx::decode_multichannel` now
+  short-circuit when the global preamble-correlation peak is not a
+  clear outlier from the score-distribution median (≥ `20×` median).
+
+  On pure χ²(2)-distributed noise the natural `max/median` ratio
+  saturates around `ln(N)/ln(2) ≈ 17` (extreme-value statistics over
+  `N ≈ 80 k` correlation offsets in a 7 s buffer); on real signal at
+  +1 dB Eb/N0_info — Robust mode's 50 %-PER threshold — the ratio
+  is `≈ 56`. The 20× gate cleanly separates them with a 4.5 dB
+  signal-side margin (rejection at `−3.5 dB SNR`, well below any
+  rate's actual decoding threshold).
+
+  Without the gate, the 50 % relative-peak threshold left ~290 false
+  NMS-survived peaks per 7 s noise buffer, each running a
+  `4 modes × 32 n_blocks` LDPC BP+OSD-2 sweep — empirically 30–180 s
+  of release-mode work per call. With the gate, a noise buffer
+  short-circuits in `~330 µs` (≈ 7 000× speedup; new test
+  `tests/uvpacket_noise_floor.rs`).
+
+  No behaviour change for real signals — all 271 existing uvpacket
+  tests still pass byte-identically.
+
 ## 0.3.3 — 2026-04-29
 
 Multi-channel SSB receive + slotted-ALOHA TX primitives for

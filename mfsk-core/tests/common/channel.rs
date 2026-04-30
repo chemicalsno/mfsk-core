@@ -245,7 +245,12 @@ mod tests {
         // Use a representative 4-FSK-era signal power (P = 0.5) so
         // the test bounds are absolute rather than measurement-tied.
         let p = 0.5;
-        for mode in [Mode::Robust, Mode::Standard, Mode::Fast, Mode::Express] {
+        for mode in [
+            Mode::Robust,
+            Mode::Standard,
+            Mode::UltraRobust,
+            Mode::Express,
+        ] {
             let sigma_clean = awgn_sigma_for_eb_n0_info(mode, 100.0, p);
             let sigma_zero = awgn_sigma_for_eb_n0_info(mode, 0.0, p);
             assert!(sigma_clean < 1e-3, "{mode:?}: clean σ {sigma_clean}");
@@ -262,9 +267,13 @@ mod tests {
     /// for them — i.e. σ decreases with rate.
     #[test]
     fn sigma_decreases_with_rate() {
+        // UltraRobust shares Robust's FEC rate (only the symbol
+        // rate differs), so σ at fixed Eb/N0 is identical between
+        // them — exclude UltraRobust from this strict-monotonic
+        // test and check only the FEC-rate-distinct modes.
         let eb_n0 = 0.0;
         let p = 0.5;
-        let sigmas: Vec<f32> = [Mode::Robust, Mode::Standard, Mode::Fast, Mode::Express]
+        let sigmas: Vec<f32> = [Mode::Robust, Mode::Standard, Mode::Express]
             .iter()
             .map(|&m| awgn_sigma_for_eb_n0_info(m, eb_n0, p))
             .collect();

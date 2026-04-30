@@ -113,15 +113,19 @@ fn decode_multichannel_awgn_smoke() {
     add_at(&mut audio, &burst_a, 0);
     add_at(&mut audio, &burst_b, 200);
 
-    // Use one σ, calibrated to the louder of the two bursts (lower bound).
+    // Use one σ, calibrated to the combined audio power. Each
+    // burst sees ~3 dB less effective SNR; with the post-redesign
+    // differential-demod threshold near +6 dB Eb/N0, both bursts
+    // need ≥ +9 dB combined to clear threshold. +12 dB gives
+    // comfortable margin for both decodes.
     let sp = signal_power(&audio);
-    let sigma = awgn_sigma_for_eb_n0_info(Mode::Robust, 8.0, sp);
+    let sigma = awgn_sigma_for_eb_n0_info(Mode::Robust, 12.0, sp);
     AwgnChannel::new(sigma, 0xCAFE_BABE).apply(&mut audio);
 
     let frames = decode_multichannel(&audio, &MultiChannelOpts::default(), &default_fec_opts());
     assert!(
         frames.len() >= 2,
-        "expected ≥ 2 frames at +8 dB, got {}",
+        "expected ≥ 2 frames at +12 dB, got {}",
         frames.len()
     );
 }
