@@ -259,6 +259,14 @@
     clippy::needless_range_loop,
     clippy::unusual_byte_groupings
 )]
+// `no_std` build is gated on the absence of the default `std` feature.
+// When `alloc` is on we pull in `extern crate alloc` so modules can
+// reach `alloc::vec::Vec` etc. without caring whether they compile
+// against `std` or not.
+#![cfg_attr(not(feature = "std"), no_std)]
+
+#[cfg(feature = "alloc")]
+extern crate alloc;
 
 /// Crate version string, taken from Cargo.toml at compile time. Useful
 /// for FFI / WASM consumers that need to verify which mfsk-core they

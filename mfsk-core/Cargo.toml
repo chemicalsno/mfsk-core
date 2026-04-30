@@ -10,8 +10,29 @@ keywords    = ["wsjt", "ft8", "q65", "amateur-radio", "dsp"]
 categories  = ["science", "encoding", "multimedia::audio"]
 
 [features]
-default      = ["ft8", "ft4", "parallel"]
-full         = ["ft8", "ft4", "fst4", "wspr", "jt9", "jt65", "q65", "packet-bytes", "uvpacket"]
+default      = ["std", "ft8", "ft4", "parallel"]
+
+# Standard-library availability. Pulls in `rustfft` (std-only) and
+# enables the rayon-based parallel iterators; required for every
+# protocol's wide-band decode path because `rustfft::FftPlanner` is
+# the default FFT backend. `no_std + alloc` builds turn this off and
+# pick a no_std FFT implementation via the `fft-*` features below.
+std          = ["alloc", "dep:rustfft"]
+
+# `no_std + alloc` baseline. All protocol modules that allocate
+# (`Vec`, `Box`, `String`) need this; only purely-stack code can
+# avoid it. The crate top-level enables `extern crate alloc` whenever
+# this feature is on.
+alloc        = []
+
+# Aggregate features.
+full         = ["std", "ft8", "ft4", "fst4", "wspr", "jt9", "jt65", "q65", "packet-bytes", "uvpacket"]
+
+# Embedded presets (no_std + alloc, no rustfft, no rayon).
+# Plumb caller-provided FFT via the `fft-*` features below.
+embedded-tx  = ["alloc", "ft8", "ft4", "wspr"]
+embedded-rx  = ["alloc", "ft8", "ft4", "wspr"]
+
 ft8          = []
 ft4          = []
 fst4         = []
@@ -24,19 +45,19 @@ packet-bytes = []
 # whose `Wsjt77Message::verify_info` length-dispatch logic (CRC-24
 # vs CRC-14) is wired through fst4's path.
 uvpacket     = ["fst4"]
-parallel     = ["dep:rayon"]
+parallel     = ["std", "dep:rayon"]
 osd-deep     = []
 eq-fallback  = []
 
 [dependencies]
-num-complex = "0.4"
-rustfft     = "6"
-crc         = "3"
+num-complex = { version = "0.4", default-features = false }
+rustfft     = { version = "6", optional = true }
+crc         = { version = "3", default-features = false }
 rayon       = { version = "1", optional = true }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = [
-    'cfg(feature, values("ft8","ft4","fst4","wspr","jt9","jt65","q65","packet-bytes","uvpacket","parallel","osd-deep","eq-fallback","full"))',
+    'cfg(feature, values("std","alloc","ft8","ft4","fst4","wspr","jt9","jt65","q65","packet-bytes","uvpacket","parallel","osd-deep","eq-fallback","full","embedded-tx","embedded-rx"))',
 ] }
 
 # Build docs.rs with every protocol feature enabled so users browsing
