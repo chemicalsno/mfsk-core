@@ -18,9 +18,13 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use mfsk_core::fec::qra::FadingModel;
 use mfsk_core::msg::ApHint;
 use mfsk_core::q65::search::SearchParams;
-use mfsk_core::q65::{Q65a60, decode_scan, decode_scan_with_ap, decode_scan_with_ap_for};
+use mfsk_core::q65::{
+    Q65a30, Q65a60, decode_scan, decode_scan_fading_for, decode_scan_with_ap,
+    decode_scan_with_ap_for,
+};
 
 /// Minimal WAV reader for WSJT-X's exact format: RIFF/WAVE header,
 /// `fmt ` chunk = PCM (1 channel, 12 kHz, 16-bit), `data` chunk =
@@ -69,8 +73,25 @@ fn samples_dir(rel: &str) -> Option<PathBuf> {
     if dir.is_dir() { Some(dir) } else { None }
 }
 
+/// Smoke test: the Q65-30A receive chain (plain BP + AP + fast-fading
+/// metric) runs to completion against every WSJT-X ionoscatter
+/// reference recording without panicking, and the WAV reader handles
+/// the file format correctly.
+///
+/// **Decode rate is not asserted** because the WSJT-X ionoscatter
+/// sample set typically requires **multi-period averaging** — a
+/// strategy where WSJT-X stacks several adjacent slots in
+/// time-frequency before running BP / fast-fading, recovering
+/// signals that sit below any individual slot's threshold. That path
+/// is not yet ported to mfsk-core. As of 0.4.2 this port produces
+/// 0/4 decodes across plain BP / AP-CQ / fast-fading
+/// {3, 8, 15} × {Gaussian, Lorentzian}. When multi-period averaging
+/// lands, this test should be promoted to require non-zero decodes
+/// (or a sibling strict test added). Current scope: catch a panic /
+/// WAV-reader / search-params regression so the existing chain
+/// stays healthy in the meantime.
 #[test]
-fn ionoscatter_6m_samples_yield_some_decode() {
+fn ionoscatter_6m_receive_chain_runs() {
     let Some(dir) = samples_dir("30A_Ionoscatter_6m") else {
         eprintln!(
             "skipping: WSJT-X sample tree not found at ../../WSJT-X/samples/Q65/30A_Ionoscatter_6m/"
@@ -89,11 +110,7 @@ fn ionoscatter_6m_samples_yield_some_decode() {
         "WSJT-X Q65-30A sample dir contains no .wav files"
     );
 
-    // Wide search params: the signal in a real recording can start
-    // anywhere in the slot, not just at the nominal +1 s offset.
     // ±50 symbols × 0.3 s/sym ≈ ±15 s around the slot midpoint.
-    let mut total = 0usize;
-    let mut decoded_at_least_one = 0usize;
     let nominal_mid = 12_000 * 15; // 15 s into the 30 s slot
     let params = SearchParams {
         freq_min_hz: 200.0,
@@ -103,14 +120,7 @@ fn ionoscatter_6m_samples_yield_some_decode() {
         max_candidates: 32,
     };
 
-    // Try a few common AP guesses on each recording. Without knowing
-    // the actual exchange, "CQ" is the most common starting hint
-    // (most ionoscatter signals are calling CQ).
-    let hints = [
-        ("plain", ApHint::new()),
-        ("CQ", ApHint::new().with_call1("CQ")),
-    ];
-
+    let mut wav_count = 0usize;
     for path in &entries {
         let audio = match read_wsjtx_wav(path) {
             Some(a) => a,
@@ -119,42 +129,39 @@ fn ionoscatter_6m_samples_yield_some_decode() {
                 continue;
             }
         };
-        total += 1;
-        let mut hit = false;
-        for (label, hint) in &hints {
-            let decodes = if hint.has_info() {
-                decode_scan_with_ap(&audio, 12_000, nominal_mid, &params, hint)
-            } else {
-                decode_scan(&audio, 12_000, nominal_mid, &params)
-            };
-            let names: Vec<String> = decodes.iter().map(|d| d.message.clone()).collect();
-            println!(
-                "{} [{label}]: {} decode(s) → {names:?}",
-                path.file_name().unwrap().to_string_lossy(),
-                decodes.len()
-            );
-            if !decodes.is_empty() {
-                hit = true;
-            }
-        }
-        if hit {
-            decoded_at_least_one += 1;
-        }
-    }
+        wav_count += 1;
 
-    // Real-world ionoscatter signals exhibit Doppler spread, multi-
-    // path fading, and may sit close to the noise floor. Q65's
-    // fast-fading metric in WSJT-X helps with that; that path is
-    // not yet ported here, so we do NOT insist on any specific
-    // decode rate. The test runs to validate that:
-    //   - .wav reading succeeds,
-    //   - decode_scan runs to completion without crashing on real
-    //     audio,
-    //   - the printed table can be inspected to track real-world
-    //     fidelity as the receiver evolves.
-    eprintln!(
-        "[info] {decoded_at_least_one}/{total} WSJT-X Q65-30A ionoscatter recordings \
-         produced at least one decode (fast-fading path not yet ported)"
+        // Three receive paths must all complete without panic. Decode
+        // counts are reported but not asserted — see this test's
+        // docstring for why ionoscatter is currently a known gap.
+        let plain = decode_scan(&audio, 12_000, nominal_mid, &params);
+        let cq = decode_scan_with_ap(
+            &audio,
+            12_000,
+            nominal_mid,
+            &params,
+            &ApHint::new().with_call1("CQ"),
+        );
+        let fading = decode_scan_fading_for::<Q65a30>(
+            &audio,
+            12_000,
+            nominal_mid,
+            &params,
+            8.0,
+            FadingModel::Gaussian,
+            None,
+        );
+        eprintln!(
+            "{}: plain={} cq={} fading_b90=8={}",
+            path.file_name().unwrap().to_string_lossy(),
+            plain.len(),
+            cq.len(),
+            fading.len(),
+        );
+    }
+    assert!(
+        wav_count > 0,
+        "no readable WAVs in WSJT-X Q65-30A ionoscatter sample dir"
     );
 }
 
