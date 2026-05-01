@@ -62,16 +62,17 @@ static mut BASIS_IM: [i16; BASIS_SCRATCH_LEN] = [0; BASIS_SCRATCH_LEN];
 const OSD_ENABLED: bool = false;
 
 /// Pass 1 (coarse_sync) candidate cap, BEFORE the manual Pass 2
-/// `sync_quality_block0` re-rank. coarse_sync's per-band score
-/// `t / mean_others` is broken on busy bands — strong signals at
-/// fractional FFT bin positions (e.g. W1FC at 2572 Hz on qso3,
-/// SNR 0 dB) score LOWER than weak phantoms, so just truncating to
-/// `max_cand=30` cuts the truth signals out (host coarse_sync diag
-/// on qso3 puts W1FC at rank 56, WM3PEN at rank 58, K1BZM at rank 52).
-/// Pass 2 re-ranks the wider top-100 by Costas-block-0 sync_quality
-/// (the metric stage 3's `q > 12` gate uses) and truncates to
-/// `max_cand` for the expensive full-Costas + LLR + BP staircase.
-const PASS1_LIMIT: usize = 100;
+/// `sync_quality_block0` re-rank. The earlier 100 was needed because
+/// coarse_sync's bare `t / mean_others` ratio exploded on the fp path
+/// (u16-quantised `mean_others` underflowing on phantom carriers,
+/// inflating their scores 100-1000× over real signals). With the
+/// regularised `t / (mean_others + ε)` shipped in mfsk-core, host
+/// real-QSO sweep showed PASS1 ∈ {75, 100} both hit the 15/22 recall
+/// ceiling on the 3-WAV corpus; PASS1 ∈ {30, 50} drops one weak qso1
+/// signal (-17 dB OH3NIV ZS6S). 75 is the smallest cap that keeps
+/// full recall — Pass 2 cost is linear in PASS1 so 100 → 75 saves
+/// ~0.33 s/slot.
+const PASS1_LIMIT: usize = 75;
 
 /// Real on-air FT8 slots — 12 kHz / mono / 16-bit PCM. Each ≈ 360 KB.
 /// Two consecutive slots from `jl1nie/rs-ft8n`'s benchmark data plus
@@ -140,21 +141,15 @@ fn main() {
     );
     log::info!("baked WAVs: {}", QSO_WAVS.len());
 
-    // Runtime parameter sweep. v4: focus on the high-recall band
-    // (max_cand ∈ {12, 20}) and vary the sync_quality gate
-    // (`q > q_thresh`). i16 FFT precision loss may suppress the
-    // q value of a real signal below 6 (the f32-calibrated
-    // default); a looser gate at q > 3 should recover those.
-    // 2 × 2 × 2 × 2 = 16 configs × 3 WAVs = 48 decodes.
-    // Single config — sweet spot from earlier sweeps. max_cand=30
-    // balances real-QSO recall (~67 % vs frame on host fp) against
-    // Core2 time budget. Parabolic dt only (dt/df grids hurt recall
-    // empirically). q_thresh=6 (q>3 same recall, just slower).
-    // max_cand = stage 3 budget (cands eligible for full Costas DFT
-    // + LLR + BP). Pass 1 (coarse_sync) emits PASS1_LIMIT; Pass 2
-    // re-ranks by sync_quality_block0 and truncates to max_cand for
-    // the expensive stage 3 work. See `decode_one`.
-    const MAX_CAND_SWEEP: &[usize] = &[30];
+    // max_cand sweep — host PASS1×max_cand sweep at PASS1=75 showed
+    // identical 15/22 truth recall for max_cand ∈ {15, 20, 30}; only
+    // the time changes (stage 3 work is per-cand). 15 is the floor
+    // for full host recall; 20 leaves slack for the i16 path's slight
+    // SNR loss vs host f32; 30 is the previous default (kept for
+    // direct A/B). On Core2 the difference shows up as stage 3 cost:
+    // ~0.14 s/cand × Δmax_cand. Parabolic dt only (dt/df grids
+    // empirically hurt recall on busy bands).
+    const MAX_CAND_SWEEP: &[usize] = &[15, 20, 30];
     const DT_GRID_SWEEP: &[u8] = &[0];
     const DF_GRID_SWEEP: &[u8] = &[0];
     // q>12 (instead of q>6): skips compute_llr (full) for borderline
