@@ -56,6 +56,8 @@
 #[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub mod decode;
 #[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
+pub mod decode_block;
+#[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub mod downsample;
 #[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub mod equalizer;

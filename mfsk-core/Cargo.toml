@@ -48,6 +48,15 @@ esp32s3      = ["embedded-rx"]
 fft-rustfft  = ["std", "dep:rustfft"]
 fft-extern   = ["alloc"]
 
+# Fixed-point migration of `decode_block` hot internals (i16
+# spectrogram, i16 LLR, optional i16 BP). Off by default — host stays
+# bit-identical to the existing f32 path. Embedded targets that turn
+# this on get halved PSRAM bandwidth + a viable path on FPU-less MCUs
+# (RP2040, RP2350-Hazard3, Cortex-M0/M0+/M3). See plan
+# `~/.claude/plans/giggly-stirring-origami.md` and the per-stage
+# Q-format table therein.
+fixed-point  = []
+
 # Lightweight modes — embedded-port-clean. `fft-rustfft` (host) or
 # `fft-extern` (embedded) is required at the crate level for the
 # decode pipeline; the protocol features themselves only enable the
@@ -89,7 +98,7 @@ rayon       = { version = "1", optional = true }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = [
-    'cfg(feature, values("std","alloc","ft8","ft4","fst4","wspr","jt9","jt65","q65","packet-bytes","uvpacket","parallel","osd-deep","eq-fallback","full","embedded-tx","embedded-rx","esp32s3","fft-rustfft","fft-extern"))',
+    'cfg(feature, values("std","alloc","ft8","ft4","fst4","wspr","jt9","jt65","q65","packet-bytes","uvpacket","parallel","osd-deep","eq-fallback","full","embedded-tx","embedded-rx","esp32s3","fft-rustfft","fft-extern","fixed-point"))',
 ] }
 
 # Build docs.rs with every protocol feature enabled so users browsing

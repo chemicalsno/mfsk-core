@@ -118,7 +118,27 @@ fn normalize_bmet(bmet: &mut [f32]) {
 // ──────────────────────────────────────────────────────────────────────────
 
 /// Compute soft LLRs from the flat symbol-spectra vector.
+///
+/// All four LLR variants (llra, llrb, llrc, llrd) are produced.
+/// Costs grow with `nsym`: nsym=3 alone is ~80 % of the work
+/// because nt = 512 = 8³ tone-combinations. Callers that only need
+/// `llra`/`llrd` (the BP-only path) should use [`compute_llr_fast`]
+/// instead — it caps at nsym=1 and skips the heavy nsym=2/3 loops.
 pub fn compute_llr<P: Protocol>(cs: &[Complex<f32>]) -> LlrSet {
+    compute_llr_capped::<P>(cs, 3)
+}
+
+/// Same as [`compute_llr`] but stops at nsym=1. `llrb`/`llrc` come
+/// back zero-filled. Use when the caller will only ever read
+/// `llra` (or `llrd`), e.g. embedded `decode_block` with
+/// `DecodeDepth::Bp`. ~5× faster than the full computation.
+pub fn compute_llr_fast<P: Protocol>(cs: &[Complex<f32>]) -> LlrSet {
+    compute_llr_capped::<P>(cs, 1)
+}
+
+/// Internal implementation — computes nsym=1..=`max_nsym`. The
+/// unused variants come back zero.
+fn compute_llr_capped<P: Protocol>(cs: &[Complex<f32>], max_nsym: usize) -> LlrSet {
     let ntones = P::NTONES as usize;
     let bps = P::BITS_PER_SYMBOL as usize;
     let gray_map = P::GRAY_MAP;
@@ -130,7 +150,7 @@ pub fn compute_llr<P: Protocol>(cs: &[Complex<f32>]) -> LlrSet {
     let mut bmetc = vec![0.0f32; codeword_len];
     let mut bmetd = vec![0.0f32; codeword_len];
 
-    for nsym in 1usize..=3 {
+    for nsym in 1usize..=max_nsym {
         // Number of tone-combinations over `nsym` symbols.
         let nt = ntones.pow(nsym as u32);
         let ibmax = bps * nsym - 1;

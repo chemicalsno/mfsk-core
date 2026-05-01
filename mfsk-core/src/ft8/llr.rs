@@ -68,6 +68,20 @@ pub fn compute_llr(cs: &[[Complex<f32>; 8]; 79]) -> LlrSet {
     }
 }
 
+/// LLRs for the BP-only path: skips nsym=2 and nsym=3 (~5× faster
+/// than [`compute_llr`]). `llrb` / `llrc` come back zero — only
+/// `llra` and `llrd` are valid.
+pub fn compute_llr_fast(cs: &[[Complex<f32>; 8]; 79]) -> LlrSet {
+    let flat = flatten_cs(cs);
+    let g = crate::core::llr::compute_llr_fast::<Ft8>(&flat);
+    LlrSet {
+        llra: inflate_llr(g.llra),
+        llrb: inflate_llr(g.llrb),
+        llrc: inflate_llr(g.llrc),
+        llrd: inflate_llr(g.llrd),
+    }
+}
+
 /// WSJT-X compatible SNR from 8-tone spectra + decoded 79-tone sequence.
 pub fn compute_snr_db(cs: &[[Complex<f32>; 8]; 79], itone: &[u8; 79]) -> f32 {
     let flat = flatten_cs(cs);

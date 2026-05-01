@@ -1,0 +1,1056 @@
+//! Embedded-friendly FT8 decode (esp-dsp pow-of-2 FFT only).
+//!
+//! Mirrors the host `decode_frame` pipeline but skips the 192_000-pt
+//! wide-band FFT cache and the 3_840-pt per-symbol FFT — both of
+//! which are non-power-of-two. Uses an 8192-pt per-symbol FFT for
+//! the spectrogram (1920-sample input zero-padded) and a brute-force
+//! per-tone DFT for the per-candidate LLR pass. Calls `bp_decode_kind`
+//! with `BpKind::NormalizedMinSum` so the BP step skips the
+//! `tanh`/`atanh` cache.
+//!
+//! Because the FFT bin width (≈ 1.465 Hz at 8192-pt) does not divide
+//! the 6.25 Hz tone spacing evenly, Costas tone positions are computed
+//! at fractional bins and rounded to the nearest integer. The
+//! resulting bin-alignment jitter (≤ 0.7 Hz) is below FT8's
+//! frequency-search tolerance.
+//!
+//! Same FFT trait, same compute path on host (rustfft) and on target
+//! (esp-dsp) — sensitivity sweeps run on host and the result transfers
+//! directly to hardware.
+
+use alloc::boxed::Box;
+use alloc::vec;
+use alloc::vec::Vec;
+
+use num_complex::Complex;
+#[cfg(not(feature = "std"))]
+use num_traits::Float;
+
+use super::decode::{DecodeDepth, DecodeResult};
+use super::llr::{compute_llr, compute_llr_fast, sync_quality};
+use super::message::unpack77;
+use super::params::{BP_MAX_ITER, COSTAS, COSTAS_POS, LDPC_N, NMAX, NN, NSPS, NTONES};
+use super::wave_gen::message_to_tones;
+#[cfg(not(feature = "fixed-point"))]
+use crate::core::fft::default_planner;
+use crate::core::sync::SyncCandidate;
+use crate::fec::ldpc::bp::{BpKind, bp_decode_kind, check_crc14};
+use crate::fec::ldpc::osd::{osd_decode, osd_decode_deep};
+
+// ── Audio sample trait ──────────────────────────────────────────────────────
+
+/// Trait for audio sample types accepted by `decode_block`. Lets the
+/// caller hand in either `i16` (the canonical FT8 PCM) or `i8`
+/// (half-storage, ~45 dB SQNR — plenty for FT8's -24 dB threshold —
+/// useful when the slot needs to fit in scarce internal SRAM on
+/// embedded targets where PSRAM access is the bottleneck).
+///
+/// The `to_f32` implementation must produce values on the same
+/// amplitude scale as `i16` so the LLR computation downstream keeps
+/// its calibration; for `i8` we therefore multiply by 256.
+pub trait AudioSample: Copy {
+    fn to_f32(self) -> f32;
+    /// Promote to i16 range. i8 → i16 via `<<8`; i16 → i16
+    /// identity. Used by the fixed-point FFT input path.
+    fn to_i16(self) -> i16;
+}
+
+impl AudioSample for i16 {
+    #[inline]
+    fn to_f32(self) -> f32 {
+        self as f32
+    }
+    #[inline]
+    fn to_i16(self) -> i16 {
+        self
+    }
+}
+
+impl AudioSample for i8 {
+    #[inline]
+    fn to_f32(self) -> f32 {
+        // Match i16 amplitude scale (multiply by 2^8). LLR
+        // calibration (LLR_SCALE in ft8::params) thus stays
+        // valid without per-sample-type rescaling.
+        (self as i32 * 256) as f32
+    }
+    #[inline]
+    fn to_i16(self) -> i16 {
+        (self as i16) << 8
+    }
+}
+
+// ── Tunables ────────────────────────────────────────────────────────────────
+
+/// Per-symbol spectrogram FFT length. Power of two.
+///
+/// Caps differ by backend:
+/// - **fc32 (f32 path)**: 4096, limited by esp-dsp's bit-rev
+///   lookup tables shipped only at sizes 16..4096
+///   (`dsps_fft2r_bitrev_tables_fc32.c`). Requesting 8192 corrupts
+///   the rev-table array inside `dsps_fft2r_fc32_ae32_`.
+/// - **sc16 (`fixed-point` feature)**: no cap up to 32768; sc16
+///   has no rev-table dependency and generates twiddles on the fly.
+///
+/// Using NFFT=4096 on both paths today. Tried NFFT=8192 on the
+/// sc16 path and saw host AWGN sweep regress ~0.5 dB at threshold —
+/// finer bins make rectangular-window leakage worse for single-bin
+/// extraction (main lobe widens from ±2.13 to ±4.27 bins). Hann
+/// windowing in Step 1 compensates and unlocks NFFT=8192 as a
+/// follow-on optimisation; revisit after Step 1.
+pub const NFFT_SPEC: usize = 4096;
+
+/// Coarse-sync slide step (samples). NSPS/2 = 960 samples (80 ms;
+/// 184 frames per slot). Halving to NSPS killed sensitivity in
+/// AWGN sweep — Costas correlation needs the half-symbol overlap
+/// to compensate for sub-NSTEP dt offsets in the truth signal.
+const NSTEP: usize = NSPS / 2;
+
+/// Steps per symbol — used to map symbol-index to time-step lag.
+const NSSY: i32 = (NSPS / NSTEP) as i32;
+
+/// FT8 tone spacing (Hz).
+const TONE_SPACING_HZ: f32 = 6.25;
+
+/// 12 kHz fixed sample rate.
+const SAMPLE_RATE_HZ: f32 = 12_000.0;
+
+/// Slot start offset (FT8 transmits 0.5 s into the slot).
+const TX_START_OFFSET_S: f32 = 0.5;
+
+/// Coarse-sync ±lag search window (s).
+///
+/// WSJT-X uses ±2.5 s — covers operators with sloppy slot timing
+/// or slow rigs. Embedded targets running on a synced clock (NTP /
+/// GPS) live well within ±1 s; halving the lag range cuts
+/// `coarse_sync` work by ~60 % (linear in `n_lag`). If the live
+/// timing source is loose, raise this back to 2.5.
+const SYNC_LAG_S: f32 = 1.0;
+
+/// Same NMS α as the bench-tuned default in `mfsk-core/src/fec/ldpc/bp.rs`.
+const NMS_ALPHA: f32 = 0.75;
+
+// ── Spectrogram ─────────────────────────────────────────────────────────────
+
+/// Spectrogram cell type. f32 (4 bytes) by default; u16 (2 bytes)
+/// under `fixed-point` — magnitude squared right-shifted by
+/// `FP_SPEC_SHIFT` to fit u16. `Spectrogram::power` returns f32 in
+/// either case so downstream code (coarse_sync score division,
+/// allsum) stays uniform. **Halves PSRAM bandwidth in stage 2.**
+#[cfg(not(feature = "fixed-point"))]
+type SpecCell = f32;
+#[cfg(feature = "fixed-point")]
+type SpecCell = u16;
+
+/// Right-shift applied to `(re² + im²)` before storing as u16.
+///
+/// 12, not 16: with the host stub matching esp-dsp's `1/N` total
+/// scaling, AWGN noise bins at typical recording levels (σ ≈ 5800
+/// at peak 29000 input) yield mag² ≈ 8200 — `>>16` quantises that
+/// to zero and breaks coarse_sync ratios. `>>12` keeps it at ~2,
+/// preserving the noise floor.
+///
+/// Headroom check: max single-tone bin (peak input 29000, /N) is
+/// 14500 → mag² = 2.1×10⁸ → `>>12` = 51 200, fits u16. Two coincident
+/// FT8 tones at the same bin peaks at ≈ 8.4×10⁸ → `>>12` = 205 000,
+/// **overflows u16** — extremely rare in practice (independent stations
+/// virtually never align both freq and dt-grid bin), but watch for
+/// truncation if the busy-band recall regresses.
+#[cfg(feature = "fixed-point")]
+const FP_SPEC_SHIFT: u32 = 12;
+
+/// Power spectrogram. **Internal type exposed for benching only —
+/// do not depend on the layout.**
+#[doc(hidden)]
+pub struct Spectrogram {
+    /// Number of positive-frequency bins kept. Always ≤ NFFT_SPEC/2.
+    /// We crop above the band of interest so a 8192-pt spectrogram on
+    /// PSRAM-light targets (ESP32 Core2: 4 MB mapped) doesn't blow
+    /// the heap (full 4096 × ~370 × 4 B = ~6 MB).
+    pub n_freq: usize,
+    /// Number of time slices.
+    pub n_time: usize,
+    /// **Column-major** (time major): `data[time * n_freq + freq]`.
+    /// Picked so the inner Costas-correlation loop, which fixes
+    /// time `m` and walks several frequency bins around a carrier
+    /// candidate, does sequential PSRAM reads. Row-major would
+    /// stride by `n_time × 4 ≈ 4 KB` per read — disaster on the
+    /// ESP32's small PSRAM cache. Column-major keeps the working
+    /// set of one time slice (`n_freq × 4 ≈ 4 KB`) in cache for
+    /// the duration of all `(fi, lag)` cells touching it.
+    data: Vec<SpecCell>,
+}
+
+impl Spectrogram {
+    #[inline]
+    fn power(&self, freq_bin: usize, time_idx: usize) -> f32 {
+        debug_assert!(freq_bin < self.n_freq);
+        debug_assert!(time_idx < self.n_time);
+        // `as f32` is a real promotion under `fixed-point` (SpecCell=u16)
+        // and a no-op when SpecCell=f32 — write it once, let the compiler
+        // pick the right branch.
+        #[allow(clippy::unnecessary_cast)]
+        let v = self.data[time_idx * self.n_freq + freq_bin] as f32;
+        v
+    }
+}
+
+/// Hann window over `NSPS` samples (peak 1.0 at the middle, zero at
+/// the edges). Cuts rectangular sidelobes from −13 dB to ≈ −32 dB so
+/// strong stations stop masking weaker neighbours 60–100 Hz away on
+/// busy bands. Coherent gain is 0.5 (single-bin signal **amplitude**
+/// halved → bin **power** down 4×); fp `compute_spectrogram` adds one
+/// pre-shift to compensate, f32 needs no compensation (relative
+/// magnitudes only).
+fn hann_window_f32() -> [f32; NSPS] {
+    let mut w = [0.0f32; NSPS];
+    let denom = NSPS as f32;
+    for k in 0..NSPS {
+        w[k] = 0.5 * (1.0 - (core::f32::consts::TAU * k as f32 / denom).cos());
+    }
+    w
+}
+
+/// Q15 form of [`hann_window_f32`] for the fixed-point compute path.
+#[cfg(feature = "fixed-point")]
+fn hann_window_q15() -> [i16; NSPS] {
+    let f = hann_window_f32();
+    let mut q = [0i16; NSPS];
+    for k in 0..NSPS {
+        q[k] = (f[k] * 32767.0).round() as i16;
+    }
+    q
+}
+
+/// Build the per-symbol power spectrogram via NFFT_SPEC-pt FFTs.
+/// Each time slice is `NSPS = 1920` samples of Hann-windowed audio
+/// zero-padded to `NFFT_SPEC`.
+///
+/// `max_freq_hz` is the upper edge of the carrier search; we keep
+/// bins covering up to `max_freq_hz + 7 × tone_spacing + ε` so the
+/// top Costas tone of a candidate at `max_freq_hz` is still in
+/// range. Bins above that are discarded — saves ~half the heap on
+/// ESP32 (4 MB PSRAM ceiling).
+///
+/// **Pub for benchmarking only — do not depend on it.**
+#[doc(hidden)]
+#[cfg(not(feature = "fixed-point"))]
+pub fn compute_spectrogram<S: AudioSample>(audio: &[S], max_freq_hz: f32) -> Spectrogram {
+    let df = SAMPLE_RATE_HZ / NFFT_SPEC as f32;
+    let band_top_hz = max_freq_hz + (NTONES as f32) * TONE_SPACING_HZ;
+    let n_freq_full = NFFT_SPEC / 2;
+    let n_freq = ((band_top_hz / df).ceil() as usize + 1).min(n_freq_full);
+    let n_time = NMAX / NSTEP - 3;
+    let scale = 1.0f32 / 300.0;
+
+    let mut planner = default_planner();
+    let fft = planner.plan_forward(NFFT_SPEC);
+
+    let hann = hann_window_f32();
+    let mut data = vec![0.0f32; n_freq * n_time];
+    let mut buf = vec![Complex::new(0.0f32, 0.0); NFFT_SPEC];
+
+    for j in 0..n_time {
+        let ia = j * NSTEP;
+        for (k, c) in buf.iter_mut().enumerate() {
+            *c = if k < NSPS {
+                let sample = if ia + k < audio.len() {
+                    audio[ia + k].to_f32() * scale * hann[k]
+                } else {
+                    0.0
+                };
+                Complex::new(sample, 0.0)
+            } else {
+                Complex::new(0.0, 0.0)
+            };
+        }
+        fft.process(&mut buf);
+        // Column-major write — `data[j * n_freq + i]` keeps each
+        // time slice contiguous in memory (good PSRAM locality
+        // for downstream coarse_sync).
+        let row_base = j * n_freq;
+        for i in 0..n_freq {
+            data[row_base + i] = buf[i].norm_sqr();
+        }
+    }
+
+    Spectrogram {
+        n_freq,
+        n_time,
+        data,
+    }
+}
+
+/// Fixed-point variant: `Vec<u32>` magnitude squared from an i16
+/// complex FFT. Halves spectrogram heap on PSRAM-light targets and
+/// is the only viable backend on FPU-less MCUs.
+///
+/// **Auto-gain**: esp-dsp's `dsps_fft2r_sc16` divides by 2 at each
+/// of `log2(N)` butterfly stages (12 stages at NFFT=4096) to keep
+/// the i16 working set from overflowing. That's a total `/4096`
+/// scale-down of the output. A real-world FT8 recording with peaks
+/// well below i16 max (e.g. WSJT-X reference WAVs at 5 % of full
+/// scale) gets quantised to zero by stage 6 of the FFT and produces
+/// an empty spectrogram. We compute the slot's peak once and shift
+/// the i16 input left enough to reach ~ ¼ of i16 range, leaving
+/// headroom for FFT growth in tone-rich slots.
+#[doc(hidden)]
+#[cfg(feature = "fixed-point")]
+pub fn compute_spectrogram<S: AudioSample>(audio: &[S], max_freq_hz: f32) -> Spectrogram {
+    use crate::core::fft::default_planner_16;
+
+    let df = SAMPLE_RATE_HZ / NFFT_SPEC as f32;
+    let band_top_hz = max_freq_hz + (NTONES as f32) * TONE_SPACING_HZ;
+    let n_freq_full = NFFT_SPEC / 2;
+    let n_freq = ((band_top_hz / df).ceil() as usize + 1).min(n_freq_full);
+    let n_time = NMAX / NSTEP - 3;
+
+    // Pre-scale gain: shift left so the audio peak lands at
+    // `2 × NFFT` (so after `log2(NFFT)` stages of /2 the post-FFT
+    // peak still has a usable mantissa of ~2).
+    let target_peak: i32 = (NFFT_SPEC * 2) as i32;
+    let mut peak_abs: i32 = 1;
+    let n_scan = audio.len().min(NMAX);
+    for k in 0..n_scan {
+        let v = audio[k].to_i16() as i32;
+        let a = v.unsigned_abs() as i32;
+        if a > peak_abs {
+            peak_abs = a;
+        }
+    }
+    let mut shift: u32 = 0;
+    while peak_abs << shift < target_peak && shift < 8 {
+        shift += 1;
+    }
+    // +1 extra shift: the Hann window's coherent gain is 0.5
+    // (single-bin signal amplitude halved → bin power ÷ 4). Pre-
+    // shifting input by +1 bit doubles amplitude so the post-FFT bin
+    // amplitude lands back where the rectangular-window auto-gain
+    // plan expected. Peak input samples near the window centre
+    // (where Hann ≈ 1) may saturate to i16_MAX after this shift,
+    // but the centre is also where CG is highest — clamping a few
+    // samples there costs less than the 6 dB amplitude loss the
+    // window otherwise imposes on every bin.
+    shift = (shift + 1).min(8);
+
+    let mut planner = default_planner_16();
+    let fft = planner.plan_forward(NFFT_SPEC);
+
+    let hann = hann_window_q15();
+    let mut data: Vec<u16> = vec![0u16; n_freq * n_time];
+    let mut buf: Vec<Complex<i16>> = vec![Complex::new(0i16, 0i16); NFFT_SPEC];
+
+    for j in 0..n_time {
+        let ia = j * NSTEP;
+        for (k, c) in buf.iter_mut().enumerate() {
+            *c = if k < NSPS && ia + k < audio.len() {
+                let raw = audio[ia + k].to_i16() as i32;
+                let scaled = (raw << shift).clamp(i16::MIN as i32, i16::MAX as i32);
+                let windowed = (scaled * hann[k] as i32) >> 15;
+                Complex::new(windowed as i16, 0)
+            } else {
+                Complex::new(0, 0)
+            };
+        }
+        fft.process(&mut buf);
+        let row_base = j * n_freq;
+        for i in 0..n_freq {
+            // Magnitude squared, right-shifted to fit u16. The
+            // i16² ≤ ~1.07 × 10⁹ (≈ 2³⁰) so sum ≤ ~2.15 × 10⁹ (~2³¹);
+            // shifting right by 16 keeps the top 16 bits — plenty for
+            // the relative-magnitude comparisons in coarse_sync.
+            let re = buf[i].re as i32;
+            let im = buf[i].im as i32;
+            let mag2 = ((re * re + im * im) as u32) >> FP_SPEC_SHIFT;
+            data[row_base + i] = mag2 as u16;
+        }
+    }
+
+    Spectrogram {
+        n_freq,
+        n_time,
+        data,
+    }
+}
+
+// ── Coarse sync ─────────────────────────────────────────────────────────────
+
+/// Costas-array correlation search across the spectrogram. Matches
+/// the host `core::sync::coarse_sync` shape but reads bins by
+/// fractional offset (`tone_step_bins ≈ 4.267` at NFFT_SPEC=8192,
+/// rounded to nearest integer).
+///
+/// **Pub for benchmarking only — do not depend on it.**
+#[doc(hidden)]
+pub fn coarse_sync(
+    spec: &Spectrogram,
+    freq_min: f32,
+    freq_max: f32,
+    sync_min: f32,
+    max_cand: usize,
+) -> Vec<SyncCandidate> {
+    let df = SAMPLE_RATE_HZ / NFFT_SPEC as f32;
+    let tstep = NSTEP as f32 / SAMPLE_RATE_HZ;
+    let jstrt = (TX_START_OFFSET_S / tstep).round() as i32;
+    let jz = (SYNC_LAG_S / tstep).round() as i32;
+    let tone_step_bins = TONE_SPACING_HZ / df;
+
+    // Carrier-bin search range. Reserve room above the carrier for the
+    // top tone (round(7 * tone_step_bins)).
+    let ia = (freq_min / df).round() as usize;
+    let max_tone_off = ((NTONES - 1) as f32 * tone_step_bins).ceil() as usize + 1;
+    let nh1 = spec.n_freq;
+    let ib_unbounded = (freq_max / df).round() as usize;
+    let ib = ib_unbounded.min(nh1.saturating_sub(max_tone_off));
+    if ib < ia {
+        return Vec::new();
+    }
+    let n_freq = ib - ia + 1;
+    let n_lag = (2 * jz + 1) as usize;
+    let mut sync2d = vec![0.0f32; n_freq * n_lag];
+    let idx = |fi: usize, lag: i32| fi * n_lag + (lag + jz) as usize;
+
+    // **Multi-bin tone sum (Plan A)**: tone_step_bins ≈ 2.13 means
+    // the 8 FT8 tones fall at fractional bin positions [0.00, 2.13,
+    // 4.27, 6.40, 8.53, 10.67, 12.80, 14.93]. Reading just `round(...)`
+    // captures only one bin's worth of the Hann mainlobe (which is
+    // ~2 bins wide); off-bin tones lose 1–3 dB to the neighbour.
+    // We sum the floor-bin and floor-bin+1 instead, recovering the
+    // full mainlobe energy for every tone regardless of fractional
+    // alignment. Cost: 2× spec reads per tone — negligible vs PSRAM
+    // bandwidth headroom on Core2.
+    let mut tone_bin_lo = [0usize; NTONES];
+    for k in 0..NTONES {
+        tone_bin_lo[k] = (k as f32 * tone_step_bins).floor() as usize;
+    }
+
+    // Pre-compute Σ_k (spec[lo,m] + spec[lo+1,m]) for every (fi, m) —
+    // the all-tones reference used inside the Costas correlation.
+    // 16 reads per (fi, m) cell; allsum vector still n_freq × n_time.
+    let mut allsum = vec![0.0f32; n_freq * spec.n_time];
+    for (fi, i_carrier) in (ia..=ib).enumerate() {
+        for m in 0..spec.n_time {
+            let mut s = 0.0f32;
+            for k in 0..NTONES {
+                let lo = (i_carrier + tone_bin_lo[k]).min(nh1 - 1);
+                let hi = (lo + 1).min(nh1 - 1);
+                s += spec.power(lo, m) + spec.power(hi, m);
+            }
+            allsum[fi * spec.n_time + m] = s;
+        }
+    }
+
+    // Three identical Costas arrays at symbol positions 0, 36, 72.
+    for (fi, i_carrier) in (ia..=ib).enumerate() {
+        for lag in -jz..=jz {
+            let mut t_blocks = [0.0f32; 3];
+            let mut t0_blocks = [0.0f32; 3];
+
+            for (bk, &start_sym) in COSTAS_POS.iter().enumerate() {
+                let block_offset = NSSY * start_sym as i32;
+                for (n, &costas_n) in COSTAS.iter().enumerate() {
+                    let m = lag + jstrt + block_offset + NSSY * n as i32;
+                    if m < 0 || (m as usize) >= spec.n_time {
+                        continue;
+                    }
+                    let m_u = m as usize;
+                    let tbin_lo = i_carrier + tone_bin_lo[costas_n];
+                    let tbin_hi = tbin_lo + 1;
+                    if tbin_hi >= nh1 {
+                        continue;
+                    }
+                    t_blocks[bk] += spec.power(tbin_lo, m_u) + spec.power(tbin_hi, m_u);
+                    t0_blocks[bk] += allsum[fi * spec.n_time + m_u];
+                }
+            }
+
+            // Old ratio metric (per-band relative): `t / mean_others`.
+            // Less penalising of weak signals near strong neighbours
+            // than the linear Karlis Goba discriminant — better at
+            // keeping busy-band truth in coarse_sync's top-N.
+            let t_all: f32 = t_blocks.iter().sum();
+            let t0_all: f32 = t0_blocks.iter().sum();
+            let t0_ref = (t0_all - t_all) / (NTONES as f32 - 1.0);
+            let sync_all = if t0_ref > 0.0 { t_all / t0_ref } else { 0.0 };
+
+            // Trailing-2-blocks score (drop block 0 — late-start tolerance).
+            let t_tail = t_blocks[1] + t_blocks[2];
+            let t0_tail = t0_blocks[1] + t0_blocks[2];
+            let t0_tail_ref = (t0_tail - t_tail) / (NTONES as f32 - 1.0);
+            let sync_tail = if t0_tail_ref > 0.0 {
+                t_tail / t0_tail_ref
+            } else {
+                0.0
+            };
+
+            sync2d[idx(fi, lag)] = sync_all.max(sync_tail);
+        }
+    }
+
+    // Per-bin peak + 40-percentile noise floor (matches host code shape).
+    let mut red = vec![0.0f32; n_freq];
+    for fi in 0..n_freq {
+        red[fi] = (-jz..=jz)
+            .map(|lag| sync2d[idx(fi, lag)])
+            .fold(0.0f32, f32::max);
+    }
+    let base = {
+        let mut sorted = red.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let pct_idx = (0.40 * n_freq as f32) as usize;
+        sorted[pct_idx.min(n_freq - 1)].max(f32::EPSILON)
+    };
+
+    const MLAG: i32 = 10;
+
+    let mut cands: Vec<SyncCandidate> = Vec::new();
+    for fi in 0..n_freq {
+        let i_carrier = ia + fi;
+        let freq_hz = i_carrier as f32 * df;
+
+        let mut peaks: Vec<(i32, f32)> = (-jz..=jz)
+            .filter_map(|lag| {
+                let raw = sync2d[idx(fi, lag)];
+                let norm = raw / base;
+                if norm.is_finite() && norm >= sync_min {
+                    Some((lag, norm))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        peaks.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+        let mut picked: Vec<i32> = Vec::new();
+        for (lag, score) in peaks {
+            if picked.iter().any(|&pl| (lag - pl).abs() <= MLAG) {
+                continue;
+            }
+            picked.push(lag);
+            // Parabolic refinement of dt: fit y = a*x² + b*x + c
+            // through (lag-1, lag, lag+1) sync2d values, locate the
+            // peak. Saves a 3-point dt grid in stage 3 (3× DFT
+            // budget) — the refined dt below is taken at face value
+            // so process_candidates can run a single full DFT per
+            // candidate.
+            let dt_quanta = if lag > -jz && lag < jz {
+                let y_lo = sync2d[idx(fi, lag - 1)];
+                let y_mi = sync2d[idx(fi, lag)];
+                let y_hi = sync2d[idx(fi, lag + 1)];
+                let denom = y_lo - 2.0 * y_mi + y_hi;
+                if denom.abs() > f32::EPSILON {
+                    let off = 0.5 * (y_lo - y_hi) / denom;
+                    // Clamp to ±1 sample to guard against poorly-
+                    // conditioned fits at the search edges.
+                    off.clamp(-1.0, 1.0)
+                } else {
+                    0.0
+                }
+            } else {
+                0.0
+            };
+            let dt_lag = lag as f32 + dt_quanta;
+            cands.push(SyncCandidate {
+                freq_hz,
+                dt_sec: (dt_lag - 0.5) * tstep,
+                score,
+            });
+            if picked.len() >= 8 {
+                break;
+            }
+        }
+    }
+
+    // Dedupe within 4 Hz / 40 ms; keep highest score.
+    let n = cands.len();
+    for i in 1..n {
+        for j in 0..i {
+            let fdiff = (cands[i].freq_hz - cands[j].freq_hz).abs();
+            let tdiff = (cands[i].dt_sec - cands[j].dt_sec).abs();
+            if fdiff < 4.0 && tdiff < 0.04 {
+                if cands[i].score >= cands[j].score {
+                    cands[j].score = 0.0;
+                } else {
+                    cands[i].score = 0.0;
+                }
+            }
+        }
+    }
+    cands.retain(|c| c.score >= sync_min);
+    cands.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+    cands.truncate(max_cand);
+    cands
+}
+
+// ── Per-symbol direct DFT (no FFT cache) ────────────────────────────────────
+
+/// Compute the 79 × 8 complex tone spectra for one candidate by
+/// direct DFT at the exact tone frequencies. Bypasses the wide-band
+/// FFT cache entirely.
+///
+/// **Phase-rotator recursion.** Naïve per-sample `cos/sin` would be
+/// ~25 M libm calls per `decode_block` invocation (8 candidates × 5
+/// dt offsets × 79 symbols × 8 tones × 1920 samples) — minutes on
+/// LX6. We replace it with one cos/sin pair per (symbol, tone) and
+/// a single complex multiply per sample.
+///
+/// **PSRAM-aware access pattern.** The audio buffer (360 KB) lives
+/// in PSRAM on Core2 (40 MHz quad, ~5× slower than internal RAM).
+/// A naïve "for tone × for sample" loop would re-read each audio
+/// sample 8 times across PSRAM. Instead we copy each 1920-sample
+/// symbol into a stack-local f32 buffer once, then run all 8 tone
+/// integrations over that internal-RAM copy. Reduces audio reads
+/// from PSRAM by 8× — the dominant cost on LX6.
+///
+/// Numerical error: each rotation is a unit-magnitude multiply with
+/// f32 round-off ≈ 6e-8; over 1920 samples the cumulative magnitude
+/// drift stays below 0.012 % — negligible for LLR computation.
+/// **Pub for benchmarking only — do not depend on it.**
+#[doc(hidden)]
+pub fn symbol_spectra_direct<S: AudioSample>(
+    audio: &[S],
+    freq_hz: f32,
+    dt_sec: f32,
+    sym_mask: SymMask,
+) -> Box<[[Complex<f32>; 8]; 79]> {
+    let mut out: Box<[[Complex<f32>; 8]; 79]> =
+        vec![[Complex::new(0.0f32, 0.0); 8]; 79].try_into().unwrap();
+    fill_symbol_spectra(&mut out, audio, freq_hz, dt_sec, sym_mask);
+    out
+}
+
+/// Which subset of the 79 symbols to compute. Used for the
+/// Costas-first early-reject in `process_candidates`: the first
+/// pass fills only Costas tone positions (21 symbols, 27 % of
+/// full DFT cost) for the `sync_quality` gate; only on a hit do
+/// we go back and fill the data-symbol positions.
+///
+/// **Pub for benchmarking only.**
+#[doc(hidden)]
+#[derive(Copy, Clone, Eq, PartialEq)]
+pub enum SymMask {
+    /// Costas symbols only (positions 0-6, 36-42, 72-78).
+    SyncOnly,
+    /// Data symbols only (positions 7-35, 43-71). Skips the 21 sync
+    /// positions — used to "top up" a Costas-only spectrum after
+    /// the sync gate has passed, without recomputing the Costas
+    /// columns.
+    DataOnly,
+}
+
+#[inline]
+fn sym_in_mask(sym: usize, mask: SymMask) -> bool {
+    let (in_block_a, in_block_b, in_block_c) = (
+        sym < COSTAS.len(),                                         // 0..7
+        sym >= COSTAS_POS[1] && sym < COSTAS_POS[1] + COSTAS.len(), // 36..43
+        sym >= COSTAS_POS[2] && sym < COSTAS_POS[2] + COSTAS.len(), // 72..79
+    );
+    let is_sync = in_block_a || in_block_b || in_block_c;
+    match mask {
+        SymMask::SyncOnly => is_sync,
+        SymMask::DataOnly => !is_sync,
+    }
+}
+
+/// **Pub for benchmarking only — do not depend on it.**
+#[doc(hidden)]
+#[cfg(not(feature = "fixed-point"))]
+pub fn fill_symbol_spectra<S: AudioSample>(
+    out: &mut [[Complex<f32>; 8]; 79],
+    audio: &[S],
+    freq_hz: f32,
+    dt_sec: f32,
+    mask: SymMask,
+) {
+    let i0 = ((TX_START_OFFSET_S + dt_sec) * SAMPLE_RATE_HZ).round() as i64;
+    let two_pi_over_fs = core::f32::consts::TAU / SAMPLE_RATE_HZ;
+
+    // Per-tone rotators precomputed once per candidate (8 cos/sin calls
+    // total — vs 8 × 79 = 632 per candidate if recomputed inside the
+    // loop).
+    let mut rotators = [Complex::new(0.0f32, 0.0); NTONES];
+    for tone in 0..NTONES {
+        let tone_freq = freq_hz + tone as f32 * TONE_SPACING_HZ;
+        let dphi = -two_pi_over_fs * tone_freq;
+        rotators[tone] = Complex::new(dphi.cos(), dphi.sin());
+    }
+
+    // Stack buffer: one symbol of audio cast to f32. Internal-RAM
+    // resident — 1920 × 4 = 7.7 KB, fits the default main-task stack.
+    let mut sym_buf = [0.0f32; NSPS];
+
+    for sym in 0..NN {
+        if !sym_in_mask(sym, mask) {
+            continue;
+        }
+        let sym_start = i0 + (sym as i64) * (NSPS as i64);
+        // ── PSRAM → internal SRAM copy, once per symbol ──
+        for k in 0..NSPS {
+            let idx = sym_start + k as i64;
+            sym_buf[k] = if idx >= 0 && (idx as usize) < audio.len() {
+                audio[idx as usize].to_f32()
+            } else {
+                0.0
+            };
+        }
+        // ── 8 tone integrations on the in-cache buffer ──
+        for tone in 0..NTONES {
+            let rotator = rotators[tone];
+            let mut osc = Complex::new(1.0f32, 0.0);
+            let mut acc = Complex::new(0.0f32, 0.0);
+            for &s in sym_buf.iter() {
+                acc.re += s * osc.re;
+                acc.im += s * osc.im;
+                osc *= rotator;
+            }
+            out[sym][tone] = acc;
+        }
+    }
+}
+
+/// Fixed-point per-symbol DFT: i16 audio × Q15 rotator, i32
+/// accumulator (>>15 per MAC to fit), single f32 cast at the end so
+/// `compute_llr`'s f32 input contract is preserved.
+///
+/// Per inner-loop step on FPU-less hardware: 4 i16×i16→i32 MULs +
+/// 4 ADDs + ~6 SHIFTs ≈ 12–14 cycles. f32 path on LX6 with FPU is
+/// ~6–8 cycles/sample (FMA-pipelined), so this is a wash on LX6 but
+/// the **only** viable kernel on RP2040/Hazard3/M0+. Live RX on
+/// Core2 runs i8 audio from I2S, so the audio→i16 step is `<<8`
+/// (one shift) instead of the f32 path's `(i as i32 * 256) as f32`
+/// (cast + mul + cast) — a measurable win for i8 input even on LX6.
+#[doc(hidden)]
+#[cfg(feature = "fixed-point")]
+pub fn fill_symbol_spectra<S: AudioSample>(
+    out: &mut [[Complex<f32>; 8]; 79],
+    audio: &[S],
+    freq_hz: f32,
+    dt_sec: f32,
+    mask: SymMask,
+) {
+    let i0 = ((TX_START_OFFSET_S + dt_sec) * SAMPLE_RATE_HZ).round() as i64;
+    let two_pi_over_fs = core::f32::consts::TAU / SAMPLE_RATE_HZ;
+
+    // Per-tone Q15 rotators (cos, sin scaled to i16).
+    let mut rotators = [Complex::new(0i16, 0i16); NTONES];
+    for tone in 0..NTONES {
+        let tone_freq = freq_hz + tone as f32 * TONE_SPACING_HZ;
+        let dphi = -two_pi_over_fs * tone_freq;
+        rotators[tone] = Complex::new(
+            (dphi.cos() * 32767.0).round() as i16,
+            (dphi.sin() * 32767.0).round() as i16,
+        );
+    }
+
+    // Stack buffer: one symbol of audio as i16. 1920 × 2 = 3.8 KB —
+    // half the f32 path. Internal-RAM resident.
+    let mut sym_buf = [0i16; NSPS];
+
+    for sym in 0..NN {
+        if !sym_in_mask(sym, mask) {
+            continue;
+        }
+        let sym_start = i0 + (sym as i64) * (NSPS as i64);
+        for k in 0..NSPS {
+            let idx = sym_start + k as i64;
+            sym_buf[k] = if idx >= 0 && (idx as usize) < audio.len() {
+                audio[idx as usize].to_i16()
+            } else {
+                0
+            };
+        }
+        for tone in 0..NTONES {
+            let rot_re = rotators[tone].re as i32;
+            let rot_im = rotators[tone].im as i32;
+            // osc starts at Q15 (1.0, 0.0)
+            let mut osc_re: i32 = 32767;
+            let mut osc_im: i32 = 0;
+            // Accumulator. i16 audio × i16 osc → i32, >>15 gives
+            // ~i17. Sum 1920 → ~i28, fits i32 with ~16 dB headroom.
+            let mut acc_re: i32 = 0;
+            let mut acc_im: i32 = 0;
+            for &s_i16 in sym_buf.iter() {
+                let s = s_i16 as i32;
+                acc_re += (s * osc_re) >> 15;
+                acc_im += (s * osc_im) >> 15;
+                // osc = osc * rotator (Q15 complex mul)
+                let new_re = ((osc_re * rot_re) - (osc_im * rot_im)) >> 15;
+                let new_im = ((osc_re * rot_im) + (osc_im * rot_re)) >> 15;
+                osc_re = new_re;
+                osc_im = new_im;
+            }
+            // f32 boundary — compute_llr's input is f32. The cost is
+            // 79×8 = 632 conversions per candidate, negligible.
+            out[sym][tone] = Complex::new(acc_re as f32, acc_im as f32);
+        }
+    }
+}
+
+// ── Public entry ────────────────────────────────────────────────────────────
+
+/// Embedded FT8 decode for one 15-s slot.
+///
+/// Runs the same algorithm shape as [`decode_frame`](super::decode::decode_frame)
+/// but talks only to power-of-two FFTs (via the
+/// [`crate::core::fft::FftPlanner`] trait) and uses the min-sum LDPC
+/// kernel to skip per-iteration `tanh` / `atanh`. No
+/// `decode_sniper*` paths are involved; no wide-band 192 k FFT cache.
+///
+/// Sensitivity vs `decode_frame` is characterised on host AWGN
+/// sweeps before any embedded port — see
+/// `tests/ft8_decode_block_snr_sweep.rs`.
+///
+/// # Arguments
+/// * `audio`     — 12 kHz i16 PCM, length up to NMAX = 180 000.
+/// * `freq_min`  — lower edge of carrier search (Hz).
+/// * `freq_max`  — upper edge of carrier search (Hz).
+/// * `sync_min`  — minimum normalised Costas score (typical 1.0–2.0).
+/// * `depth`     — `Bp` / `BpAll` / `BpAllOsd`.
+/// * `max_cand`  — cap on Costas candidates evaluated.
+pub fn decode_block<S: AudioSample>(
+    audio: &[S],
+    freq_min: f32,
+    freq_max: f32,
+    sync_min: f32,
+    depth: DecodeDepth,
+    max_cand: usize,
+) -> Vec<DecodeResult> {
+    let spec = compute_spectrogram(audio, freq_max);
+    // Pass 1: coarse_sync with a wide net (PASS1_LIMIT cands).
+    // The ratio metric is good at separating "carrier band has
+    // signal-like energy" from "pure noise" but bad at fine ranking
+    // — we keep more candidates than stage 3 will eat so Pass 2 has
+    // material to re-rank by sync_quality.
+    let pass1 = coarse_sync(&spec, freq_min, freq_max, sync_min, PASS1_LIMIT);
+    drop(spec);
+    // Pass 2: per-cand Costas DFT (`SymMask::SyncOnly`) at the exact
+    // tone freqs (no FFT bin alignment issue) → `sync_quality`. Re-rank
+    // by sync_quality and truncate to `max_cand` for stage 3. The
+    // Costas spectra (`cs`) are kept and reused in stage 3 — no
+    // re-computation.
+    let pass2 = refine_candidates(audio, pass1, max_cand);
+    process_candidates(audio, pass2, depth)
+}
+
+/// Pass-1 candidate cap — coarse_sync emits at most this many
+/// candidates regardless of `max_cand`. Pass 2 re-ranks by
+/// `sync_quality` (the same metric stage 3 uses to gate decode
+/// attempts — much sharper than the per-bin power ratio) and
+/// truncates to caller's `max_cand` for stage 3.
+const PASS1_LIMIT: usize = 100;
+
+/// One Pass-2 output: the original candidate, its 79×8 Costas-only
+/// spectrum (filled in stage 3 with the data-symbol DFT), and its
+/// `sync_quality` score for ranking.
+pub type RefinedCandidate = (SyncCandidate, Box<[[Complex<f32>; 8]; 79]>, u32);
+
+/// Per-candidate Costas-only DFT + sync_quality re-rank. Keeps the
+/// top `max_cand` by sync_quality; **the cs spectrum is retained**
+/// and reused in stage 3 to avoid recomputing the 21-symbol DFT.
+///
+/// On Core2 this costs ~75 ms per candidate (i16 rotator DFT). With
+/// `PASS1_LIMIT=100`, total Pass 2 ≈ 7.5 s on Core2 — adds ~70 % to
+/// the slot budget vs the old single-pass `max_cand=30` flow but
+/// captures every truth signal coarse_sync ranks poorly (most of
+/// the busy-band recall gain in qso3).
+fn refine_candidates<S: AudioSample>(
+    audio: &[S],
+    cands: Vec<SyncCandidate>,
+    max_cand: usize,
+) -> Vec<RefinedCandidate> {
+    let mut refined: Vec<RefinedCandidate> = cands
+        .into_iter()
+        .map(|c| {
+            let cs = symbol_spectra_direct(audio, c.freq_hz, c.dt_sec, SymMask::SyncOnly);
+            let q = sync_quality(&cs);
+            (c, cs, q)
+        })
+        .collect();
+    refined.sort_by_key(|r| core::cmp::Reverse(r.2));
+    refined.truncate(max_cand);
+    refined
+}
+
+/// Stage 3: take Pass-2 refined candidates (cand + Costas-only cs +
+/// sync_quality), fill in the data-symbol spectra, run LLR + BP/OSD
+/// staircase. The Costas DFT was already done in Pass 2 — we only
+/// add the data-symbol DFT here.
+///
+/// **Pub for benchmarking only — do not depend on it.**
+#[doc(hidden)]
+pub fn process_candidates<S: AudioSample>(
+    audio: &[S],
+    cands: Vec<RefinedCandidate>,
+    depth: DecodeDepth,
+) -> Vec<DecodeResult> {
+    let bp_kind = BpKind::NormalizedMinSum { alpha: NMS_ALPHA };
+    // dt is already parabolically refined by coarse_sync; no grid here.
+
+    let mut results: Vec<DecodeResult> = Vec::new();
+    for (cand, mut cs, q) in cands {
+        if q <= 6 {
+            continue;
+        }
+        // Fill in the 58 data-symbol spectra (Costas already done in Pass 2).
+        fill_symbol_spectra(&mut cs, audio, cand.freq_hz, cand.dt_sec, SymMask::DataOnly);
+        let refined_dt = cand.dt_sec;
+
+        // ── Staircase: cheap → deeper → OSD ─────────────────────────
+        //
+        // 1) Bp(llra) on the fast nsym=1 LLR. Most candidates that
+        //    decode at all decode here; the rest fall through.
+        // 2) Full compute_llr (nsym=1+2+3) → Bp on all 4 variants
+        //    (a/b/c/d).
+        // 3) OSD-1 / OSD-3 fallback gated on sync_quality.
+        //
+        // `BpAll` and `BpAllOsd` enable the deeper stages; plain
+        // `Bp` stops after step 1.
+        let mut accepted: Option<(crate::fec::ldpc::bp::BpResult, u8)> = None;
+
+        // Step 1: fast llra
+        let llr_a_fast = compute_llr_fast(&cs);
+        if let Some(bp) = bp_decode_kind(
+            &llr_a_fast.llra,
+            None,
+            BP_MAX_ITER,
+            Some(check_crc14),
+            bp_kind,
+        ) {
+            accepted = Some((bp, 0));
+        }
+
+        // Step 2: deeper LLR + 4 variants
+        let mut llr_full_opt: Option<super::llr::LlrSet> = None;
+        if accepted.is_none() && matches!(depth, DecodeDepth::BpAll | DecodeDepth::BpAllOsd) {
+            let llr_full = compute_llr(&cs);
+            for (llr, pid) in [
+                (&llr_full.llra, 0u8),
+                (&llr_full.llrb, 1),
+                (&llr_full.llrc, 2),
+                (&llr_full.llrd, 3),
+            ] {
+                if let Some(bp) = bp_decode_kind(llr, None, BP_MAX_ITER, Some(check_crc14), bp_kind)
+                {
+                    accepted = Some((bp, pid));
+                    break;
+                }
+            }
+            llr_full_opt = Some(llr_full);
+        }
+
+        // Step 3: OSD fallback (sync_quality gated; only for BpAllOsd)
+        if accepted.is_none() && matches!(depth, DecodeDepth::BpAllOsd) && q >= 12 {
+            let llr_full = match &llr_full_opt {
+                Some(l) => l,
+                None => {
+                    llr_full_opt = Some(compute_llr(&cs));
+                    llr_full_opt.as_ref().unwrap()
+                }
+            };
+            for (llr, pid) in [
+                (&llr_full.llra, 4u8),
+                (&llr_full.llrb, 5),
+                (&llr_full.llrc, 6),
+                (&llr_full.llrd, 7),
+            ] {
+                let osd = if q >= 18 {
+                    osd_decode_deep(llr, 3, Some(check_crc14))
+                } else {
+                    osd_decode(llr)
+                };
+                if let Some(osd) = osd {
+                    // Reuse BpResult shape via a synthetic conversion.
+                    let bp = crate::fec::ldpc::bp::BpResult {
+                        message77: osd.message77,
+                        info: osd.info,
+                        codeword: vec![0u8; LDPC_N],
+                        hard_errors: osd.hard_errors,
+                        iterations: 0,
+                    };
+                    accepted = Some((bp, pid));
+                    break;
+                }
+            }
+        }
+
+        let Some((bp, pass_id)) = accepted else {
+            continue;
+        };
+        let Some(text) = unpack77(&bp.message77) else {
+            continue;
+        };
+        // Plausibility filter — reject CRC-passing-but-garbage
+        // messages. With max_cand=200 × 4 LLR variants × OSD,
+        // CRC-14's 1/16384 false-positive rate produces ~1-2 random
+        // strings per slot. Same filter the host wide-band path
+        // uses (`decode_frame::process_candidate`).
+        if !crate::msg::wsjt77::is_plausible_message(&text) {
+            continue;
+        }
+        if results.iter().any(|r| r.message77 == bp.message77) {
+            continue;
+        }
+        let itone = message_to_tones(&bp.message77);
+        let snr_db = super::llr::compute_snr_db(&cs, &itone);
+        results.push(DecodeResult {
+            message77: bp.message77,
+            freq_hz: cand.freq_hz,
+            dt_sec: refined_dt,
+            hard_errors: bp.hard_errors,
+            sync_score: cand.score,
+            pass: pass_id,
+            sync_cv: 0.0,
+            snr_db,
+        });
+    }
+
+    results
+}
+
+// ── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::{MessageCodec, MessageFields};
+    use crate::ft8::wave_gen::{message_to_tones, tones_to_f32};
+    use crate::msg::Wsjt77Message;
+
+    fn pack_cq() -> [u8; 77] {
+        let bits = Wsjt77Message
+            .pack(&MessageFields {
+                call1: Some("CQ".into()),
+                call2: Some("JA1ABC".into()),
+                grid: Some("PM95".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let mut out = [0u8; 77];
+        out.copy_from_slice(&bits);
+        out
+    }
+
+    fn synth_clean(msg77: &[u8; 77], freq_hz: f32) -> Vec<i16> {
+        let itone = message_to_tones(msg77);
+        let pcm = tones_to_f32(&itone, freq_hz, 0.5);
+        let mut slot = vec![0.0f32; NMAX];
+        let start = (TX_START_OFFSET_S * SAMPLE_RATE_HZ) as usize;
+        let n = pcm.len().min(NMAX - start);
+        slot[start..start + n].copy_from_slice(&pcm[..n]);
+        slot.iter()
+            .map(|&s| (s * 25_000.0).clamp(-32_768.0, 32_767.0) as i16)
+            .collect()
+    }
+
+    #[test]
+    fn roundtrip_clean_signal() {
+        let msg = pack_cq();
+        let audio = synth_clean(&msg, 1500.0);
+        let results = decode_block(&audio, 100.0, 3000.0, 1.0, DecodeDepth::BpAll, 30);
+        assert!(
+            results.iter().any(|r| r.message77 == msg),
+            "decode_block should recover clean CQ; got {} results",
+            results.len()
+        );
+    }
+}

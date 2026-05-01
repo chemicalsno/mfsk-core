@@ -37,7 +37,7 @@
 
 use alloc::boxed::Box;
 
-use num_complex::Complex32;
+use num_complex::{Complex, Complex32};
 
 /// In-place complex single-precision FFT for one fixed length.
 pub trait Fft {
@@ -67,6 +67,34 @@ pub trait FftPlanner {
 
     /// Plan an inverse FFT of length `len`.
     fn plan_inverse(&mut self, len: usize) -> Box<dyn Fft>;
+}
+
+// ── i16 (fixed-point) trait pair ─────────────────────────────────────
+//
+// Mirror of [`Fft`] / [`FftPlanner`] for `Complex<i16>` data. Used by
+// the embedded `decode_block` under the `fixed-point` feature flag —
+// bandwidth-bound stages (spectrogram, allsum) halve their PSRAM
+// traffic vs the f32 path. On embedded targets the planner wraps a
+// chip-native i16 FFT (esp-dsp `dsps_fft2r_sc16`, CMSIS-DSP
+// `arm_cfft_q15`, …); on host a stub re-quantises through rustfft
+// for sensitivity validation only.
+
+/// In-place complex i16 FFT for one fixed length. The data layout is
+/// interleaved `{re, im, re, im, …}` matching `num_complex::Complex<i16>`'s
+/// `repr(C)` layout, which in turn matches the `int16_t *` ABI used by
+/// the major embedded FFT libs.
+pub trait Fft16 {
+    fn process(&self, buf: &mut [Complex<i16>]);
+    fn len(&self) -> usize;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// Plans (and typically caches) [`Fft16`] instances on demand.
+pub trait FftPlanner16 {
+    fn plan_forward(&mut self, len: usize) -> Box<dyn Fft16>;
+    fn plan_inverse(&mut self, len: usize) -> Box<dyn Fft16>;
 }
 
 // ── rustfft backend ──────────────────────────────────────────────────
@@ -128,6 +156,91 @@ mod rustfft_backend {
 #[cfg(feature = "fft-rustfft")]
 pub use rustfft_backend::RustFftPlanner;
 
+// ── rustfft-based host stub for the i16 traits ───────────────────────
+//
+// Quantises i16 input → f32 → rustfft → f32 → i16, with stage-wise
+// scaling to match what `dsps_fft2r_sc16`'s asm does on Xtensa. Speed
+// is irrelevant on host; correctness for the AWGN sweep gate is the
+// only goal.
+
+#[cfg(feature = "fft-rustfft")]
+mod rustfft_backend_i16 {
+    use super::*;
+    use alloc::sync::Arc;
+
+    pub struct RustFftPlanner16 {
+        inner: rustfft::FftPlanner<f32>,
+    }
+
+    impl RustFftPlanner16 {
+        pub fn new() -> Self {
+            Self {
+                inner: rustfft::FftPlanner::new(),
+            }
+        }
+    }
+
+    impl Default for RustFftPlanner16 {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    struct RustFft16Adapter {
+        inner: Arc<dyn rustfft::Fft<f32>>,
+    }
+
+    impl Fft16 for RustFft16Adapter {
+        fn process(&self, buf: &mut [Complex<i16>]) {
+            assert_eq!(buf.len(), self.inner.len());
+            let mut tmp: alloc::vec::Vec<Complex32> = buf
+                .iter()
+                .map(|c| Complex32::new(c.re as f32, c.im as f32))
+                .collect();
+            self.inner.process(&mut tmp);
+            // Match `dsps_fft2r_sc16` total gain: per-butterfly `>>1`
+            // for log2(N) stages = total `1/N` (NOT `1/sqrt(N)` —
+            // sqrt(N) leaves single-tone bins ~sqrt(N)× over esp-dsp
+            // and clamps to i16_MAX for any signal pre-scaled to MSBs
+            // by `compute_spectrogram`'s auto-gain). Per-stage rounding
+            // noise still isn't modelled here; the auto-gain pre-scale
+            // keeps that error well below the signal level so a flat
+            // 1/N is good enough for the AWGN sweep.
+            let n = tmp.len() as f32;
+            let scale = 1.0 / n;
+            for (dst, src) in buf.iter_mut().zip(tmp.iter()) {
+                let re = (src.re * scale)
+                    .round()
+                    .clamp(i16::MIN as f32, i16::MAX as f32);
+                let im = (src.im * scale)
+                    .round()
+                    .clamp(i16::MIN as f32, i16::MAX as f32);
+                dst.re = re as i16;
+                dst.im = im as i16;
+            }
+        }
+        fn len(&self) -> usize {
+            self.inner.len()
+        }
+    }
+
+    impl FftPlanner16 for RustFftPlanner16 {
+        fn plan_forward(&mut self, len: usize) -> Box<dyn Fft16> {
+            Box::new(RustFft16Adapter {
+                inner: self.inner.plan_fft_forward(len),
+            })
+        }
+        fn plan_inverse(&mut self, len: usize) -> Box<dyn Fft16> {
+            Box::new(RustFft16Adapter {
+                inner: self.inner.plan_fft_inverse(len),
+            })
+        }
+    }
+}
+
+#[cfg(feature = "fft-rustfft")]
+pub use rustfft_backend_i16::RustFftPlanner16;
+
 // ── Default planner constructor ──────────────────────────────────────
 
 /// Construct the default [`FftPlanner`] for the active FFT backend
@@ -168,6 +281,27 @@ pub fn default_planner() -> Box<dyn FftPlanner> {
         // missing the link fails. The factory's safety contract is
         // simply that it returns a valid `Box<dyn FftPlanner>`.
         unsafe { mfsk_core_make_default_fft_planner() }
+    }
+}
+
+/// i16 sibling of [`default_planner`]. Gated behind `fixed-point` —
+/// only embedded builds with that feature need an i16 backend.
+#[cfg(all(
+    feature = "fixed-point",
+    any(feature = "fft-rustfft", feature = "fft-extern")
+))]
+#[inline]
+pub fn default_planner_16() -> Box<dyn FftPlanner16> {
+    #[cfg(feature = "fft-rustfft")]
+    {
+        Box::new(RustFftPlanner16::new())
+    }
+    #[cfg(all(not(feature = "fft-rustfft"), feature = "fft-extern"))]
+    {
+        unsafe extern "Rust" {
+            fn mfsk_core_make_default_fft_planner_16() -> Box<dyn FftPlanner16>;
+        }
+        unsafe { mfsk_core_make_default_fft_planner_16() }
     }
 }
 
