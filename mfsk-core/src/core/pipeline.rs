@@ -188,6 +188,7 @@ pub fn process_candidate_basic<P: Protocol>(
             // codecs that override `verify_info = |_| true` accept any
             // parity-converged candidate.
             verify_info: Some(<P::Msg as MessageCodec>::verify_info),
+            ..FecOpts::default()
         };
 
         for (llr, pass_id) in &variants {
@@ -219,6 +220,7 @@ pub fn process_candidate_basic<P: Protocol>(
                     osd_depth: osd_depth as u32,
                     ap_mask: None,
                     verify_info: Some(<P::Msg as MessageCodec>::verify_info),
+                    ..FecOpts::default()
                 };
                 for (llr, _) in &variants {
                     if let Some(r) = fec.decode_soft(llr, &osd_opts) {
@@ -246,6 +248,7 @@ pub fn process_candidate_basic<P: Protocol>(
                         osd_depth: 4,
                         ap_mask: None,
                         verify_info: Some(<P::Msg as MessageCodec>::verify_info),
+                        ..FecOpts::default()
                     };
                     for (llr, _) in &variants {
                         if let Some(r) = fec.decode_soft(llr, &osd4_opts) {

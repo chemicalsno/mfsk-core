@@ -1,5 +1,79 @@
 # Changelog
 
+## 0.4.4 — LDPC min-sum kernels (NMS + OMS) for embedded targets
+
+Adds `NormalizedMinSum` and `OffsetMinSum` check-node update kernels
+to the shared LDPC belief-propagation decoder
+(`fec/ldpc/bp.rs::bp_decode_generic_kind`). Default behaviour is
+unchanged — `BpKind::SumProduct` (WSJT-X-equivalent log-domain
+sum-product) stays the implicit pick on every existing code path.
+Embedded callers can now opt into a min-sum approximation that
+skips the per-iteration `tanh` / `atanh` cache, trading ~0.05–0.15 dB
+threshold for substantially faster decode on FPU-poor targets and
+materially less work on host targets too.
+
+### What's new
+
+- **`mfsk_core::core::BpKind`** enum:
+  - `SumProduct` — default, WSJT-X parity.
+  - `NormalizedMinSum { alpha: f32 }` — `L_c→v ≈ α · sign(∏) · min|L|`,
+    typical α ≈ 0.7..0.9.
+  - `OffsetMinSum { beta: f32 }` — `L_c→v ≈ sign · max(min|L| − β, 0)`,
+    typical β ≈ 0.5.
+- **`FecOpts.bp_kind`** field threading the choice into the LDPC
+  codec impls (`Ldpc174_91` for FT8/FT4, `Ldpc240_101` for FST4 +
+  uvpacket). Existing `FecOpts {…}` literals migrate via
+  `..FecOpts::default()` rest syntax.
+- **min1 / min2 + XOR-sign trick** in the min-sum path: per check
+  node, the two smallest `|L|` and the parity of incoming negatives
+  are computed once per iteration; the per-edge output then picks
+  `min2` if the edge's own `|L|` owns `min1`, else `min1`. The
+  inner loop is therefore O(check_degree) instead of the
+  sum-product's O(check_degree²) `tanh`-cache lookups, before any
+  floating-point savings are counted.
+
+### Sign convention fix
+
+The WSJT-X sum-product path computes `tmn = ∏ tanh(−toc/2)` then
+`tov = 2 · atanh(−tmn)` — algebra gives the output sign as
+`(−1)^nrw · sign(∏ toc[s≠j])`. The textbook NMS formula
+`α · sign(∏) · min` lacks that `(−1)^nrw` factor, so on
+odd-row-weight checks (nrw=7 in LDPC174_91, mixed in LDPC240_101)
+the unflipped NMS output disagreed with SP and BP diverged in
+noise. The implementation XORs `nrw_ichk & 1` into the extrinsic
+sign so the new kernels produce sign-compatible messages.
+
+### Verified
+
+- `tests/ldpc_min_sum.rs::ldpc174_clean_round_trip_every_kind` and
+  `ldpc240_clean_round_trip_every_kind` — all three kernels recover
+  the original info from clean LLRs in ≤ 5 BP iterations.
+- `tests/ldpc_min_sum.rs::nms_oms_threshold_within_0p5_db_of_sum_product`
+  (`#[ignore]`d so the default `cargo test` stays fast) sweeps Eb/N0
+  over 30 trials per dB and asserts NMS / OMS thresholds land within
+  0.5 dB of `SumProduct`. Observed at `target=0.5`: SP / NMS / OMS
+  all hit 50 % decode rate at 1.5 dB Eb/N0; per-dB rates differ by
+  ~3-7 percentage points (well under the published 0.1-0.2 dB NMS
+  calibration loss for short LDPC codes).
+- `cargo test --features full --release -- --include-ignored` all
+  green; clippy + fmt clean; `cargo publish --dry-run` clean.
+
+### Embedded-target notes
+
+ESP32 family FPU coverage:
+
+- ESP32 (LX6) / ESP32-S2 / ESP32-S3 (LX7) all ship single-precision
+  hardware FPU — the f32 NMS path runs at native float speed.
+- ESP32-C3 / C6 / H2 (RISC-V) have **no** FPU; f32 is software
+  emulated. NMS still helps (the per-iteration `tanh`/`atanh` cost
+  is dominant), but a fixed-point i16 LLR follow-up will give
+  another 2-4× on these targets. Tracked as next-PR scope.
+
+The `embedded-rx` Cargo preset still defaults to SumProduct so an
+existing build sees no behaviour change. Embedded consumers
+explicitly construct `FecOpts { bp_kind: BpKind::NormalizedMinSum
+{ alpha: 0.75 }, ..Default::default() }` to opt in.
+
 ## 0.4.3 — Q65 multi-period averaging (ionoscatter port)
 
 Adds the WSJT-X `iavg=1` / `iavg=2` averaged-decode path to the

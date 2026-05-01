@@ -570,6 +570,7 @@ mod tests {
                 osd_depth: 0,
                 ap_mask: None,
                 verify_info: None,
+                ..FecOpts::default()
             };
             if let Some(r) = fec.decode_soft(&llrs_full, &bp_opts)
                 && r.info == info
@@ -584,6 +585,7 @@ mod tests {
                 osd_depth: 2,
                 ap_mask: None,
                 verify_info: None,
+                ..FecOpts::default()
             };
             if let Some(r) = fec.decode_soft(&llrs_full, &osd_opts)
                 && r.info == info

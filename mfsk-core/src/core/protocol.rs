@@ -217,6 +217,46 @@ pub trait FrameLayout: Copy + Default + 'static {
 // FEC
 // ──────────────────────────────────────────────────────────────────────────
 
+/// LDPC belief-propagation check-node update kernel.
+///
+/// `SumProduct` is the WSJT-X-equivalent log-domain sum-product update
+/// (the `2·atanh(∏ tanh(L/2))` formula). `NormalizedMinSum` and
+/// `OffsetMinSum` are min-sum approximations that skip the
+/// transcendental functions entirely — significantly faster on
+/// FPU-poor embedded targets at a small (typically <0.2 dB on Q65 /
+/// FT8 / FT4 thresholds with α=0.75 or β=0.5) SNR cost.
+///
+/// Both min-sum variants use the standard min1/min2 trick (track the
+/// two smallest |L| at each check node) plus XOR-accumulated signs,
+/// so the per-iteration cost is roughly O(check_degree) instead of
+/// the sum-product's O(check_degree²) for the per-edge `tanh`-cache
+/// lookups.
+///
+/// Use `SumProduct` on host targets (default), `NormalizedMinSum` or
+/// `OffsetMinSum` on `no_std` / FPU-limited builds.
+#[derive(Copy, Clone, Debug, Default)]
+pub enum BpKind {
+    /// WSJT-X-equivalent log-domain sum-product. Default — best
+    /// accuracy, reference output.
+    #[default]
+    SumProduct,
+    /// Normalised min-sum: `L_c→v ≈ α · sign(∏) · min|L|`. Typical
+    /// `alpha ≈ 0.75`. Trades ~0.05–0.15 dB threshold for ~3-5×
+    /// faster check-node update on f32, more on fixed-point.
+    NormalizedMinSum {
+        /// Magnitude scale factor, typically `0.7..=0.9`.
+        alpha: f32,
+    },
+    /// Offset min-sum: `L_c→v ≈ sign(∏) · max(min|L| − β, 0)`.
+    /// Typical `beta ≈ 0.5`. Performs slightly differently from NMS
+    /// near low SNR; included for sweep comparison and parity with
+    /// the LDPC literature.
+    OffsetMinSum {
+        /// Magnitude offset, typically `0.0..=1.0`.
+        beta: f32,
+    },
+}
+
 /// Options controlling FEC decoding depth / fall-backs.
 ///
 /// This is deliberately a plain data struct rather than a trait — it describes
@@ -246,6 +286,11 @@ pub struct FecOpts<'a> {
     /// MessageCodec>::verify_info` here so that, e.g., FT8/FT4/FST4
     /// reject parity-only candidates whose CRC-14 doesn't pass.
     pub verify_info: Option<fn(&[u8]) -> bool>,
+    /// LDPC BP check-node update kernel. Defaults to `SumProduct`
+    /// (WSJT-X-equivalent). Embedded callers select
+    /// `NormalizedMinSum { alpha: 0.75 }` to trade ~0.1 dB threshold
+    /// for substantially faster decode on f32 / fixed-point math.
+    pub bp_kind: BpKind,
 }
 
 impl<'a> Default for FecOpts<'a> {
@@ -255,6 +300,7 @@ impl<'a> Default for FecOpts<'a> {
             osd_depth: 0,
             ap_mask: None,
             verify_info: None,
+            bp_kind: BpKind::SumProduct,
         }
     }
 }

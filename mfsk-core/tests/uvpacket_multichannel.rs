@@ -18,6 +18,7 @@ fn default_fec_opts() -> FecOpts<'static> {
         osd_depth: 2,
         ap_mask: None,
         verify_info: None,
+        ..FecOpts::default()
     }
 }
 

@@ -25,7 +25,7 @@ pub mod osd;
 pub mod params;
 pub mod tables;
 
-pub use bp::{BpResult, bp_decode, check_crc14, crc14};
+pub use bp::{BpResult, bp_decode, bp_decode_kind, check_crc14, crc14};
 pub use osd::{OsdResult, ldpc_encode, osd_decode, osd_decode_deep, osd_decode_deep4};
 pub use params::{Ldpc174_91Params, Ldpc240_101Params, LdpcParams};
 
@@ -86,7 +86,13 @@ impl FecCodec for Ldpc174_91 {
             None => None,
         };
 
-        if let Some(r) = bp_decode(&llr_arr, ap_mask, opts.bp_max_iter, opts.verify_info) {
+        if let Some(r) = bp_decode_kind(
+            &llr_arr,
+            ap_mask,
+            opts.bp_max_iter,
+            opts.verify_info,
+            opts.bp_kind,
+        ) {
             // Phase 0c-B: BpResult.info is a Vec<u8> of length P::K
             // already, so no copy/reconstruction needed.
             return Some(FecResult {
