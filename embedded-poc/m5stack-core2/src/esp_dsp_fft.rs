@@ -126,8 +126,7 @@ unsafe extern "C" {
 /// Runtime-tunable via [`set_dot_shift`] — `main.rs` sweeps `-9 / -11
 /// / -13` to find where precision starts to bite vs where i16
 /// saturation steals strong-signal magnitude.
-pub static ESP_DSP_DOT_SHIFT: core::sync::atomic::AtomicI8 =
-    core::sync::atomic::AtomicI8::new(-11);
+pub static ESP_DSP_DOT_SHIFT: core::sync::atomic::AtomicI8 = core::sync::atomic::AtomicI8::new(-11);
 
 /// Atomically swap the dot-product shift parameter. Returns the
 /// previous value. Used by `main.rs` for the shift sweep.
@@ -164,9 +163,7 @@ pub struct EspDspPlanner {
 
 impl EspDspPlanner {
     pub fn new() -> Self {
-        Self {
-            initialised_max: 0,
-        }
+        Self { initialised_max: 0 }
     }
 
     fn ensure_table(&mut self, len: usize) {
@@ -197,10 +194,7 @@ impl FftPlanner for EspDspPlanner {
             "esp-dsp FFT requires power-of-2 length ≥ 4 (got {len})"
         );
         self.ensure_table(len);
-        Box::new(EspDspFft {
-            len,
-            forward: true,
-        })
+        Box::new(EspDspFft { len, forward: true })
     }
 
     fn plan_inverse(&mut self, len: usize) -> Box<dyn Fft> {
@@ -265,9 +259,7 @@ pub struct EspDspPlanner16 {
 
 impl EspDspPlanner16 {
     pub fn new() -> Self {
-        Self {
-            initialised_max: 0,
-        }
+        Self { initialised_max: 0 }
     }
 
     fn ensure_table(&mut self, len: usize) {
@@ -295,10 +287,7 @@ impl FftPlanner16 for EspDspPlanner16 {
             "esp-dsp i16 FFT requires power-of-2 length ≥ 4 (got {len})"
         );
         self.ensure_table(len);
-        Box::new(EspDspFft16 {
-            len,
-            forward: true,
-        })
+        Box::new(EspDspFft16 { len, forward: true })
     }
 
     fn plan_inverse(&mut self, len: usize) -> Box<dyn Fft16> {

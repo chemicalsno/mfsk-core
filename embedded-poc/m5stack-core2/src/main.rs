@@ -34,16 +34,27 @@
 // stripping the factory as dead code.
 pub mod esp_dsp_fft;
 
+use mfsk_core::fec::ldpc::bp::{bp_decode_kind, check_crc14, BpKind};
+use mfsk_core::fec::ldpc::osd::{osd_decode, osd_decode_deep};
 use mfsk_core::ft8::decode::DecodeResult;
 use mfsk_core::ft8::decode_block::{
-    coarse_sync, compute_spectrogram, fill_symbol_spectra, symbol_spectra_direct, SymMask,
+    coarse_sync, compute_spectrogram, fill_symbol_spectra_into, symbol_spectra_direct_into,
+    SymMask, BASIS_SCRATCH_LEN,
 };
 use mfsk_core::ft8::llr::{compute_llr, compute_llr_fast, compute_snr_db, sync_quality};
-use mfsk_core::fec::ldpc::osd::{osd_decode, osd_decode_deep};
 use mfsk_core::ft8::params::LDPC_N;
 use mfsk_core::ft8::wave_gen::message_to_tones;
-use mfsk_core::fec::ldpc::bp::{bp_decode_kind, check_crc14, BpKind};
 use mfsk_core::msg::wsjt77::unpack77;
+
+/// Q15 basis scratch for `fill_symbol_spectra_into`. Two flat arrays
+/// (cos / sin × 8 tones × 1920 samples = 30 KB each, 60 KB total).
+/// In `.bss` so they land in **internal DRAM** — the dot-product
+/// inner loop reads basis hundreds of times, and PSRAM at 40 MHz
+/// QUAD is 5–10× slower per access. Default-heap allocation routes
+/// 60 KB blocks to PSRAM under `CONFIG_SPIRAM_USE_MALLOC` and
+/// completely cancels the asm dot product's speed advantage.
+static mut BASIS_RE: [i16; BASIS_SCRATCH_LEN] = [0; BASIS_SCRATCH_LEN];
+static mut BASIS_IM: [i16; BASIS_SCRATCH_LEN] = [0; BASIS_SCRATCH_LEN];
 
 /// Real on-air FT8 slots — 12 kHz / mono / 16-bit PCM. Each ≈ 360 KB.
 /// Two consecutive slots from `jl1nie/rs-ft8n`'s benchmark data plus
@@ -51,7 +62,10 @@ use mfsk_core::msg::wsjt77::unpack77;
 const QSO_WAVS: &[(&str, &[u8])] = &[
     ("qso1 (191111_110130)", include_bytes!("../assets/qso1.wav")),
     ("qso2 (191111_110200)", include_bytes!("../assets/qso2.wav")),
-    ("qso3 busy band (210703)", include_bytes!("../assets/qso3_busy.wav")),
+    (
+        "qso3 busy band (210703)",
+        include_bytes!("../assets/qso3_busy.wav"),
+    ),
 ];
 
 extern crate alloc;
@@ -96,7 +110,9 @@ fn main() {
         log::info!(
             "free heap: internal = {} KB (largest contig {} KB), PSRAM = {} KB",
             esp_idf_svc::sys::heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024,
-            esp_idf_svc::sys::heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024,
+            esp_idf_svc::sys::heap_caps_get_largest_free_block(
+                MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT
+            ) / 1024,
             esp_idf_svc::sys::heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) / 1024,
         );
     }
@@ -133,15 +149,11 @@ fn main() {
         for &max_cand in MAX_CAND_SWEEP {
             for &dt_grid in DT_GRID_SWEEP {
                 for &df_grid in DF_GRID_SWEEP {
-                    log::info!(
-                        "\n════════════════════════════════════════════"
-                    );
+                    log::info!("\n════════════════════════════════════════════");
                     log::info!(
                         "RUN: max_cand={max_cand}  dt_grid={dt_grid}  df_grid={df_grid}  q>{q_thresh}"
                     );
-                    log::info!(
-                        "════════════════════════════════════════════"
-                    );
+                    log::info!("════════════════════════════════════════════");
                     for (label, slot) in &slots {
                         log::info!("\nWAV: {label}");
                         decode_one(slot, max_cand, dt_grid, df_grid, q_thresh);
@@ -208,7 +220,18 @@ fn decode_one(slot: &[i16], max_cand: usize, dt_grid: u8, df_grid: u8, q_thresh:
             for &f_off in &f_offsets {
                 let f = cand.freq_hz + f_off;
                 let dt = cand.dt_sec + dt_off;
-                let cs = symbol_spectra_direct(slot, f, dt, SymMask::SyncOnly);
+                // SAFETY: single-threaded main task, scratch arrays
+                // are only accessed here (no overlapping borrow).
+                let cs = unsafe {
+                    symbol_spectra_direct_into(
+                        slot,
+                        f,
+                        dt,
+                        SymMask::SyncOnly,
+                        &mut BASIS_RE,
+                        &mut BASIS_IM,
+                    )
+                };
                 let q = sync_quality(&cs);
                 if q <= q_thresh {
                     continue;
@@ -222,7 +245,18 @@ fn decode_one(slot: &[i16], max_cand: usize, dt_grid: u8, df_grid: u8, q_thresh:
         let Some((mut cs, refined_f, refined_dt, q_best)) = best else {
             continue;
         };
-        fill_symbol_spectra(&mut cs, slot, refined_f, refined_dt, SymMask::DataOnly);
+        // SAFETY: single-threaded; scratch arrays only used here.
+        unsafe {
+            fill_symbol_spectra_into(
+                &mut cs,
+                slot,
+                refined_f,
+                refined_dt,
+                SymMask::DataOnly,
+                &mut BASIS_RE,
+                &mut BASIS_IM,
+            );
+        }
 
         // BpAllOsd staircase:
         //  1) Bp(llra-fast)
@@ -275,7 +309,9 @@ fn decode_one(slot: &[i16], max_cand: usize, dt_grid: u8, df_grid: u8, q_thresh:
             }
         }
         let Some(message77) = accepted else { continue };
-        let Some(text) = unpack77(&message77) else { continue };
+        let Some(text) = unpack77(&message77) else {
+            continue;
+        };
         if !mfsk_core::msg::wsjt77::is_plausible_message(&text) {
             continue;
         }
