@@ -629,12 +629,20 @@ pub fn symbol_spectra_direct<S: AudioSample>(
 #[doc(hidden)]
 #[derive(Copy, Clone, Eq, PartialEq)]
 pub enum SymMask {
-    /// Costas symbols only (positions 0-6, 36-42, 72-78).
+    /// Costas symbols only — all three blocks (positions 0-6, 36-42,
+    /// 72-78). 21 symbols. Used for full-precision sync_quality
+    /// gating in stage 3.
     SyncOnly,
+    /// Costas block 0 only (positions 0-6). 7 symbols — 1/3 the cost
+    /// of `SyncOnly`. Used for Pass 2 sync_quality re-rank where the
+    /// finer ranking precision of all three blocks is unnecessary.
+    SyncBlock0,
+    /// Everything except Costas block 0 — fills positions 7-78
+    /// (data symbols + Costas blocks 1, 2). 72 symbols. Used in
+    /// stage 3 to "top up" a `SyncBlock0`-filled spectrum.
+    NotBlock0,
     /// Data symbols only (positions 7-35, 43-71). Skips the 21 sync
-    /// positions — used to "top up" a Costas-only spectrum after
-    /// the sync gate has passed, without recomputing the Costas
-    /// columns.
+    /// positions — used to "top up" a `SyncOnly`-filled spectrum.
     DataOnly,
 }
 
@@ -648,6 +656,8 @@ fn sym_in_mask(sym: usize, mask: SymMask) -> bool {
     let is_sync = in_block_a || in_block_b || in_block_c;
     match mask {
         SymMask::SyncOnly => is_sync,
+        SymMask::SyncBlock0 => in_block_a,
+        SymMask::NotBlock0 => !in_block_a,
         SymMask::DataOnly => !is_sync,
     }
 }
@@ -844,15 +854,20 @@ const PASS1_LIMIT: usize = 100;
 /// `sync_quality` score for ranking.
 pub type RefinedCandidate = (SyncCandidate, Box<[[Complex<f32>; 8]; 79]>, u32);
 
-/// Per-candidate Costas-only DFT + sync_quality re-rank. Keeps the
-/// top `max_cand` by sync_quality; **the cs spectrum is retained**
-/// and reused in stage 3 to avoid recomputing the 21-symbol DFT.
+/// Per-candidate Costas-block-0 DFT + sync_quality_block0 re-rank.
+/// Keeps the top `max_cand` by Pass-2 score; **the cs spectrum is
+/// retained** (block 0 only at this point) and stage 3 fills the
+/// remaining 72 symbols via [`SymMask::NotBlock0`].
 ///
-/// On Core2 this costs ~75 ms per candidate (i16 rotator DFT). With
-/// `PASS1_LIMIT=100`, total Pass 2 ≈ 7.5 s on Core2 — adds ~70 % to
-/// the slot budget vs the old single-pass `max_cand=30` flow but
-/// captures every truth signal coarse_sync ranks poorly (most of
-/// the busy-band recall gain in qso3).
+/// Cost: 7 sync symbols × 8 tones = 56 DFT per candidate vs
+/// `SyncOnly`'s 168 — 1/3 the work. On Core2 ~25 ms/cand. With
+/// `PASS1_LIMIT=100` Pass 2 ≈ 2.5 s — fits the slot budget.
+///
+/// The retained `q` is the **block-0** score (range 0..=7, expected
+/// ~6-7 for real signals, ~0.875 for noise). Stage 3 recomputes the
+/// full 21-symbol `sync_quality` after filling blocks 1, 2 and uses
+/// that for its `q > 6` gate; the per-cand sort here is just for
+/// truncating to `max_cand`.
 fn refine_candidates<S: AudioSample>(
     audio: &[S],
     cands: Vec<SyncCandidate>,
@@ -861,14 +876,36 @@ fn refine_candidates<S: AudioSample>(
     let mut refined: Vec<RefinedCandidate> = cands
         .into_iter()
         .map(|c| {
-            let cs = symbol_spectra_direct(audio, c.freq_hz, c.dt_sec, SymMask::SyncOnly);
-            let q = sync_quality(&cs);
+            let cs = symbol_spectra_direct(audio, c.freq_hz, c.dt_sec, SymMask::SyncBlock0);
+            let q = sync_quality_block0(&cs);
             (c, cs, q)
         })
         .collect();
     refined.sort_by_key(|r| core::cmp::Reverse(r.2));
     refined.truncate(max_cand);
     refined
+}
+
+/// Hard-decision sync quality on Costas **block 0 only** (symbols
+/// 0..7). Cheaper variant of [`sync_quality`] for Pass 2 — checks
+/// only one of the three Costas blocks. Range 0..=7.
+fn sync_quality_block0(cs: &[[Complex<f32>; 8]; 79]) -> u32 {
+    let mut count = 0u32;
+    for (t, &expected) in COSTAS.iter().enumerate() {
+        let sym = t; // block 0 starts at symbol 0
+        let best = (0..NTONES)
+            .max_by(|&a, &b| {
+                cs[sym][a]
+                    .norm()
+                    .partial_cmp(&cs[sym][b].norm())
+                    .unwrap_or(core::cmp::Ordering::Equal)
+            })
+            .unwrap_or(0);
+        if best == expected {
+            count += 1;
+        }
+    }
+    count
 }
 
 /// Stage 3: take Pass-2 refined candidates (cand + Costas-only cs +
@@ -887,12 +924,21 @@ pub fn process_candidates<S: AudioSample>(
     // dt is already parabolically refined by coarse_sync; no grid here.
 
     let mut results: Vec<DecodeResult> = Vec::new();
-    for (cand, mut cs, q) in cands {
+    for (cand, mut cs, _q_block0) in cands {
+        // Fill the remaining 72 symbols (Costas blocks 1, 2 + all 58
+        // data symbols). Pass 2 only filled block 0 — `q_block0` is
+        // discarded once we have the full 21-symbol sync_quality.
+        fill_symbol_spectra(
+            &mut cs,
+            audio,
+            cand.freq_hz,
+            cand.dt_sec,
+            SymMask::NotBlock0,
+        );
+        let q = sync_quality(&cs);
         if q <= 6 {
             continue;
         }
-        // Fill in the 58 data-symbol spectra (Costas already done in Pass 2).
-        fill_symbol_spectra(&mut cs, audio, cand.freq_hz, cand.dt_sec, SymMask::DataOnly);
         let refined_dt = cand.dt_sec;
 
         // ── Staircase: cheap → deeper → OSD ─────────────────────────
