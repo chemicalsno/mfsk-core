@@ -964,24 +964,25 @@ matching) all share the same QRA codec under the hood.
 
 `uvpacket` is in-tree but **outside** the WSJT family. It is an
 applied example of how the FEC infrastructure (`Ldpc240_101`, BP,
-OSD-2) can be reused for protocols that share none of the WSJT
+OSD-2/3) can be reused for protocols that share none of the WSJT
 modulation, sync, message-codec, or slot conventions. Specifically
 it is a four-mode packet protocol for narrow-FM voice channels
-(HT/mobile, ~3 kHz audio passband) using single-carrier coherent
-QPSK + root-raised-cosine pulse, a 31-bit BPSK m-sequence preamble,
-pilot-aided phase tracking, and a byte-pipe API.
+(HT/mobile, ~3 kHz audio passband) using single-carrier
+**π/4-DQPSK + LMS equaliser** + RRC pulse, four 127-chip BPSK
+m-sequence preamble variants (mode-encoded), differential
+demodulation (no carrier-phase tracker), and a byte-pipe API.
 
 Sharing with the WSJT family stops at the FEC mother code:
 
 | Layer | WSJT family | uvpacket |
 |---|---|---|
-| Modulation | M-ary tone FSK / GFSK | single-carrier QPSK + RRC |
-| Demod | non-coherent symbol-power detect | matched filter + pilot phase track |
+| Modulation | M-ary tone FSK / GFSK | single-carrier π/4-DQPSK + RRC |
+| Demod | non-coherent symbol-power detect | LMS equaliser + 1-symbol differential |
 | Slot | fixed 7.5 / 15 / 60 / 120 s | variable-length burst |
-| Sync | tone-index Costas blocks | 31-bit BPSK m-sequence |
+| Sync | tone-index Costas blocks | 4-variant 127-chip BPSK m-sequence (mode-encoded) |
 | Message | structured (callsign + grid) | byte-pipe (`app_type` tag) |
 | Pipeline | generic `mfsk-core` TX/RX | bespoke `uvpacket::{tx,rx}` |
-| FEC | (mode-specific) | `Ldpc240_101` (shared with FST4) |
+| FEC | (mode-specific) | `Ldpc240_101` (shared with FST4) + dedicated unpunctured header block |
 
 Because uvpacket bypasses the generic TX/RX pipeline, several of
 its `ModulationParams` trait constants (`NTONES = 4`, `GFSK_BT`,
@@ -993,8 +994,35 @@ This trade-off is documented at
 and is the natural consequence of keeping a non-WSJT protocol
 in-tree rather than spinning it out as a sibling crate.
 
-For the full design narrative, AX.25 / M17 / D-STAR / DMR / VARA
-comparison, and Phase 2 characterisation curves, see
+#### Dual-probe view of the trait scope
+
+The 0.4.0 release shipped two independent stress tests of the
+trait abstractions, in opposite directions:
+
+- **Q65 family expansion — *positive* probe.** Pushed the trait
+  surface to a non-binary code (QRA over GF(2⁶)) and four parallel
+  decoder strategies (AWGN / AP / fast-fading / AP-list) without
+  bending the trait shape. The `Protocol` / `ModulationParams` /
+  `FrameLayout` / `FecCodec` / `MessageCodec` layers carried
+  through unchanged for six sub-modes generated from one macro.
+- **`uvpacket` — *negative* probe.** Stepped outside the WSJT
+  family on every axis (modulation, sync, message format, slot
+  policy) and observed where the abstraction naturally peels away.
+  FEC + DSP + channel-test infrastructure carried over; the
+  generic TX/RX pipeline and the message-codec / AP-compat traits
+  did not.
+
+The peeling is evidence that the trait surface is **right-sized
+for the WSJT protocol family**, not evidence of a missing
+generalisation. A general-purpose PHY framework would have to
+abstract `SYNC_MODE` beyond "Costas blocks or interleaved" to
+cover m-sequences, equaliser state, RRC pulse shaping, etc.; the
+WSJT code paths would pay the indirection cost for no in-family
+benefit. See [`docs/UVPACKET.md`](UVPACKET.md) §0 for the same
+view from the applied-example side.
+
+For the full uvpacket design narrative, AX.25 / M17 / D-STAR / DMR
+/ VARA comparison, and characterisation curves, see
 [`docs/UVPACKET.md`](UVPACKET.md). Representative WAV samples are
 at `audio_samples/uvpacket/`.
 

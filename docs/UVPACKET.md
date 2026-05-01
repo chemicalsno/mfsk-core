@@ -12,6 +12,89 @@ This document covers the modem itself. Application semantics
 (signed QSL exchange, position beacons, short text) are
 **not** part of `mfsk-core`; see §1.4 for the intended layering.
 
+## 0. Why this applied example exists — the negative-probe pair to Q65
+
+`uvpacket` is **not** a stand-alone applied example. It is a
+deliberate **negative probe** of where `mfsk-core`'s trait
+abstractions naturally stop holding, paired with the Q65 family
+expansion shipped in 0.4.0 as the **positive probe** of how far
+they reach inside the WSJT family. The two together — not either
+alone — are what test the trait design's scope.
+
+### What Q65 confirmed (positive)
+
+The `Protocol` / `ModulationParams` / `FrameLayout` / `FecCodec` /
+`MessageCodec` layers carried cleanly through, all the way to:
+
+- a **non-binary** code (QRA over GF(2⁶)) plugged into `FecCodec`'s
+  bit-level API by packing symbols inside its own `encode`;
+- six sub-modes generated from a single `q65_submode!` macro, all
+  passing `tests/protocol_invariants.rs`;
+- four parallel decode strategies (AWGN / AP-hint / fast-fading /
+  AP-list) sharing one generic `decode_at_for::<P>` body.
+
+That's a positive signal: the trait surface stretches over the
+"natural extensions" of the WSJT family without bending.
+
+### What `uvpacket` was meant to probe (negative)
+
+`uvpacket` deliberately walks outside the WSJT family:
+
+- single-carrier **π/4-DQPSK + LMS equaliser** (not M-ary tone FSK);
+- a **byte-pipe API** (not a structured callsign + grid message);
+- its own dedicated header LDPC block + **variable-length bursts**
+  (not fixed slots);
+- four-variant **127-chip BPSK preambles** (not Costas tone-index
+  blocks).
+
+Hypothesis: *"if the trait abstractions break here it doesn't hurt
+inside the WSJT family but it does mean the abstraction is missing
+expressive power; if they peel away cleanly, the trait scope is
+right-sized for WSJT."*
+
+### The observed boundary
+
+| Component | Outcome |
+|---|---|
+| `Ldpc240_101` mother code + BP / OSD-2/3 | **borrowed as-is** |
+| Test-channel infrastructure (AWGN / Rayleigh / SSB realistic / FM realistic) | **borrowed as-is** |
+| DSP primitives (RRC, correlators, LMS solve) | **borrowed as-is** |
+| `MessageCodec` | **deliberately bypassed** (byte-pipe: no structured codec needed) |
+| `WsjtApCompatible` | **deliberately bypassed** (uvpacket has no AP concept) |
+| `Protocol::ID` / `ModulationParams` trait constants | **decorative** — not consulted by the bespoke TX/RX pipeline |
+| Generic `core::pipeline::decode_frame::<P>` | **not used** (bespoke `uvpacket::rx`) |
+
+### Conclusion — the traits are intentionally WSJT-specific
+
+`mfsk-core`'s trait abstractions are a **concrete abstraction
+optimised for the WSJT protocol family**, not a general-purpose PHY
+framework. That's a correct design judgement:
+
+- *Because* the traits are WSJT-specific, a single `<P>` parameter
+  threads through `coarse_sync::<P>` / `compute_llr::<P>` /
+  `decode_frame::<P>` and monomorphises into per-protocol code that
+  costs nothing — Q65's six sub-modes drop in for the price of one
+  trait impl block.
+- A general PHY framework would have to generalise `SYNC_MODE`
+  beyond "Costas blocks or interleaved" to cover m-sequences, RRC
+  pulse shaping, equaliser state, etc. The WSJT code paths would
+  then read through additional indirection for no in-family benefit.
+
+`uvpacket` demonstrates that outside that boundary the WSJT trait
+abstractions peel away cleanly, which is *evidence the abstraction
+is correctly scoped*, not evidence that it falls short. For
+non-WSJT protocols the natural way to use `mfsk-core` is as a thin
+library of FEC + DSP + channel-test infrastructure underneath your
+own TX/RX pipeline — exactly the way `uvpacket` itself uses it.
+
+`docs/LIBRARY.md` §10.1 summarises the same dual-probe view from
+the trait-design side, and is a one-paragraph companion to this
+section.
+
+The remainder of this document (§1 onward) treats `uvpacket` as a
+modem on its own terms — design choices, characterisation,
+implementation loss.
+
 ## 1. Scope
 
 ### 1.1 What this is — a modem, layered alongside the WSJT family

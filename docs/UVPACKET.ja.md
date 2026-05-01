@@ -12,6 +12,80 @@
 このドキュメントでは設計上の選択、特性測定結果、既知の modem
 実装損失をまとめます。API は in-source rustdoc を参照。
 
+## 0. なぜこの応用例があるのか — Q65 と対をなす境界 probe
+
+`uvpacket` は単独の応用例ではなく、`mfsk-core` の trait 抽象の
+**境界を意図的に外側から probe する** ための実験です。0.4.0 で
+shipped した Q65 ファミリ拡張と対になる: Q65 は trait が
+WSJT 系の内側でどこまで素直に伸びるかを確かめる **positive probe**、
+`uvpacket` は WSJT 系の外に出ると trait がどこで自然に途切れるかを
+確かめる **negative probe**。両方の結果が揃ってはじめて trait 設計
+の妥当性が立体的に裏付けられる、という発想です。
+
+### Q65 で確認できたこと (positive)
+
+`Protocol` / `ModulationParams` / `FrameLayout` / `FecCodec` /
+`MessageCodec` の **全層** が、以下を含めてもクリーンに乗りました:
+
+- 非バイナリ符号 (QRA over GF(2⁶)) を `FecCodec` の bit 単位 API に
+  シンボル変換でラップする。
+- 6 サブモードを単一の `q65_submode!` マクロから生やし、すべて
+  `tests/protocol_invariants.rs` を通る。
+- AWGN / AP-hint / fast-fading / AP-list の 4 並列デコード戦略が
+  `decode_at_for::<P>` の generic コードを共有する。
+
+これは「trait が WSJT 系の自然な拡張に対しては強い」という positive
+な示唆です。
+
+### `uvpacket` で確認したかったこと (negative)
+
+WSJT 系の外側に意図的に出ます:
+
+- 単一搬送波 **π/4-DQPSK + LMS イコライザ** (M-ary tone FSK ではない)
+- **バイトパイプ API** (構造化 callsign + grid メッセージではない)
+- 自前のヘッダ LDPC ブロック + **可変長バースト** (固定スロットではない)
+- 4 種の **127 chip BPSK プリアンブル** (Costas tone-index ではない)
+
+仮説: 「ここで trait が破綻するなら WSJT 系内部では問題にならない
+が trait の表現力に穴がある。逆に綺麗に剥離するなら、抽象が
+WSJT 系に対して適切な scope を持っている」。
+
+### 観測された境界
+
+| 項目 | 結果 |
+|---|---|
+| `Ldpc240_101` 親コード + BP / OSD-2/3 | **そのまま借りた** |
+| テストチャンネル基盤 (AWGN / Rayleigh / SSB realistic / FM realistic) | **そのまま借りた** |
+| DSP 部品 (RRC、相関器、LMS 解) | **そのまま借りた** |
+| `MessageCodec` | **意図的に bypass** (バイトパイプ — 構造化 codec 不要) |
+| `WsjtApCompatible` | **意図的に bypass** (uvpacket には AP の概念がない) |
+| `Protocol::ID` / `ModulationParams` 定数 | **decorative** (自前 TX/RX パイプラインからは参照されない) |
+| 汎用 `core::pipeline::decode_frame::<P>` | **使っていない** (専用 `uvpacket::rx`) |
+
+### 結論 — trait は WSJT 系のために意図的に specific
+
+`mfsk-core` の trait 抽象は **WSJT 系プロトコルファミリ向けに
+最適化された具体的な抽象**であって、汎用 PHY フレームワークでは
+ありません。これは正しい設計判断です:
+
+- 抽象を WSJT 系に絞ったからこそ、`Protocol` 1 つの `<P>` パラメータ
+  から `coarse_sync::<P>` / `compute_llr::<P>` / `decode_frame::<P>`
+  が monomorphize でき、Q65 のような新モードがゼロコストで生える。
+- 汎用 PHY framework として作っていたら、`SYNC_MODE` を「Costas
+  でも m-sequence でも何でも」と一般化する代償に trait 階層が
+  階段状に増え、WSJT 系のコードが冗長になっていたはず。
+
+`uvpacket` はその境界の外側で WSJT 用 trait 抽象が自然に剥離する
+ことを実証していて、抽象の**不足**を示しているのではなく、抽象の
+**適切な scope を確認している**。WSJT 系外のプロトコルに対しては
+`mfsk-core` を「FEC + DSP + チャンネルテスト基盤を持つ薄い
+ライブラリ」として、自前の TX/RX パイプラインを書く側から使うのが
+自然な使い方です。`uvpacket` はその使い方の働く実例でもあります。
+
+以下、§1 以降は `uvpacket` 単体の設計と特性測定を扱います。trait
+抽象との関係についての要約は LIBRARY.ja.md §10.1 にも 1 段落あり、
+そちらと本節は対のペアです。
+
 ## 1. スコープ
 
 ### 1.1 これが何か
