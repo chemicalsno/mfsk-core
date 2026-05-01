@@ -90,6 +90,7 @@ fn one_trial(mode: Mode, eb_n0_db: f32, seed: u64) -> bool {
         osd_depth: 2,
         ap_mask: None,
         verify_info: None,
+        ..FecOpts::default()
     };
     let Some(result) = fec.decode_soft(&full_llrs, &opts) else {
         return false;

@@ -133,8 +133,7 @@ pub fn default_fec_opts() -> FecOpts<'static> {
     FecOpts {
         bp_max_iter: 50,
         osd_depth: 2,
-        ap_mask: None,
-        verify_info: None,
+        ..FecOpts::default()
     }
 }
 

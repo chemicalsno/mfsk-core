@@ -15,7 +15,7 @@ pub mod tables;
 use alloc::vec;
 
 use crate::core::{FecCodec, FecOpts, FecResult};
-use crate::fec::ldpc::bp::bp_decode_generic;
+use crate::fec::ldpc::bp::bp_decode_generic_kind;
 use crate::fec::ldpc::osd::{ldpc_encode_generic, osd_decode_generic};
 use crate::fec::ldpc::params::Ldpc240_101Params;
 
@@ -131,11 +131,12 @@ impl FecCodec for Ldpc240_101 {
             None => None,
         };
 
-        if let Some(r) = bp_decode_generic::<Ldpc240_101Params>(
+        if let Some(r) = bp_decode_generic_kind::<Ldpc240_101Params>(
             &llr_arr,
             ap_slice,
             opts.bp_max_iter,
             opts.verify_info,
+            opts.bp_kind,
         ) {
             return Some(FecResult {
                 info: r.info,
