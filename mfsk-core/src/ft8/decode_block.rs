@@ -112,6 +112,36 @@ const NSSY: i32 = (NSPS / NSTEP) as i32;
 /// FT8 tone spacing (Hz).
 const TONE_SPACING_HZ: f32 = 6.25;
 
+/// Regulariser added to `mean_others` in coarse_sync's ratio metric
+/// `t / (mean_others + ε)`. On the fp path the u16 spectrogram
+/// quantises noise bins to 0; on phantom carriers where the 7
+/// non-Costas tones happen to quantise to 0 the bare ratio explodes
+/// 100-1000× over real-signal scores and buries busy-band truth in
+/// coarse_sync's top-N. ε ≈ a fraction of one u16 LSB at
+/// `FP_SPEC_SHIFT=12` keeps the ratio finite without depressing
+/// genuine weak-signal scores (AWGN -17.5 dB threshold preserved).
+///
+/// 0.5 was picked from a host sweep over real-QSO WAVs: ε ∈ {0.1,
+/// 0.25, 0.5, 1.0, 2.0} — 0.25 and 0.5 both gave 8/13 truth in
+/// top-30 on busy-band qso3 (was 4/13 with bare ratio); 0.5 had
+/// slightly tighter top ranks. ε > 1.0 starts losing borderline
+/// weak signals; ε < 0.25 leaks phantom inflation back in.
+///
+/// On the f32 path `mean_others` never quantises to 0 so ε is
+/// dwarfed by typical t0_ref values and has no measurable effect.
+const RATIO_EPS_DEFAULT: f32 = 0.5;
+fn ratio_eps() -> f32 {
+    #[cfg(feature = "std")]
+    {
+        if let Ok(s) = std::env::var("MFSK_RATIO_EPS")
+            && let Ok(v) = s.parse::<f32>()
+        {
+            return v;
+        }
+    }
+    RATIO_EPS_DEFAULT
+}
+
 /// 12 kHz fixed sample rate.
 const SAMPLE_RATE_HZ: f32 = 12_000.0;
 
@@ -409,6 +439,7 @@ pub fn coarse_sync(
     let n_lag = (2 * jz + 1) as usize;
     let mut sync2d = vec![0.0f32; n_freq * n_lag];
     let idx = |fi: usize, lag: i32| fi * n_lag + (lag + jz) as usize;
+    let ratio_eps = ratio_eps();
 
     // **Multi-bin tone sum (Plan A)**: tone_step_bins ≈ 2.13 means
     // the 8 FT8 tones fall at fractional bin positions [0.00, 2.13,
@@ -464,24 +495,21 @@ pub fn coarse_sync(
                 }
             }
 
-            // Old ratio metric (per-band relative): `t / mean_others`.
-            // Less penalising of weak signals near strong neighbours
-            // than the linear Karlis Goba discriminant — better at
-            // keeping busy-band truth in coarse_sync's top-N.
+            // Regularised ratio `t / (mean_others + ε)`.
+            // ε prevents the u16-quantised fp path from blowing up
+            // when phantom carriers happen to land where 7 of 8 tone
+            // bins quantise to 0; `t0_ref → 0` would otherwise inflate
+            // ratio scores by 100-1000× over real signals.
             let t_all: f32 = t_blocks.iter().sum();
             let t0_all: f32 = t0_blocks.iter().sum();
             let t0_ref = (t0_all - t_all) / (NTONES as f32 - 1.0);
-            let sync_all = if t0_ref > 0.0 { t_all / t0_ref } else { 0.0 };
+            let sync_all = t_all / (t0_ref + ratio_eps);
 
             // Trailing-2-blocks score (drop block 0 — late-start tolerance).
             let t_tail = t_blocks[1] + t_blocks[2];
             let t0_tail = t0_blocks[1] + t0_blocks[2];
             let t0_tail_ref = (t0_tail - t_tail) / (NTONES as f32 - 1.0);
-            let sync_tail = if t0_tail_ref > 0.0 {
-                t_tail / t0_tail_ref
-            } else {
-                0.0
-            };
+            let sync_tail = t_tail / (t0_tail_ref + ratio_eps);
 
             sync2d[idx(fi, lag)] = sync_all.max(sync_tail);
         }
@@ -903,7 +931,7 @@ pub fn decode_block<S: AudioSample>(
     // signal-like energy" from "pure noise" but bad at fine ranking
     // — we keep more candidates than stage 3 will eat so Pass 2 has
     // material to re-rank by sync_quality.
-    let pass1 = coarse_sync(&spec, freq_min, freq_max, sync_min, PASS1_LIMIT);
+    let pass1 = coarse_sync(&spec, freq_min, freq_max, sync_min, pass1_limit());
     drop(spec);
     // Pass 2: per-cand Costas DFT (`SymMask::SyncOnly`) at the exact
     // tone freqs (no FFT bin alignment issue) → `sync_quality`. Re-rank
@@ -919,7 +947,29 @@ pub fn decode_block<S: AudioSample>(
 /// `sync_quality` (the same metric stage 3 uses to gate decode
 /// attempts — much sharper than the per-bin power ratio) and
 /// truncates to caller's `max_cand` for stage 3.
-const PASS1_LIMIT: usize = 100;
+///
+/// Sweep on real-QSO WAVs (host fp i16, BpAll, with the regularised
+/// coarse_sync ratio in `RATIO_EPS_DEFAULT`) showed:
+/// - PASS1 ∈ {30, 50}: 14/22 truth (drops one weak qso1 signal)
+/// - PASS1 ∈ {75, 100}: 15/22 truth (full recall ceiling)
+/// - PASS1=200: same 15/22 (no further gain — qso3's remaining gap
+///   is at coarse_sync rank 100+, beyond Pass 2's reach).
+///
+/// 75 is the smallest PASS1 that keeps the full recall ceiling.
+/// Core2 Pass 2 cost is linear in PASS1 (per-cand block-0 DFT) —
+/// 100 → 75 saves ~0.33 s/slot.
+const PASS1_LIMIT_DEFAULT: usize = 75;
+fn pass1_limit() -> usize {
+    #[cfg(feature = "std")]
+    {
+        if let Ok(s) = std::env::var("MFSK_PASS1_LIMIT")
+            && let Ok(v) = s.parse::<usize>()
+        {
+            return v;
+        }
+    }
+    PASS1_LIMIT_DEFAULT
+}
 
 /// One Pass-2 output: the original candidate, its 79×8 Costas-only
 /// spectrum (filled in stage 3 with the data-symbol DFT), and its
@@ -932,8 +982,8 @@ pub type RefinedCandidate = (SyncCandidate, Box<[[Complex<f32>; 8]; 79]>, u32);
 /// remaining 72 symbols via [`SymMask::NotBlock0`].
 ///
 /// Cost: 7 sync symbols × 8 tones = 56 DFT per candidate vs
-/// `SyncOnly`'s 168 — 1/3 the work. On Core2 ~25 ms/cand. With
-/// `PASS1_LIMIT=100` Pass 2 ≈ 2.5 s — fits the slot budget.
+/// `SyncOnly`'s 168 — 1/3 the work. On Core2 ~13 ms/cand with the
+/// asm dot product. PASS1=75 → Pass 2 ≈ 1.0 s.
 ///
 /// The retained `q` is the **block-0** score (range 0..=7, expected
 /// ~6-7 for real signals, ~0.875 for noise). Stage 3 recomputes the
