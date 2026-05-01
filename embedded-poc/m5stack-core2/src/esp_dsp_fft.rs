@@ -122,31 +122,35 @@ unsafe extern "C" {
 /// recovers the Q15-normalised i32 the trait contract expects (with
 /// the bottom 11 bits zero-padded — equivalent to losing 11 bits of
 /// precision off the bottom of the dynamic range).
-const ESP_DSP_DOT_SHIFT: i8 = -11;
+///
+/// Runtime-tunable via [`set_dot_shift`] — `main.rs` sweeps `-9 / -11
+/// / -13` to find where precision starts to bite vs where i16
+/// saturation steals strong-signal magnitude.
+pub static ESP_DSP_DOT_SHIFT: core::sync::atomic::AtomicI8 =
+    core::sync::atomic::AtomicI8::new(-11);
+
+/// Atomically swap the dot-product shift parameter. Returns the
+/// previous value. Used by `main.rs` for the shift sweep.
+pub fn set_dot_shift(new_shift: i8) -> i8 {
+    ESP_DSP_DOT_SHIFT.swap(new_shift, core::sync::atomic::Ordering::SeqCst)
+}
 
 #[unsafe(no_mangle)]
 pub extern "Rust" fn mfsk_core_dot_q15_i32(a: *const i16, b: *const i16, n: usize) -> i32 {
+    let shift = ESP_DSP_DOT_SHIFT.load(core::sync::atomic::Ordering::Relaxed);
     let mut out_i16: i16 = 0;
     // SAFETY: `a` and `b` point to `n` valid i16 elements (callers
     // pass `slice.as_ptr()`, `slice.len()`); `out_i16` is a stack
     // local. esp-dsp doesn't touch the input pointers beyond
     // `n` reads each.
-    let r = unsafe {
-        dsps_dotprod_s16_ae32(
-            a,
-            b,
-            &mut out_i16 as *mut i16,
-            n as i32,
-            ESP_DSP_DOT_SHIFT,
-        )
-    };
+    let r = unsafe { dsps_dotprod_s16_ae32(a, b, &mut out_i16 as *mut i16, n as i32, shift) };
     debug_assert_eq!(r, ESP_OK);
-    // Restore Q15-normalised i32 magnitude. With shift=-11 the
-    // i16 output represents `acc >> 26`; left-shifting by 11 puts
-    // it back into the `acc >> 15` range expected by the trait
-    // (zero-padded in the bottom 11 bits — that's the precision
-    // we trade for the asm dot product).
-    (out_i16 as i32) << 11
+    // Restore Q15-normalised i32 magnitude. With shift = X the
+    // i16 output represents `acc >> (15 - X)`. Left-shift by
+    // `(15 - X) - 15 = -X` puts it back into `acc >> 15` range.
+    // For X = -11: shift back by 11 (zero-pad bottom 11 bits).
+    let restore = (-(shift as i32)) as u32;
+    (out_i16 as i32) << restore
 }
 
 /// `esp-dsp` FFT planner. Construct once per session, share across

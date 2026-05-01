@@ -755,10 +755,15 @@ pub fn fill_symbol_spectra<S: AudioSample>(
     let two_pi_over_fs = core::f32::consts::TAU / SAMPLE_RATE_HZ;
 
     // ── Phase 1: precompute Q15 basis vectors (cos, sin × 8 tones).
-    // 8 × 1920 × 2 bytes × 2 = 60 KB — heap allocated; too big for
-    // the 16 KB ESP32 default stack.
-    let mut basis_re: Vec<[i16; NSPS]> = alloc::vec![[0i16; NSPS]; NTONES];
-    let mut basis_im: Vec<[i16; NSPS]> = alloc::vec![[0i16; NSPS]; NTONES];
+    // Single flat heap allocation (NTONES × NSPS × 2 = 30 720 i16 ≈
+    // 60 KB) per axis. **Don't** use `vec![[0i16; NSPS]; NTONES]` —
+    // that materialises a `[i16; NSPS]` (3.8 KB) on the stack and
+    // copies it `NTONES` times, blowing the 16 KB ESP32 main task
+    // stack. Flat `vec![0i16; n]` is one zero-init heap alloc with
+    // no per-element copy.
+    let basis_len = NTONES * NSPS;
+    let mut basis_re: Vec<i16> = alloc::vec![0i16; basis_len];
+    let mut basis_im: Vec<i16> = alloc::vec![0i16; basis_len];
     for tone in 0..NTONES {
         let tone_freq = freq_hz + tone as f32 * TONE_SPACING_HZ;
         let dphi = -two_pi_over_fs * tone_freq;
@@ -766,9 +771,10 @@ pub fn fill_symbol_spectra<S: AudioSample>(
         let rot_im = (dphi.sin() * 32767.0).round() as i32;
         let mut osc_re: i32 = 32767;
         let mut osc_im: i32 = 0;
+        let base = tone * NSPS;
         for k in 0..NSPS {
-            basis_re[tone][k] = osc_re as i16;
-            basis_im[tone][k] = osc_im as i16;
+            basis_re[base + k] = osc_re as i16;
+            basis_im[base + k] = osc_im as i16;
             let new_re = ((osc_re * rot_re) - (osc_im * rot_im)) >> 15;
             let new_im = ((osc_re * rot_im) + (osc_im * rot_re)) >> 15;
             osc_re = new_re;
@@ -794,8 +800,11 @@ pub fn fill_symbol_spectra<S: AudioSample>(
             };
         }
         for tone in 0..NTONES {
-            let acc_re = dot_q15_i32(&sym_buf, &basis_re[tone]);
-            let acc_im = dot_q15_i32(&sym_buf, &basis_im[tone]);
+            let base = tone * NSPS;
+            let basis_re_tone = &basis_re[base..base + NSPS];
+            let basis_im_tone = &basis_im[base..base + NSPS];
+            let acc_re = dot_q15_i32(&sym_buf, basis_re_tone);
+            let acc_im = dot_q15_i32(&sym_buf, basis_im_tone);
             out[sym][tone] = Complex::new(acc_re as f32, acc_im as f32);
         }
     }
