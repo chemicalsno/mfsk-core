@@ -27,6 +27,7 @@
 //! `DecodeContext`, `FecOpts`, `FecResult`, `MessageFields`) are also
 //! re-exported at the crate root for ergonomics.
 
+pub mod dotprod;
 pub mod dsp;
 pub mod equalize;
 pub mod fft;
