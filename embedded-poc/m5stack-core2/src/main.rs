@@ -56,6 +56,11 @@ use mfsk_core::msg::wsjt77::unpack77;
 static mut BASIS_RE: [i16; BASIS_SCRATCH_LEN] = [0; BASIS_SCRATCH_LEN];
 static mut BASIS_IM: [i16; BASIS_SCRATCH_LEN] = [0; BASIS_SCRATCH_LEN];
 
+/// Skip the OSD fallback (Bp staircase still runs all 4 LLR variants).
+/// OSD recovers a few weak signals at the cost of producing phantom
+/// CRC-passing garbage decodes (~2 per qso3 slot in our tests).
+const OSD_ENABLED: bool = false;
+
 /// Real on-air FT8 slots — 12 kHz / mono / 16-bit PCM. Each ≈ 360 KB.
 /// Two consecutive slots from `jl1nie/rs-ft8n`'s benchmark data plus
 /// one busy-band recording from WSJT-X.
@@ -136,7 +141,11 @@ fn main() {
     const MAX_CAND_SWEEP: &[usize] = &[30];
     const DT_GRID_SWEEP: &[u8] = &[0];
     const DF_GRID_SWEEP: &[u8] = &[0];
-    const Q_THRESH_SWEEP: &[u32] = &[6];
+    // q>12 (instead of q>6): skips compute_llr (full) for borderline
+    // cands. Combined with OSD off (see `OSD_ENABLED` at module scope)
+    // this trades weak-signal recall (~-1 truth typical) for ~30-40%
+    // faster stage 3 and zero phantom CRC-passing decodes.
+    const Q_THRESH_SWEEP: &[u32] = &[12];
 
     // Pre-load slots once into PSRAM. Loading is ~170 ms each, no
     // need to repeat per sweep config.
@@ -286,7 +295,7 @@ fn decode_one(slot: &[i16], max_cand: usize, dt_grid: u8, df_grid: u8, q_thresh:
                     break;
                 }
             }
-            if accepted.is_none() && q_best >= 12 {
+            if OSD_ENABLED && accepted.is_none() && q_best >= 12 {
                 let osd_variants = [
                     (&llr_full.llra, 4u8),
                     (&llr_full.llrb, 5),
