@@ -51,7 +51,8 @@ fn coarse_sync_candidate_diag() {
             .filter_map(|r| unpack77(&r.message77).map(|t| (r.freq_hz, r.dt_sec, r.snr_db, t)))
             .collect();
 
-        // Block's candidates.
+        // Block's candidates. Top-200 (already sorted by score
+        // descending inside `coarse_sync`).
         let spec = compute_spectrogram(&slot, 3000.0);
         let cands = coarse_sync(&spec, 100.0, 3000.0, 0.5, 200);
 
@@ -59,20 +60,25 @@ fn coarse_sync_candidate_diag() {
         println!("  truth from decode_frame: {} signals", truth.len());
         println!("  block coarse_sync emitted: {} candidates", cands.len());
 
-        // For each truth, find the closest candidate within 6 Hz / 0.5 s.
+        // For each truth, find the closest candidate within 6 Hz / 0.5 s
+        // AND its rank in the score-sorted top-200. This tells us
+        // whether `max_cand=30` (Core2 budget) would have cut the
+        // truth signal out of stage 3.
         println!(
-            "\n  {:<32} | {:>7} | {:>5} | {:>4} | closest cand (df, ddt, score)",
+            "\n  {:<32} | {:>7} | {:>5} | {:>4} | rank | closest cand (df, ddt, score)",
             "truth msg", "freq", "SNR", "dt"
         );
-        println!("  {}", "─".repeat(95));
+        println!("  {}", "─".repeat(102));
         for (tf, tdt, tsnr, tmsg) in &truth {
             let mut best_df = f32::INFINITY;
+            let mut best_rank: Option<usize> = None;
             let mut best: Option<&_> = None;
-            for c in &cands {
+            for (rank, c) in cands.iter().enumerate() {
                 let df = (c.freq_hz - tf).abs();
                 let ddt = (c.dt_sec - tdt).abs();
                 if df < 6.0 && ddt < 0.5 && df < best_df {
                     best_df = df;
+                    best_rank = Some(rank);
                     best = Some(c);
                 }
             }
@@ -82,21 +88,38 @@ fn coarse_sync_candidate_diag() {
                 tmsg.as_str()
             };
             match best {
-                Some(c) => println!(
-                    "  {:<32} | {:>5.0}Hz | {:>+4.0}  | {:>+4.2} | df={:+.1}Hz ddt={:+.2}s s={:.2}",
-                    mt,
-                    tf,
-                    tsnr,
-                    tdt,
-                    c.freq_hz - tf,
-                    c.dt_sec - tdt,
-                    c.score,
-                ),
+                Some(c) => {
+                    let rank = best_rank.unwrap();
+                    let in_top30 = if rank < 30 { "✓" } else { "✗" };
+                    println!(
+                        "  {:<32} | {:>5.0}Hz | {:>+4.0}  | {:>+4.2} | {:>3}{} | df={:+.1}Hz ddt={:+.2}s s={:.0}",
+                        mt,
+                        tf,
+                        tsnr,
+                        tdt,
+                        rank + 1,
+                        in_top30,
+                        c.freq_hz - tf,
+                        c.dt_sec - tdt,
+                        c.score,
+                    )
+                }
                 None => println!(
-                    "  {:<32} | {:>5.0}Hz | {:>+4.0}  | {:>+4.2} | ✗ MISSING from coarse_sync",
+                    "  {:<32} | {:>5.0}Hz | {:>+4.0}  | {:>+4.2} |    — | ✗ MISSING from coarse_sync",
                     mt, tf, tsnr, tdt,
                 ),
             }
+        }
+        println!();
+        println!("  ── top-30 by score ──");
+        for (i, c) in cands.iter().take(30).enumerate() {
+            println!(
+                "  rank {:>2}: freq={:>5.0} Hz  dt={:>+5.2} s  score={:.0}",
+                i + 1,
+                c.freq_hz,
+                c.dt_sec,
+                c.score
+            );
         }
         println!();
     }

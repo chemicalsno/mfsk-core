@@ -39,7 +39,7 @@ use mfsk_core::fec::ldpc::osd::{osd_decode, osd_decode_deep};
 use mfsk_core::ft8::decode::DecodeResult;
 use mfsk_core::ft8::decode_block::{
     coarse_sync, compute_spectrogram, fill_symbol_spectra_into, symbol_spectra_direct_into,
-    SymMask, BASIS_SCRATCH_LEN,
+    sync_quality_block0, SymMask, BASIS_SCRATCH_LEN,
 };
 use mfsk_core::ft8::llr::{compute_llr, compute_llr_fast, compute_snr_db, sync_quality};
 use mfsk_core::ft8::params::LDPC_N;
@@ -60,6 +60,18 @@ static mut BASIS_IM: [i16; BASIS_SCRATCH_LEN] = [0; BASIS_SCRATCH_LEN];
 /// OSD recovers a few weak signals at the cost of producing phantom
 /// CRC-passing garbage decodes (~2 per qso3 slot in our tests).
 const OSD_ENABLED: bool = false;
+
+/// Pass 1 (coarse_sync) candidate cap, BEFORE the manual Pass 2
+/// `sync_quality_block0` re-rank. coarse_sync's per-band score
+/// `t / mean_others` is broken on busy bands — strong signals at
+/// fractional FFT bin positions (e.g. W1FC at 2572 Hz on qso3,
+/// SNR 0 dB) score LOWER than weak phantoms, so just truncating to
+/// `max_cand=30` cuts the truth signals out (host coarse_sync diag
+/// on qso3 puts W1FC at rank 56, WM3PEN at rank 58, K1BZM at rank 52).
+/// Pass 2 re-ranks the wider top-100 by Costas-block-0 sync_quality
+/// (the metric stage 3's `q > 12` gate uses) and truncates to
+/// `max_cand` for the expensive full-Costas + LLR + BP staircase.
+const PASS1_LIMIT: usize = 100;
 
 /// Real on-air FT8 slots — 12 kHz / mono / 16-bit PCM. Each ≈ 360 KB.
 /// Two consecutive slots from `jl1nie/rs-ft8n`'s benchmark data plus
@@ -138,6 +150,10 @@ fn main() {
     // balances real-QSO recall (~67 % vs frame on host fp) against
     // Core2 time budget. Parabolic dt only (dt/df grids hurt recall
     // empirically). q_thresh=6 (q>3 same recall, just slower).
+    // max_cand = stage 3 budget (cands eligible for full Costas DFT
+    // + LLR + BP). Pass 1 (coarse_sync) emits PASS1_LIMIT; Pass 2
+    // re-ranks by sync_quality_block0 and truncates to max_cand for
+    // the expensive stage 3 work. See `decode_one`.
     const MAX_CAND_SWEEP: &[usize] = &[30];
     const DT_GRID_SWEEP: &[u8] = &[0];
     const DF_GRID_SWEEP: &[u8] = &[0];
@@ -192,16 +208,53 @@ fn decode_one(slot: &[i16], max_cand: usize, dt_grid: u8, df_grid: u8, q_thresh:
         spec.n_freq,
     );
 
-    // Stage 2: Costas correlation.
+    // Stage 2: Costas correlation. Pass 1 — wide net at PASS1_LIMIT.
     let t2 = now_us();
-    let cands = coarse_sync(&spec, 100.0, 3_000.0, 1.0, max_cand);
+    let pass1 = coarse_sync(&spec, 100.0, 3_000.0, 1.0, PASS1_LIMIT);
     let t3 = now_us();
     log::info!(
-        "  stage 2 (sync):       {:>8} us  ({} candidate(s))",
+        "  stage 2 (sync):       {:>8} us  ({} cand)",
         t3 - t2,
-        cands.len(),
+        pass1.len(),
     );
     drop(spec);
+
+    // Pass 2: re-rank by `sync_quality_block0` (cheap — 7 syms × 8
+    // tones DFT per cand, ~9 ms each on Core2 with asm dot + internal
+    // basis). Truncate to `max_cand` for stage 3. The cs is dropped
+    // inside the closure so only one cs Box (5 KB) is outstanding at
+    // a time — avoids the heap fragmentation that crashed
+    // `decode_block`'s collected-Vec<RefinedCandidate> approach.
+    let t_pass2 = now_us();
+    let mut ranked: alloc::vec::Vec<(mfsk_core::core::sync::SyncCandidate, u32)> = pass1
+        .into_iter()
+        .map(|c| {
+            let cs = unsafe {
+                symbol_spectra_direct_into(
+                    slot,
+                    c.freq_hz,
+                    c.dt_sec,
+                    SymMask::SyncBlock0,
+                    &mut BASIS_RE,
+                    &mut BASIS_IM,
+                )
+            };
+            let q = sync_quality_block0(&cs);
+            // cs dropped here
+            (c, q)
+        })
+        .collect();
+    ranked.sort_by_key(|r| core::cmp::Reverse(r.1));
+    ranked.truncate(max_cand);
+    let t_pass2_end = now_us();
+    log::info!(
+        "  pass 2 (re-rank):     {:>8} us  → top {} by sync_quality_block0",
+        t_pass2_end - t_pass2,
+        ranked.len(),
+    );
+
+    let cands: alloc::vec::Vec<mfsk_core::core::sync::SyncCandidate> =
+        ranked.into_iter().map(|(c, _)| c).collect();
 
     // Stage 3: per-cand (dt, df) refinement + DFT + LLR + BP.
     let dt_offsets: alloc::vec::Vec<f32> = match dt_grid {

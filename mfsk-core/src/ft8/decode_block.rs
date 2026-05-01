@@ -961,7 +961,12 @@ fn refine_candidates<S: AudioSample>(
 /// Hard-decision sync quality on Costas **block 0 only** (symbols
 /// 0..7). Cheaper variant of [`sync_quality`] for Pass 2 — checks
 /// only one of the three Costas blocks. Range 0..=7.
-fn sync_quality_block0(cs: &[[Complex<f32>; 8]; 79]) -> u32 {
+///
+/// Pub-but-doc-hidden so embedded callers (e.g. the m5stack-core2
+/// PoC's manual Pass 2) can re-rank coarse_sync candidates by this
+/// metric without pulling in the full `decode_block` D-pattern.
+#[doc(hidden)]
+pub fn sync_quality_block0(cs: &[[Complex<f32>; 8]; 79]) -> u32 {
     let mut count = 0u32;
     for (t, &expected) in COSTAS.iter().enumerate() {
         let sym = t; // block 0 starts at symbol 0
