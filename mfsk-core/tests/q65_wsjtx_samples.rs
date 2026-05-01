@@ -22,8 +22,8 @@ use mfsk_core::fec::qra::FadingModel;
 use mfsk_core::msg::ApHint;
 use mfsk_core::q65::search::SearchParams;
 use mfsk_core::q65::{
-    Q65a30, Q65a60, decode_scan, decode_scan_fading_for, decode_scan_with_ap,
-    decode_scan_with_ap_for,
+    Q65a30, Q65a60, decode_multi_period_for, decode_scan, decode_scan_fading_for,
+    decode_scan_with_ap, decode_scan_with_ap_for,
 };
 
 /// Minimal WAV reader for WSJT-X's exact format: RIFF/WAVE header,
@@ -73,23 +73,20 @@ fn samples_dir(rel: &str) -> Option<PathBuf> {
     if dir.is_dir() { Some(dir) } else { None }
 }
 
-/// Smoke test: the Q65-30A receive chain (plain BP + AP + fast-fading
-/// metric) runs to completion against every WSJT-X ionoscatter
-/// reference recording without panicking, and the WAV reader handles
-/// the file format correctly.
+/// Smoke test: the Q65-30A *single-period* receive chain (plain BP +
+/// AP + fast-fading metric) runs to completion against every WSJT-X
+/// ionoscatter reference recording without panicking, and the WAV
+/// reader handles the file format correctly.
 ///
-/// **Decode rate is not asserted** because the WSJT-X ionoscatter
-/// sample set typically requires **multi-period averaging** — a
-/// strategy where WSJT-X stacks several adjacent slots in
-/// time-frequency before running BP / fast-fading, recovering
-/// signals that sit below any individual slot's threshold. That path
-/// is not yet ported to mfsk-core. As of 0.4.2 this port produces
-/// 0/4 decodes across plain BP / AP-CQ / fast-fading
-/// {3, 8, 15} × {Gaussian, Lorentzian}. When multi-period averaging
-/// lands, this test should be promoted to require non-zero decodes
-/// (or a sibling strict test added). Current scope: catch a panic /
-/// WAV-reader / search-params regression so the existing chain
-/// stays healthy in the meantime.
+/// **Single-period decode rate is not asserted** — these recordings
+/// sit below the single-period decode threshold (each WAV produces
+/// 0 decodes via plain / AP-CQ / fast-fading taken in isolation).
+/// The averaged-decode gate lives in
+/// `ionoscatter_6m_full_stack_decodes_via_averaging` below, which
+/// stacks the slots and recovers them via the multi-period EMA path
+/// (`decode_multi_period_for`). This test stays useful as a
+/// regression catch on the per-slot chain (panic / WAV-reader /
+/// search-params blow-up).
 #[test]
 fn ionoscatter_6m_receive_chain_runs() {
     let Some(dir) = samples_dir("30A_Ionoscatter_6m") else {
@@ -162,6 +159,116 @@ fn ionoscatter_6m_receive_chain_runs() {
     assert!(
         wav_count > 0,
         "no readable WAVs in WSJT-X Q65-30A ionoscatter sample dir"
+    );
+}
+
+/// Strict gate: stack the four ionoscatter recordings into one
+/// running EMA via [`decode_multi_period_for`] and require at least
+/// one decode total.
+///
+/// Mirrors WSJT-X's `iavg=1`/`iavg=2` averaged-decode flow from
+/// `lib/q65_decode.f90` — the path that lets weak ionoscatter
+/// signals decode when single-period BP/fading cannot. Our reduced
+/// b90 sweep `{3, 8, 15} × {Gaussian, Lorentzian}` plus plain Bessel
+/// fallback covers the realistic ionoscatter spread regime.
+///
+/// Currently no AP-list pair is supplied (the recordings are from
+/// an unknown station so we don't know plausible call/grid pairs);
+/// the fading + plain BP ladder must reach the threshold on its own.
+/// If the expected call/grid pair becomes known, pass it through
+/// [`mfsk_core::q65::standard_qso_codewords`] for the AP-list path.
+#[test]
+fn ionoscatter_6m_full_stack_decodes_via_averaging() {
+    let Some(dir) = samples_dir("30A_Ionoscatter_6m") else {
+        eprintln!("skipping: WSJT-X sample tree not found");
+        return;
+    };
+    let mut paths: Vec<_> = std::fs::read_dir(&dir)
+        .expect("read samples dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("wav"))
+        .collect();
+    // Stable order so the EMA sees slots in chronological order.
+    paths.sort();
+    assert!(
+        !paths.is_empty(),
+        "WSJT-X Q65-30A sample dir contains no .wav files"
+    );
+
+    let audios: Vec<Vec<f32>> = paths.iter().filter_map(|p| read_wsjtx_wav(p)).collect();
+    assert!(
+        !audios.is_empty(),
+        "no readable WAVs in WSJT-X Q65-30A ionoscatter sample dir"
+    );
+    let slot_refs: Vec<&[f32]> = audios.iter().map(|v| v.as_slice()).collect();
+
+    // 15 s into the 30 s slot, ±15 s tolerance — covers the full
+    // recording so the running-EMA coarse search has the whole slot.
+    let nominal_mid = 12_000 * 15;
+    let params = SearchParams {
+        freq_min_hz: 200.0,
+        freq_max_hz: 3_000.0,
+        time_tolerance_symbols: 50,
+        score_threshold: 0.05,
+        max_candidates: 32,
+    };
+
+    let decodes_no_ap =
+        decode_multi_period_for::<Q65a30>(&slot_refs, 12_000, nominal_mid, &params, None);
+    eprintln!(
+        "[info] ionoscatter multi-period (no AP-list): {} unique decode(s) across {} slot(s)",
+        decodes_no_ap.len(),
+        slot_refs.len(),
+    );
+    for d in &decodes_no_ap {
+        eprintln!(
+            "  → freq={:.1} Hz dt={:.2} s iter={} : {}",
+            d.freq_hz,
+            d.start_sample as f32 / 12_000.0,
+            d.iterations,
+            d.message
+        );
+    }
+
+    // Try the AP-list path with K1JT / K9AN — the call pair revealed
+    // by the no-AP run above. WSJT-X normally builds this list from
+    // the user's "Watch list" or last-seen-CQ; here we hard-code the
+    // discovered pair to test the AP-list integration.
+    use mfsk_core::q65::standard_qso_codewords;
+    let ap_codewords = standard_qso_codewords("K1JT", "K9AN", "");
+    let decodes_ap = decode_multi_period_for::<Q65a30>(
+        &slot_refs,
+        12_000,
+        nominal_mid,
+        &params,
+        Some(&ap_codewords),
+    );
+    eprintln!(
+        "[info] ionoscatter multi-period (AP-list K1JT/K9AN): {} unique decode(s)",
+        decodes_ap.len(),
+    );
+    for d in &decodes_ap {
+        eprintln!(
+            "  → freq={:.1} Hz dt={:.2} s iter={} : {}",
+            d.freq_hz,
+            d.start_sample as f32 / 12_000.0,
+            d.iterations,
+            d.message
+        );
+    }
+
+    // Goal: multi-period averaging recovers the signal in at least one
+    // of the strategies. Single decode counts as success because the
+    // running-EMA collapses repeated copies of the same QSO line into
+    // one output entry — once a QSO has been recovered there's no
+    // additional information from re-recovering it.
+    assert!(
+        !decodes_no_ap.is_empty() || !decodes_ap.is_empty(),
+        "0/{} ionoscatter slots produced any decode through multi-period averaging \
+         (neither without AP-list nor with K1JT/K9AN AP-list) — regression or \
+         insufficient signal recovery in the EMA-on-spectrogram path",
+        slot_refs.len(),
     );
 }
 

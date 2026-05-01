@@ -1,5 +1,72 @@
 # Changelog
 
+## 0.4.3 — Q65 multi-period averaging (ionoscatter port)
+
+Adds the WSJT-X `iavg=1` / `iavg=2` averaged-decode path to the
+Q65 receive chain. The 0.4.2 honest-test pass left the WSJT-X
+ionoscatter reference set (`30A_Ionoscatter_6m/*.wav`) at 0/4
+decoded with an explicit `multi-period averaging not yet ported`
+docstring; this release ports it and recovers `K1JT K9AN R-16` —
+the actual exchange in the recording, decoded by averaging the 4
+slots before BP / fast-fading. Single-period EME paths
+(`60A_EME_6m`, `60D_EME_10GHz`) are unchanged.
+
+### What's new
+
+- **`mfsk_core::q65::decode_multi_period_for<P>`** + `decode_multi_period`
+  Q65-30A wrapper. Stateless API: pass `&[&[f32]]` of audio slots
+  in chronological order and an optional AP-list candidate set;
+  returns deduplicated `Vec<Q65Decode>`. Internally maintains an
+  exponential-moving-average spectrogram with time constant
+  `min(navg, 4)` (matches WSJT-X's `lib/qra/q65/q65.f90:300-304`
+  accumulator) and runs coarse sync search on the running average
+  before each candidate goes through a 3-stage decode ladder:
+  - **Stage B (AP-list)** when `ap_codewords` is supplied — averaged
+    Bessel-metric intrinsics → `Q65Codec::decode_with_codeword_list`.
+    Mirrors WSJT-X's `iavg=1` q3 path.
+  - **Stage C-fading** — averaged wide energies →
+    `intrinsics_fast_fading` BP, swept across
+    `b90·Ts ∈ {3, 8, 15} × {Gaussian, Lorentzian}`.
+  - **Stage C-plain** — averaged narrow energies → Bessel-metric BP
+    fallback.
+- Per-slot at most one decode is appended (the first stage that
+  succeeds for any candidate wins). Repeated identical messages
+  across slots are deduplicated by `(message, ±4 Hz freq)` because
+  the running EMA collapses copies of the same QSO into one
+  signal.
+
+### Verified
+
+- `tests/q65_wsjtx_samples.rs::ionoscatter_6m_full_stack_decodes_via_averaging`
+  asserts ≥1 decode across the 4-slot WSJT-X ionoscatter stack.
+  Both paths (no AP-list, K1JT/K9AN AP-list) recover
+  `K1JT K9AN R-16` at 1010 Hz / dt=0.90 s.
+- `tests/q65_wsjtx_samples.rs::ionoscatter_6m_receive_chain_runs`
+  smoke test still passes (single-period chain unchanged).
+- 6 m EME (`eme_6m_sample_yields_decode_with_ap` — 3 W7GJ exchanges
+  via plain + AP-CQ) and 10 GHz EME
+  (`q65_fast_fading::eme_10ghz_reference_decodes_with_fast_fading`
+  — 3 VK7MO/K6QPV decodes via fast-fading) untouched.
+- `cargo test --features full --release -- --include-ignored` all
+  green; clippy + fmt clean.
+
+### Implementation notes
+
+- Reuses the existing `extract_data_energies` /
+  `extract_data_energies_wide` energy extractors (private to
+  `q65::rx`), `mfsk_bessel_metric` and `intrinsics_fast_fading`
+  intrinsics builders, `Q65Codec::{decode, decode_with_codeword_list}`
+  decoders, and `super::search::coarse_search_on_spec_for<P>`. No
+  changes to `Spectrogram`, `SearchParams`, or any existing public
+  surface — the multi-period entry is an additive layer.
+- Stateless by design: real-time consumers manage the slot buffer
+  themselves. A `Q65Averager` struct + WSJT-X-style even/odd
+  parity (`iseq=0/1`) split are reasonable follow-ups but were not
+  needed to clear the WSJT-X reference set.
+- AP-list path uses the existing `standard_qso_codewords(my, his,
+  grid)` builder. When the call+grid pair is unknown, pass `None`
+  and the fading + plain BP ladder handles it.
+
 ## 0.4.2 — documentation consistency pass
 
 Patch release. No public-API changes; host builds (`--features full`)

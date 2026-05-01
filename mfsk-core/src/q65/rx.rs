@@ -598,6 +598,351 @@ pub fn decode_scan_default(audio: &[f32], sample_rate: u32) -> Vec<Q65Decode> {
     )
 }
 
+// ──────────────────────────────────────────────────────────────────────────
+// Multi-period averaging — WSJT-X `iavg=1,2` parity.
+//
+// Mirrors `lib/q65_decode.f90`'s averaged decode flow: maintain an
+// EMA over the per-slot spectrogram, run coarse search on the
+// running average, and on each candidate try the AP-list / fading /
+// plain BP ladder against energies averaged across the slots seen so
+// far. Stateless (caller owns the slot buffer) — see the docstring
+// on `decode_multi_period_for` for the call shape.
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Average per-symbol FFT energies (`extract_data_energies` output)
+/// element-wise across `audio_slots[..=current]` at the candidate
+/// `(start_sample, base_freq_hz)`. Returns `None` if no slot yields
+/// usable energies.
+fn averaged_data_energies<P: ModulationParams>(
+    audio_slots: &[&[f32]],
+    sample_rate: u32,
+    start_sample: usize,
+    base_freq_hz: f32,
+) -> Option<Vec<f32>> {
+    let mut accum: Option<Vec<f32>> = None;
+    let mut count = 0_usize;
+    for &audio in audio_slots {
+        let Some(e) = extract_data_energies::<P>(audio, sample_rate, start_sample, base_freq_hz)
+        else {
+            continue;
+        };
+        match accum.as_mut() {
+            Some(a) => {
+                for (slot, v) in a.iter_mut().zip(&e) {
+                    *slot += *v;
+                }
+            }
+            None => accum = Some(e),
+        }
+        count += 1;
+    }
+    let mut accum = accum?;
+    if count > 1 {
+        let inv = 1.0_f32 / count as f32;
+        for v in &mut accum {
+            *v *= inv;
+        }
+    }
+    Some(accum)
+}
+
+/// Wide-spectrogram variant of [`averaged_data_energies`] for the
+/// fast-fading metric path.
+fn averaged_data_energies_wide<P: ModulationParams>(
+    audio_slots: &[&[f32]],
+    sample_rate: u32,
+    start_sample: usize,
+    base_freq_hz: f32,
+) -> Option<Vec<f32>> {
+    let mut accum: Option<Vec<f32>> = None;
+    let mut count = 0_usize;
+    for &audio in audio_slots {
+        let Some(e) =
+            extract_data_energies_wide::<P>(audio, sample_rate, start_sample, base_freq_hz)
+        else {
+            continue;
+        };
+        match accum.as_mut() {
+            Some(a) => {
+                for (slot, v) in a.iter_mut().zip(&e) {
+                    *slot += *v;
+                }
+            }
+            None => accum = Some(e),
+        }
+        count += 1;
+    }
+    let mut accum = accum?;
+    if count > 1 {
+        let inv = 1.0_f32 / count as f32;
+        for v in &mut accum {
+            *v *= inv;
+        }
+    }
+    Some(accum)
+}
+
+/// Run the AP-list decoder against averaged narrow energies.
+fn decode_averaged_ap_list_for<P: ModulationParams>(
+    audio_slots: &[&[f32]],
+    sample_rate: u32,
+    start_sample: usize,
+    base_freq_hz: f32,
+    candidates: &[[i32; 63]],
+) -> Option<Q65Decode> {
+    use crate::core::{DecodeContext, MessageCodec};
+    use crate::msg::Q65Message;
+
+    if candidates.is_empty() {
+        return None;
+    }
+    let energies =
+        averaged_data_energies::<P>(audio_slots, sample_rate, start_sample, base_freq_hz)?;
+
+    let mut intrinsics = vec![0.0_f32; 64 * 63];
+    QRA15_65_64_IRR_E23.mfsk_bessel_metric(&mut intrinsics, &energies, 63, default_es_no_metric());
+
+    let codec = Q65Codec::new(&QRA15_65_64_IRR_E23);
+    let (_idx, info_syms) = codec.decode_with_codeword_list(&intrinsics, candidates)?;
+
+    let bits77 = unpack_symbols_to_bits77(&info_syms);
+    let text = Q65Message.unpack(&bits77, &DecodeContext::default())?;
+
+    Some(Q65Decode {
+        message: text,
+        freq_hz: base_freq_hz,
+        start_sample,
+        iterations: 0,
+    })
+}
+
+/// Run the fast-fading metric BP decoder against averaged wide energies.
+fn decode_averaged_fading_for<P: ModulationParams>(
+    audio_slots: &[&[f32]],
+    sample_rate: u32,
+    start_sample: usize,
+    base_freq_hz: f32,
+    b90_ts: f32,
+    model: FadingModel,
+) -> Option<Q65Decode> {
+    use crate::core::{DecodeContext, MessageCodec};
+    use crate::msg::Q65Message;
+
+    let energies =
+        averaged_data_energies_wide::<P>(audio_slots, sample_rate, start_sample, base_freq_hz)?;
+
+    let mut intrinsics = vec![0.0_f32; 64 * 63];
+    let _state = intrinsics_fast_fading(
+        &QRA15_65_64_IRR_E23,
+        &mut intrinsics,
+        &energies,
+        submode_index_from_params::<P>(),
+        b90_ts,
+        model,
+        default_es_no_metric(),
+    );
+
+    let mut codec = Q65Codec::new(&QRA15_65_64_IRR_E23);
+    let mut info_syms = [0_i32; 13];
+    let iterations = codec.decode(&intrinsics, &mut info_syms, 50).ok()?;
+
+    let bits77 = unpack_symbols_to_bits77(&info_syms);
+    let text = Q65Message.unpack(&bits77, &DecodeContext::default())?;
+
+    Some(Q65Decode {
+        message: text,
+        freq_hz: base_freq_hz,
+        start_sample,
+        iterations,
+    })
+}
+
+/// Run plain Bessel-metric BP against averaged narrow energies.
+fn decode_averaged_plain_for<P: ModulationParams>(
+    audio_slots: &[&[f32]],
+    sample_rate: u32,
+    start_sample: usize,
+    base_freq_hz: f32,
+) -> Option<Q65Decode> {
+    use crate::core::{DecodeContext, MessageCodec};
+    use crate::msg::Q65Message;
+
+    let energies =
+        averaged_data_energies::<P>(audio_slots, sample_rate, start_sample, base_freq_hz)?;
+
+    let mut intrinsics = vec![0.0_f32; 64 * 63];
+    QRA15_65_64_IRR_E23.mfsk_bessel_metric(&mut intrinsics, &energies, 63, default_es_no_metric());
+
+    let mut codec = Q65Codec::new(&QRA15_65_64_IRR_E23);
+    let mut info_syms = [0_i32; 13];
+    let iterations = codec.decode(&intrinsics, &mut info_syms, 50).ok()?;
+
+    let bits77 = unpack_symbols_to_bits77(&info_syms);
+    let text = Q65Message.unpack(&bits77, &DecodeContext::default())?;
+
+    Some(Q65Decode {
+        message: text,
+        freq_hz: base_freq_hz,
+        start_sample,
+        iterations,
+    })
+}
+
+/// Multi-period averaging Q65 decode for sub-mode `P`. Mirrors WSJT-X's
+/// `iavg=1`/`iavg=2` averaged-decode path from
+/// [`q65_decode.f90`](https://sourceforge.net/p/wsjt/wsjtx/ci/main/tree/lib/q65_decode.f90)
+/// — the strategy that lets ionoscatter and weak EME signals decode
+/// when single-period BP/fading cannot.
+///
+/// The function processes the slots in order, maintaining an
+/// **exponential moving average** of the per-slot spectrogram with
+/// time constant `min(navg, 4)` (`u = 1.0 / min(i+1, 4)`, matching the
+/// `lib/qra/q65/q65.f90:300-304` accumulator). At each slot the
+/// running-average spectrogram drives a coarse sync search, and for
+/// every surviving candidate a 3-stage decode ladder is tried
+/// against energies averaged across all slots seen so far:
+///
+/// 1. **AP-list** — when `ap_codewords.is_some()`. Mirrors `iavg=1`'s
+///    q3 path. Cheap relative to the rest, included when caller has a
+///    plausible call/grid pair (see [`super::ap_list::standard_qso_codewords`]).
+/// 2. **Fast-fading metric BP** — sweeps `b90·Ts ∈ {3, 8, 15}` ×
+///    `{Gaussian, Lorentzian}`. Covers the realistic ionoscatter +
+///    EME spread regimes.
+/// 3. **Plain Bessel BP** — last-resort AWGN-only fallback.
+///
+/// Returns at most one decode per slot (the first one that succeeds
+/// at any stage), deduped by `(message, ±4 Hz freq)` so a stable QSO
+/// call only counts once. Single-period decodes are *not* re-run
+/// inside this function — callers who want them should call
+/// [`decode_scan_for`] / [`decode_scan_fading_for`] separately.
+///
+/// Empty `audio_slots` returns an empty Vec.
+pub fn decode_multi_period_for<P: ModulationParams>(
+    audio_slots: &[&[f32]],
+    sample_rate: u32,
+    nominal_start_sample: usize,
+    params: &super::search::SearchParams,
+    ap_codewords: Option<&[[i32; 63]]>,
+) -> Vec<Q65Decode> {
+    use super::search::{Spectrogram, coarse_search_on_spec_for};
+
+    let mut output: Vec<Q65Decode> = Vec::new();
+    if audio_slots.is_empty() {
+        return output;
+    }
+
+    // Initialise EMA from slot 0.
+    let mut ema_spec = Spectrogram::build_for::<P>(audio_slots[0], sample_rate);
+    if ema_spec.n_time == 0 {
+        return output;
+    }
+
+    let b90_ladder = [3.0_f32, 8.0, 15.0];
+    let fading_models = [FadingModel::Gaussian, FadingModel::Lorentzian];
+
+    for (i, &audio) in audio_slots.iter().enumerate() {
+        if i > 0 {
+            let slot_spec = Spectrogram::build_for::<P>(audio, sample_rate);
+            // EMA update: weight = 1 / min(navg, 4) — matches WSJT-X's
+            // `ntc = min(navg, 4); u = 1.0/ntc` accumulator. After the
+            // 4th slot the time constant saturates, so older history
+            // decays at a fixed rate (~25%/slot).
+            if slot_spec.n_time == ema_spec.n_time
+                && slot_spec.n_freq == ema_spec.n_freq
+                && slot_spec.mags_sqr.len() == ema_spec.mags_sqr.len()
+            {
+                let weight = 1.0_f32 / ((i + 1).min(4) as f32);
+                let one_minus = 1.0 - weight;
+                for (e, s) in ema_spec.mags_sqr.iter_mut().zip(&slot_spec.mags_sqr) {
+                    *e = weight * *s + one_minus * *e;
+                }
+                ema_spec.noise_per_bin =
+                    weight * slot_spec.noise_per_bin + one_minus * ema_spec.noise_per_bin;
+            }
+            // (else: dimension mismatch, keep prior EMA — this slot
+            // still contributes to per-candidate energy averaging.)
+        }
+
+        let candidates =
+            coarse_search_on_spec_for::<P>(&ema_spec, sample_rate, nominal_start_sample, params);
+
+        let history = &audio_slots[..=i];
+        let mut slot_decode: Option<Q65Decode> = None;
+
+        'candidate_loop: for cand in candidates {
+            // Stage B — AP-list decode on averaged narrow energies.
+            if let Some(codewords) = ap_codewords
+                && let Some(d) = decode_averaged_ap_list_for::<P>(
+                    history,
+                    sample_rate,
+                    cand.start_sample,
+                    cand.freq_hz,
+                    codewords,
+                )
+            {
+                slot_decode = Some(d);
+                break 'candidate_loop;
+            }
+
+            // Stage C-fading — fast-fading metric BP, b90 × model sweep.
+            for &b90 in &b90_ladder {
+                for &model in &fading_models {
+                    if let Some(d) = decode_averaged_fading_for::<P>(
+                        history,
+                        sample_rate,
+                        cand.start_sample,
+                        cand.freq_hz,
+                        b90,
+                        model,
+                    ) {
+                        slot_decode = Some(d);
+                        break 'candidate_loop;
+                    }
+                }
+            }
+
+            // Stage C-plain — Bessel-metric BP fallback.
+            if let Some(d) = decode_averaged_plain_for::<P>(
+                history,
+                sample_rate,
+                cand.start_sample,
+                cand.freq_hz,
+            ) {
+                slot_decode = Some(d);
+                break 'candidate_loop;
+            }
+        }
+
+        if let Some(d) = slot_decode {
+            let dup = output
+                .iter()
+                .any(|prev| prev.message == d.message && (prev.freq_hz - d.freq_hz).abs() <= 4.0);
+            if !dup {
+                output.push(d);
+            }
+        }
+    }
+
+    output
+}
+
+/// Q65-30A convenience wrapper for [`decode_multi_period_for`].
+pub fn decode_multi_period(
+    audio_slots: &[&[f32]],
+    sample_rate: u32,
+    nominal_start_sample: usize,
+    params: &super::search::SearchParams,
+    ap_codewords: Option<&[[i32; 63]]>,
+) -> Vec<Q65Decode> {
+    decode_multi_period_for::<Q65a30>(
+        audio_slots,
+        sample_rate,
+        nominal_start_sample,
+        params,
+        ap_codewords,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::tx::synthesize_standard;
