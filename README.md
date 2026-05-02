@@ -26,6 +26,10 @@ want to run the decoders *somewhere else*:
   Fortran runtime is a non-starter,
 - in a **headless Rust application** (skimmer, monitoring station,
   remote SDR front end),
+- on **embedded MCUs** (ESP32-S3 with esp-dsp, RP2350 with CMSIS-DSP,
+  Cortex-M) via `no_std + alloc` — the M5Stack Core2 PoC decodes 3–7
+  FT8 results per 15 s cycle on Xtensa LX6 with the fixed-point hot
+  path,
 - or as the core of a **new protocol experiment** that reuses FT8's
   LDPC and sync machinery for a different modulation / FEC /
   message recipe.
@@ -124,24 +128,17 @@ FFI consumers should iterate `PROTOCOLS` (or filter via `by_id` /
 `by_name`) at startup; if you need a new protocol, add the ZST + a
 `protocol_meta!` line and rebuild.
 
-### Applied example: `uvpacket`
+### Applied example: `uvpacket` (experimental)
 
 The `uvpacket` module (`--features uvpacket`, off by default) is
-an in-tree example of how the trait abstractions handle a
-non-WSJT mode: a single-carrier π/4-DQPSK packet protocol with
-LMS equaliser and dedicated header LDPC block, fitted to the
-3 kHz audio passband of NFM / SSB voice channels. It reuses the
-shared `Ldpc240_101` codec but otherwise has its own modulation,
-sync (4-variant 127-chip preamble), framing, and byte-pipe API.
-
-uvpacket is a hobbyist application included as documentation of
-how the abstractions extend beyond WSJT-X. **Its public API may
-change within the 0.4.x line** — pin to an exact version if you
-depend on it. See
+an in-tree example showing the trait abstractions extend beyond
+WSJT-X — a π/4-DQPSK packet protocol for NFM / SSB voice channels
+that reuses the shared `Ldpc240_101` codec. **Experimental and
+its public API may change** — pin to an exact version. See
 [`docs/UVPACKET.md`](https://github.com/jl1nie/mfsk-core/blob/main/docs/UVPACKET.md)
 ([日本語](https://github.com/jl1nie/mfsk-core/blob/main/docs/UVPACKET.ja.md))
-for the full design narrative and per-mode performance
-characterisation.
+for the design narrative, modulation / equaliser / framing details
+and per-mode performance characterisation.
 
 ## Modules
 
@@ -173,7 +170,7 @@ characterisation.
 | `jt9`         |         | JT9 decode / synth                           |
 | `jt65`        |         | JT65 decode / synth (+ erasure-aware RS)     |
 | `q65`         |         | Q65-30A decode / synth (QRA soft-decision)   |
-| `uvpacket`    |         | Applied example: NFM voice-channel packet protocol (QPSK + LDPC), reuses `Ldpc240_101` |
+| `uvpacket`    |         | Applied example *(experimental)*: NFM voice-channel packet protocol (QPSK + LDPC), reuses `Ldpc240_101` |
 | `full`        |         | Aggregate of all seven WSJT protocols + uvpacket + packet-bytes |
 | `parallel`    | ✓       | Rayon-parallel candidate processing          |
 | `osd-deep`    |         | OSD-3 fallback on AP decodes (extra CPU)     |

@@ -3,10 +3,10 @@ name        = "mfsk-core"
 version     = "0.5.1"
 edition     = "2024"
 license     = "GPL-3.0-or-later"
-description = "Pure-Rust WSJT-family decoders and synthesisers (FT8 FT4 FST4 WSPR JT9 JT65 Q65) behind a zero-cost Protocol trait. no_std + alloc capable with a pluggable FFT backend; ESP32-S3 PoC included."
+description = "Pure-Rust WSJT-family decoders and synthesisers (FT8 FT4 FST4 WSPR JT9 JT65 Q65) behind a zero-cost Protocol trait. Host (rustfft) or no_std embedded targets (ESP32-S3, RP2350, Cortex-M) via a pluggable FFT backend; optional fixed-point hot path for FPU-less MCUs."
 repository  = "https://github.com/jl1nie/mfsk-core"
 readme      = "../README.md"
-keywords    = ["wsjt", "ft8", "q65", "amateur-radio", "dsp"]
+keywords    = ["wsjt", "ft8", "q65", "amateur-radio", "embedded"]
 categories  = ["science", "encoding", "multimedia::audio", "embedded", "no-std"]
 
 [features]
