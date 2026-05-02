@@ -1,8 +1,11 @@
 # Rust often needs a bit of an extra main task stack size compared to C
 # (the default is 3K). decode_block allocates a 372×4096 f32 spectrogram
 # in the heap, not the stack — but the planner / cw / tov scratch in BP
-# is heap too, so 16K main stack is plenty.
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
+# is heap too. 16K was sweep-margin-tight: a full 9-decode sweep tripped
+# `A stack overflow in task main` right at `=== Sweep complete ===` even
+# after replacing `std::thread::sleep` with direct `vTaskDelay`. 32K
+# gives comfortable headroom.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=32768
 
 CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
 CONFIG_FREERTOS_IDLE_TASK_STACKSIZE=4096

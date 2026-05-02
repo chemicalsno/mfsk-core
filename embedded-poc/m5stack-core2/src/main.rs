@@ -187,8 +187,16 @@ fn main() {
     }
 
     log::info!("\n=== Sweep complete. Idling. ===");
+    // `std::thread::sleep` on esp-idf goes through pthread/condvar
+    // shims that pushed main task past the 16 KB stack canary right
+    // after a full sweep (`A stack overflow in task main` →
+    // SW_CPU_RESET → infinite re-flash-the-bench loop). Direct
+    // `vTaskDelay(portMAX_DELAY)` is a single syscall with no Rust
+    // stack growth.
     loop {
-        std::thread::sleep(std::time::Duration::from_secs(60));
+        unsafe {
+            esp_idf_svc::sys::vTaskDelay(u32::MAX);
+        }
     }
 }
 

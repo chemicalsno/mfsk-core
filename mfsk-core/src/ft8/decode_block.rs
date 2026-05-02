@@ -451,6 +451,10 @@ pub fn coarse_sync(
     let mut sync2d = vec![0.0f32; n_freq * n_lag];
     let idx = |fi: usize, lag: i32| fi * n_lag + (lag + jz) as usize;
     let ratio_eps = ratio_eps();
+    #[cfg(feature = "std")]
+    let prof = std::env::var("MFSK_PROFILE_COARSE").is_ok();
+    #[cfg(feature = "std")]
+    let t_setup = std::time::Instant::now();
 
     // **Multi-bin tone sum (Plan A)**: tone_step_bins ≈ 2.13 means
     // the 8 FT8 tones fall at fractional bin positions [0.00, 2.13,
@@ -466,43 +470,96 @@ pub fn coarse_sync(
         tone_bin_lo[k] = (k as f32 * tone_step_bins).floor() as usize;
     }
 
-    // Pre-compute Σ_k (spec[lo,m] + spec[lo+1,m]) for every (fi, m) —
-    // the all-tones reference used inside the Costas correlation.
-    // 16 reads per (fi, m) cell; allsum vector still n_freq × n_time.
+    // Pre-compute the (bk, n) → m_base table. m for the inner iter is
+    // `m_base[bk][n] + lag`; m_base depends only on the Costas pattern
+    // and `jstrt` (constants of the slot), not on (fi, lag). Hoists
+    // 21 mul/add chains out of the n_freq × n_lag × 21 inner loop.
+    let m_base: [[i32; COSTAS.len()]; COSTAS_POS.len()] = {
+        let mut t = [[0i32; COSTAS.len()]; COSTAS_POS.len()];
+        for (bk, &start_sym) in COSTAS_POS.iter().enumerate() {
+            let block_offset = NSSY * start_sym as i32;
+            for (n, _) in COSTAS.iter().enumerate() {
+                t[bk][n] = jstrt + block_offset + NSSY * n as i32;
+            }
+        }
+        t
+    };
+    // Pre-compute Costas-tone bin offsets in COSTAS-order (i.e.
+    // `tone_bin_lo[COSTAS[n]]`). Saves an indirect lookup per inner
+    // iteration.
+    let costas_off: [usize; COSTAS.len()] = {
+        let mut t = [0usize; COSTAS.len()];
+        for (n, &costas_n) in COSTAS.iter().enumerate() {
+            t[n] = tone_bin_lo[costas_n];
+        }
+        t
+    };
+
+    // Pre-compute the set of `m` time-indices that the score loop
+    // will read. Only Costas-symbol positions ± lag count — typically
+    // 3 contiguous bands totalling ~110 of the 184 frames, so the
+    // naïve "compute allsum for every m" wastes ~40 % of its work
+    // on cells the score loop never reads.
+    let needed_m: alloc::vec::Vec<usize> = {
+        let mut mark = alloc::vec![false; spec.n_time];
+        for bk in 0..COSTAS_POS.len() {
+            let lo = m_base[bk][0] - jz;
+            let hi = m_base[bk][COSTAS.len() - 1] + jz;
+            let lo_u = lo.max(0) as usize;
+            let hi_u = (hi.min(spec.n_time as i32 - 1)) as usize;
+            if lo_u <= hi_u {
+                #[allow(clippy::needless_range_loop)]
+                for m in lo_u..=hi_u {
+                    mark[m] = true;
+                }
+            }
+        }
+        (0..spec.n_time).filter(|&m| mark[m]).collect()
+    };
+
+    // Pre-compute Σ_k (spec[lo,m] + spec[lo+1,m]) for every (fi, m
+    // ∈ needed_m). 16 reads per (fi, m) cell; allsum vector still
+    // shaped n_freq × n_time so the score loop can index by m_u
+    // without remapping.
     let mut allsum = vec![0.0f32; n_freq * spec.n_time];
     for (fi, i_carrier) in (ia..=ib).enumerate() {
-        for m in 0..spec.n_time {
+        let row_off = fi * spec.n_time;
+        for &m in &needed_m {
             let mut s = 0.0f32;
             for k in 0..NTONES {
                 let lo = (i_carrier + tone_bin_lo[k]).min(nh1 - 1);
                 let hi = (lo + 1).min(nh1 - 1);
                 s += spec.power(lo, m) + spec.power(hi, m);
             }
-            allsum[fi * spec.n_time + m] = s;
+            allsum[row_off + m] = s;
         }
     }
+    #[cfg(feature = "std")]
+    let t_allsum = std::time::Instant::now();
 
     // Three identical Costas arrays at symbol positions 0, 36, 72.
+    // Note: block 0's lowest m is `jstrt + (-jz) < 0` for the
+    // standard slot, so the `m < 0` guard is load-bearing — only
+    // the upper bound can be elided.
+    let n_time = spec.n_time;
+    let n_time_i = n_time as i32;
     for (fi, i_carrier) in (ia..=ib).enumerate() {
+        let allsum_row = &allsum[fi * n_time..(fi + 1) * n_time];
         for lag in -jz..=jz {
             let mut t_blocks = [0.0f32; 3];
             let mut t0_blocks = [0.0f32; 3];
 
-            for (bk, &start_sym) in COSTAS_POS.iter().enumerate() {
-                let block_offset = NSSY * start_sym as i32;
-                for (n, &costas_n) in COSTAS.iter().enumerate() {
-                    let m = lag + jstrt + block_offset + NSSY * n as i32;
-                    if m < 0 || (m as usize) >= spec.n_time {
+            for bk in 0..COSTAS_POS.len() {
+                for n in 0..COSTAS.len() {
+                    let m = m_base[bk][n] + lag;
+                    if m < 0 || m >= n_time_i {
                         continue;
                     }
                     let m_u = m as usize;
-                    let tbin_lo = i_carrier + tone_bin_lo[costas_n];
+                    let tbin_lo = i_carrier + costas_off[n];
                     let tbin_hi = tbin_lo + 1;
-                    if tbin_hi >= nh1 {
-                        continue;
-                    }
                     t_blocks[bk] += spec.power(tbin_lo, m_u) + spec.power(tbin_hi, m_u);
-                    t0_blocks[bk] += allsum[fi * spec.n_time + m_u];
+                    t0_blocks[bk] += allsum_row[m_u];
                 }
             }
 
@@ -525,6 +582,8 @@ pub fn coarse_sync(
             sync2d[idx(fi, lag)] = sync_all.max(sync_tail);
         }
     }
+    #[cfg(feature = "std")]
+    let t_score = std::time::Instant::now();
 
     // Per-bin peak + 40-percentile noise floor (matches host code shape).
     let mut red = vec![0.0f32; n_freq];
@@ -618,6 +677,17 @@ pub fn coarse_sync(
     cands.retain(|c| c.score >= sync_min);
     cands.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
     cands.truncate(max_cand);
+    #[cfg(feature = "std")]
+    if prof {
+        let t_end = std::time::Instant::now();
+        let allsum_us = (t_allsum - t_setup).as_micros();
+        let score_us = (t_score - t_allsum).as_micros();
+        let post_us = (t_end - t_score).as_micros();
+        let total_us = (t_end - t_setup).as_micros();
+        eprintln!(
+            "[coarse_sync prof] n_freq={n_freq} n_lag={n_lag}  allsum={allsum_us} score={score_us} dedupe+sort={post_us}  total={total_us} us"
+        );
+    }
     cands
 }
 
