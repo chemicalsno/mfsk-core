@@ -1361,8 +1361,12 @@ fn refine_candidates<S: AudioSample>(
 
 /// Variant of [`refine_candidates`] that uses caller-provided basis
 /// scratch (forwards to `symbol_spectra_direct_into`).
+///
+/// **Pub for benchmarking + manually-staged callers** (e.g.
+/// m5stack-core2 main.rs which logs per-stage wall-clock).
 #[cfg(feature = "fixed-point")]
-fn refine_candidates_into<S: AudioSample>(
+#[doc(hidden)]
+pub fn refine_candidates_into<S: AudioSample>(
     audio: &[S],
     cands: Vec<SyncCandidate>,
     max_cand: usize,
@@ -1513,8 +1517,8 @@ pub fn process_candidates<S: AudioSample>(
     cands: Vec<RefinedCandidate>,
     depth: DecodeDepth,
 ) -> Vec<DecodeResult> {
-    process_candidates_with(audio, cands, depth, |cs, cand| {
-        fill_symbol_spectra(cs, audio, cand.freq_hz, cand.dt_sec, SymMask::NotBlock0);
+    process_candidates_with(audio, cands, depth, |cs, cand, mask| {
+        fill_symbol_spectra(cs, audio, cand.freq_hz, cand.dt_sec, mask);
     })
 }
 
@@ -1523,21 +1527,25 @@ pub fn process_candidates<S: AudioSample>(
 /// to reach its theoretical 1-cycle/sample speed (default heap
 /// allocation routes the 60 KB × 2 basis to PSRAM /
 /// non-cacheable RAM and erases the kernel's advantage).
+///
+/// **Pub for benchmarking + manually-staged callers** (e.g.
+/// m5stack-core2 main.rs which logs per-stage wall-clock).
 #[cfg(feature = "fixed-point")]
-fn process_candidates_into<S: AudioSample>(
+#[doc(hidden)]
+pub fn process_candidates_into<S: AudioSample>(
     audio: &[S],
     cands: Vec<RefinedCandidate>,
     depth: DecodeDepth,
     basis_re: &mut [i16],
     basis_im: &mut [i16],
 ) -> Vec<DecodeResult> {
-    process_candidates_with(audio, cands, depth, |cs, cand| {
+    process_candidates_with(audio, cands, depth, |cs, cand, mask| {
         fill_symbol_spectra_into(
             cs,
             audio,
             cand.freq_hz,
             cand.dt_sec,
-            SymMask::NotBlock0,
+            mask,
             basis_re,
             basis_im,
         );
@@ -1552,24 +1560,29 @@ fn process_candidates_with<S: AudioSample, F>(
     _audio: &[S],
     cands: Vec<RefinedCandidate>,
     depth: DecodeDepth,
-    mut fill_data: F,
+    mut fill: F,
 ) -> Vec<DecodeResult>
 where
-    F: FnMut(&mut [[Cmplx<f32>; 8]; 79], &SyncCandidate),
+    F: FnMut(&mut [[Cmplx<f32>; 8]; 79], &SyncCandidate, SymMask),
 {
     // dt is already parabolically refined by coarse_sync; no grid here.
 
     let mut results: Vec<DecodeResult> = Vec::new();
     let q_thr = q_thresh();
     for (cand, mut cs, _q_block0) in cands {
-        // Fill the remaining 72 symbols (Costas blocks 1, 2 + all 58
-        // data symbols). Pass 2 only filled block 0 — `q_block0` is
-        // discarded once we have the full 21-symbol sync_quality.
-        fill_data(&mut cs, &cand);
+        // Two-step fill: sync blocks first, gate by full sync_quality,
+        // then fill data symbols only for survivors. Saves the 58 ×
+        // 8 = 464 data-symbol DFTs on every candidate that fails the
+        // q gate (typically half of `max_cand`). Re-filling block 0
+        // (already done by Pass 2) is a 56-DFT waste per cand —
+        // small vs the data savings, and removable later by adding
+        // a SyncBlocks12 mask.
+        fill(&mut cs, &cand, SymMask::SyncOnly);
         let q = sync_quality(&cs);
         if q <= q_thr {
             continue;
         }
+        fill(&mut cs, &cand, SymMask::DataOnly);
         let refined_dt = cand.dt_sec;
 
         // ── Staircase: cheap → deeper → OSD ─────────────────────────

@@ -202,7 +202,15 @@ fn main() {
 
 /// Run the staged `decode_block` on one slot, log per-stage timings
 /// and per-message SNR.
-fn decode_one(slot: &[i16], max_cand: usize, dt_grid: u8, df_grid: u8, q_thresh: u32) {
+///
+/// Calls into the manually-staged `mfsk-core` API
+/// (`refine_candidates_into` / `process_candidates_into`) so the
+/// `BASIS_RE` / `BASIS_IM` static internal-RAM scratch is reused
+/// across all DFTs — without that, esp-dsp's asm dot product
+/// fall back on PSRAM-resident basis (5-10× slower per access).
+fn decode_one(slot: &[i16], max_cand: usize, _dt_grid: u8, _df_grid: u8, _q_thresh: u32) {
+    use mfsk_core::ft8::decode_block::{process_candidates_into, refine_candidates_into};
+
     // Stage 1: spectrogram.
     let t0 = now_us();
     let spec = compute_spectrogram(slot, 3_000.0);
@@ -225,202 +233,34 @@ fn decode_one(slot: &[i16], max_cand: usize, dt_grid: u8, df_grid: u8, q_thresh:
     );
     drop(spec);
 
-    // Pass 2: re-rank by `sync_quality_block0` (cheap — 7 syms × 8
-    // tones DFT per cand, ~9 ms each on Core2 with asm dot + internal
-    // basis). Truncate to `max_cand` for stage 3. The cs is dropped
-    // inside the closure so only one cs Box (5 KB) is outstanding at
-    // a time — avoids the heap fragmentation that crashed
-    // `decode_block`'s collected-Vec<RefinedCandidate> approach.
+    // Pass 2 — re-rank by sync_quality_block0 (manually-staged
+    // mfsk-core entry point with our `.bss` basis scratch).
     let t_pass2 = now_us();
-    let mut ranked: alloc::vec::Vec<(mfsk_core::core::sync::SyncCandidate, u32)> = pass1
-        .into_iter()
-        .map(|c| {
-            let cs = unsafe {
-                symbol_spectra_direct_into(
-                    slot,
-                    c.freq_hz,
-                    c.dt_sec,
-                    SymMask::SyncBlock0,
-                    &mut BASIS_RE,
-                    &mut BASIS_IM,
-                )
-            };
-            let q = sync_quality_block0(&cs);
-            // cs dropped here
-            (c, q)
-        })
-        .collect();
-    ranked.sort_by_key(|r| core::cmp::Reverse(r.1));
-    ranked.truncate(max_cand);
+    // SAFETY: single-threaded main task; BASIS_RE / BASIS_IM are only
+    // accessed here and inside process_candidates_into below.
+    let pass2 = unsafe {
+        refine_candidates_into(slot, pass1, max_cand, &mut BASIS_RE, &mut BASIS_IM)
+    };
     let t_pass2_end = now_us();
     log::info!(
         "  pass 2 (re-rank):     {:>8} us  → top {} by sync_quality_block0",
         t_pass2_end - t_pass2,
-        ranked.len(),
+        pass2.len(),
     );
 
-    let cands: alloc::vec::Vec<mfsk_core::core::sync::SyncCandidate> =
-        ranked.into_iter().map(|(c, _)| c).collect();
-
-    // Stage 3: per-cand (dt, df) refinement + DFT + LLR + BP.
-    let dt_offsets: alloc::vec::Vec<f32> = match dt_grid {
-        3 => alloc::vec![-0.040, 0.0, 0.040],
-        _ => alloc::vec![0.0],
+    // Stage 3 — fill data symbols + BP staircase. `DecodeDepth::BpAll`
+    // matches the OSD_ENABLED=false production setting; the
+    // `MFSK_Q_THRESH` env var (default 12) controls the
+    // sync_quality early-reject inside process_candidates_into.
+    let depth = if OSD_ENABLED {
+        mfsk_core::ft8::decode::DecodeDepth::BpAllOsd
+    } else {
+        mfsk_core::ft8::decode::DecodeDepth::BpAll
     };
-    let df_step = 12_000.0 / mfsk_core::ft8::decode_block::NFFT_SPEC as f32; // ≈ 1.46 Hz at NFFT=4096
-    let f_offsets: alloc::vec::Vec<f32> = match df_grid {
-        3 => alloc::vec![-0.25 * df_step, 0.0, 0.25 * df_step],
-        _ => alloc::vec![0.0],
-    };
-
     let t4 = now_us();
-    let bp_kind = BpKind::NormalizedMinSum { alpha: 0.75 };
-    let mut results: alloc::vec::Vec<DecodeResult> = alloc::vec::Vec::new();
-    for cand in &cands {
-        // Pick the best (df, dt) by sync_quality on Costas-only DFT.
-        let mut best: Option<(
-            alloc::boxed::Box<[[mfsk_core::core::scalar::Cmplx<f32>; 8]; 79]>,
-            f32,
-            f32,
-            u32,
-        )> = None;
-        for &dt_off in &dt_offsets {
-            for &f_off in &f_offsets {
-                let f = cand.freq_hz + f_off;
-                let dt = cand.dt_sec + dt_off;
-                // SAFETY: single-threaded main task, scratch arrays
-                // are only accessed here (no overlapping borrow).
-                let cs = unsafe {
-                    symbol_spectra_direct_into(
-                        slot,
-                        f,
-                        dt,
-                        SymMask::SyncOnly,
-                        &mut BASIS_RE,
-                        &mut BASIS_IM,
-                    )
-                };
-                let q = sync_quality(&cs);
-                if q <= q_thresh {
-                    continue;
-                }
-                match &best {
-                    Some((_, _, _, q_best)) if q <= *q_best => {}
-                    _ => best = Some((cs, f, dt, q)),
-                }
-            }
-        }
-        let Some((mut cs, refined_f, refined_dt, q_best)) = best else {
-            continue;
-        };
-        // SAFETY: single-threaded; scratch arrays only used here.
-        unsafe {
-            fill_symbol_spectra_into(
-                &mut cs,
-                slot,
-                refined_f,
-                refined_dt,
-                SymMask::DataOnly,
-                &mut BASIS_RE,
-                &mut BASIS_IM,
-            );
-        }
-
-        // BpAllOsd staircase:
-        //  1) Bp(llra-fast)
-        //  2) Bp on full LLR variants a/b/c/d (nsym=1+2+3)
-        //  3) OSD-2 (sync_q≥12) / OSD-3 (sync_q≥18)
-        let mut accepted = None;
-        let mut accepted_pass: u8 = 0;
-        // Compile-time scalar select. Under `fixed-point-llr` the
-        // entire LLR + BP path is i16 Q11; otherwise f32. Same
-        // generic NMS implementation either way.
-        #[cfg(feature = "fixed-point-llr")]
-        type LlrT = mfsk_core::core::scalar::Q11i16;
-        #[cfg(not(feature = "fixed-point-llr"))]
-        type LlrT = f32;
-        let llr_a_fast: mfsk_core::ft8::llr::LlrSet<LlrT> = compute_llr_fast(&cs);
-        let bp_step1 = mfsk_core::fec::ldpc::bp::bp_decode_nms::<LlrT>(
-            &llr_a_fast.llra,
-            None,
-            30,
-            Some(check_crc14),
-            0.75,
-        );
-        if let Some(bp) = bp_step1 {
-            accepted = Some(bp.message77);
-            accepted_pass = 0;
-        }
-        let mut hard_errors_acc: u32 = 0;
-        if accepted.is_none() {
-            let llr_full: mfsk_core::ft8::llr::LlrSet<LlrT> = compute_llr(&cs);
-            let variants = [
-                (&llr_full.llra, 0u8),
-                (&llr_full.llrb, 1),
-                (&llr_full.llrc, 2),
-                (&llr_full.llrd, 3),
-            ];
-            for (llr, pid) in variants {
-                let bp_step2 = mfsk_core::fec::ldpc::bp::bp_decode_nms::<LlrT>(
-                    llr,
-                    None,
-                    30,
-                    Some(check_crc14),
-                    0.75,
-                );
-                if let Some(bp) = bp_step2 {
-                    accepted = Some(bp.message77);
-                    accepted_pass = pid;
-                    hard_errors_acc = bp.hard_errors;
-                    break;
-                }
-            }
-            if OSD_ENABLED && accepted.is_none() && q_best >= 12 {
-                let osd_variants = [
-                    (&llr_full.llra, 4u8),
-                    (&llr_full.llrb, 5),
-                    (&llr_full.llrc, 6),
-                    (&llr_full.llrd, 7),
-                ];
-                for (llr, pid) in osd_variants {
-                    let osd = if q_best >= 18 {
-                        osd_decode_deep(llr, 3, Some(check_crc14))
-                    } else {
-                        osd_decode(llr)
-                    };
-                    if let Some(osd) = osd {
-                        accepted = Some(osd.message77);
-                        accepted_pass = pid;
-                        hard_errors_acc = osd.hard_errors;
-                        break;
-                    }
-                }
-            }
-        }
-        let Some(message77) = accepted else { continue };
-        let Some(text) = unpack77(&message77) else {
-            continue;
-        };
-        if !mfsk_core::msg::wsjt77::is_plausible_message(&text) {
-            continue;
-        }
-        if results.iter().any(|r| r.message77 == message77) {
-            continue;
-        }
-        let itone = message_to_tones(&message77);
-        let snr_db = compute_snr_db(&cs, &itone);
-        results.push(DecodeResult {
-            message77,
-            freq_hz: refined_f,
-            dt_sec: refined_dt,
-            hard_errors: hard_errors_acc,
-            sync_score: cand.score,
-            pass: accepted_pass,
-            sync_cv: 0.0,
-            snr_db,
-        });
-    }
-    let _ = LDPC_N;
+    let results = unsafe {
+        process_candidates_into(slot, pass2, depth, &mut BASIS_RE, &mut BASIS_IM)
+    };
     let t5 = now_us();
     log::info!(
         "  stage 3 (refine+BP):  {:>8} us  ({} result(s))",
@@ -430,19 +270,18 @@ fn decode_one(slot: &[i16], max_cand: usize, dt_grid: u8, df_grid: u8, q_thresh:
     log::info!(
         "  ─── total decode:    {:>8} us = {:.3} s",
         t5 - t0,
-        (t5 - t0) as f32 / 1_000_000.0,
+        (t5 - t0) as f64 / 1e6,
     );
-
-    // Per-message report (caller compares with host SNRs).
     for (i, r) in results.iter().enumerate() {
-        let text = unpack77(&r.message77).unwrap_or_else(|| "<?>".into());
-        log::info!(
-            "    [{}] {:>5.0} Hz  SNR={:>+5.1} dB  e={}  '{}'",
-            i,
-            r.freq_hz,
-            r.snr_db,
-            r.hard_errors,
-            text,
-        );
+        if let Some(text) = unpack77(&r.message77) {
+            log::info!(
+                "    [{i}]  {:>4.0} Hz  SNR={:>5.1} dB  e={}  '{}'",
+                r.freq_hz,
+                r.snr_db,
+                r.hard_errors,
+                text
+            );
+        }
     }
 }
+
