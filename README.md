@@ -269,17 +269,21 @@ reference:
      layout: docs/ lives at the repo root, not under the crate). -->
 - **English:** [`docs/LIBRARY.md`](https://github.com/jl1nie/mfsk-core/blob/main/docs/LIBRARY.md)
 - **日本語:** [`docs/LIBRARY.ja.md`](https://github.com/jl1nie/mfsk-core/blob/main/docs/LIBRARY.ja.md)
+- **Embedded targets:** [`docs/EMBEDDED.md`](https://github.com/jl1nie/mfsk-core/blob/main/docs/EMBEDDED.md)
+  — feature-flag map, FFT / dot-product extern contracts, BASIS
+  scratch placement, Q-format reference, Core2 perf ballpark.
 
 ## Status
 
-`0.4.x` — API is deliberately not frozen. Breaking changes follow
-cargo-style minor bumps (`0.4 → 0.5`). 0.4.1 added the embedded
-port: `no_std + alloc` builds work end-to-end, the FFT backend is
-pluggable through a trait (`fft-rustfft` for host, `fft-extern` for
-embedded targets that bring their own FFT — esp-dsp, CMSIS-DSP),
-caller-buffer TX APIs (`*_into` variants, `*_OUTPUT_LEN` constants)
-let callers preallocate, and a working ESP32-S3 PoC lives at
-`embedded-poc/esp32s3/`.
+`0.5.x` — API is deliberately not frozen. Breaking changes follow
+cargo-style minor bumps (`0.4 → 0.5`). The 0.4.x line landed the
+embedded baseline (`no_std + alloc`, pluggable FFT backend,
+caller-buffer TX APIs); 0.5.0 ships the first end-to-end real-audio
+embedded port — M5Stack Core2 (Xtensa LX6) decoding 3-7 FT8 results
+per 14 s slot in ~3.0–4.0 s wall-clock. See
+[`docs/EMBEDDED.md`](https://github.com/jl1nie/mfsk-core/blob/main/docs/EMBEDDED.md)
+for the integration contract; `embedded-poc/m5stack-core2/` is the
+working example binary.
 
 Algorithm correctness is covered by the workspace test suite,
 including end-to-end synth → decode roundtrips for every protocol,

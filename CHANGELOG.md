@@ -1,5 +1,113 @@
 # Changelog
 
+## 0.5.0 — End-to-end embedded port (M5Stack Core2 reference)
+
+The 0.4.x line built the embedded baseline (no_std + alloc, pluggable
+FFT, fixed-point kernels). 0.5.0 ties it together: the first real-
+audio FT8 decode pipeline running end-to-end on a hobbyist-class MCU.
+Reference target M5Stack Core2 (Xtensa LX6 + esp-dsp ASM) decodes
+real-QSO recordings at 2.9–4.0 s per 14 s slot, matching host f32
+recall. The published library is unchanged in shape — what's new are
+features, perf, and integration documentation.
+
+### What's new
+
+#### Embedded perf chain (Core2 LX6, fixed-point + fixed-point-llr)
+
+vs the 0.4.4 first-flash baseline:
+
+- **Stage 1 (spectrogram)**: −42 % via two-for-one real-FFT trick.
+  Pack two consecutive real audio frames into one complex N=4096 FFT
+  and recover per-frame spectra by post-butterfly. Halves FFT count
+  on the standard FT8 slot (184 → 92). `compute_spectrogram` under
+  `fixed-point`.
+- **Stage 2 (coarse_sync)**: feature-gated i32 inner loop
+  (`fixed-point-coarse-i32`) — **off by default**; helps FPU-less
+  targets (RP2040, M0+), hurts ~25 % on LX6/LX7 where FPU+ALU
+  parallelism is the win. The default f32 path stays.
+- **Stage 3 (refine + BP)**: four wins in series —
+  - `BpScratch` reusable pool eliminates 7 `vec![]` per BP call
+    (~12 KB Q11i16 / 24 KB f32) → 1 alloc per slot instead of ~75.
+    Old `bp_decode_*` signatures keep working (allocate scratch
+    internally); new `bp_decode_*_with_scratch` for hot-path callers.
+  - `SymMask::SyncBlocks12` skips re-filling Costas block 0 in the
+    Stage-3 SyncOnly fill (Pass 2 already populated it). 56 DFT /
+    surviving candidate saved.
+  - Step-2 BP staircase **lazy LLR + skip-variant-a** — Step 1's
+    `compute_llr_fast` already produces llra/llrd; Step 2 reuses
+    llrd, lazy-computes llrb (nsym=2) and llrc (nsym=3) only as
+    needed. Variant a is identical to Step 1's input, so it's
+    skipped entirely. New `compute_llr_partial<P, S, T>(cs, nsym)`
+    in `core::llr` and the FT8 wrapper.
+
+  Combined Core2 stage-3 wall-clock: qso1 858 → 690 ms (−20 %),
+  qso2 1098 → 920 ms (−16 %), qso3 (busy) 2971 → 1826 ms (−39 %).
+
+  **Total slot time** (Core2): qso1 3.75 → **2.88 s**, qso2 3.99 →
+  **3.10 s**, qso3 5.17 → **3.99 s** — all three within −22 to
+  −24 %, recall preserved (3 / 5 / 7 results).
+
+#### `is_plausible_callsign` — stricter CRC false-positive filter
+
+New `mfsk_core::msg::wsjt77::is_plausible_callsign` adds an ITU
+prefix-allowlist check on top of the structural `is_valid_callsign`.
+Catches `Z74QTJ`, `Q1ABC`, etc. — letter+digit prefix gaps where
+random codewords passing CRC-14 land disproportionately on busy
+bands. ~85 hardcoded entries (1-char letter prefixes
+`F G I K M N R W` + 2-char letter+digit ITU Appendix-42 series).
+`is_plausible_message` (the existing block-result filter at
+`ft8::decode_block::process_candidates_with`) now uses it
+automatically. `is_valid_callsign` stays public for callers who
+want the permissive structural check.
+
+#### New Cargo features
+
+| Feature | Default | Purpose |
+|---|---|---|
+| `fixed-point-cs` | off | `Cmplx<Q14i16>` cs storage (4 KB instead of 8 KB per Box). |
+| `fixed-point-coarse-i32` | off | Stage-2 i32 path. **FPU-less only.** |
+| `profile-coarse` | off | Always-on coarse_sync sub-stage timing. |
+
+`std` no longer transitively pulls `rustfft` (now only `fft-rustfft`
+does). Lets `std` be enabled on Xtensa for `std::time::Instant`
+without dragging the host-only FFT crate.
+
+#### New public API surface (additive)
+
+- `core::llr::compute_llr_partial<P, S, T>(cs, nsym)` — single-
+  variant LLR for the staircase.
+- `ft8::llr::compute_llr_partial<T>(cs, nsym)` — FT8 wrapper.
+- `fec::ldpc::bp::BpScratch<P, T>` + `bp_decode_generic_nms_with_scratch` +
+  `bp_decode_nms_with_scratch` — pool-aware BP entry points.
+- `ft8::decode_block::SymMask::SyncBlocks12` — Costas blocks 1+2 mask.
+- `msg::wsjt77::is_plausible_callsign`.
+
+### Documentation
+
+- New [`docs/EMBEDDED.md`](docs/EMBEDDED.md): targets we test,
+  feature-flag map, the FFT / dot-product extern contracts, BASIS
+  scratch placement, Q-format reference, Core2 perf ballpark, and
+  what we deliberately don't ship (audio I/O, RTOS glue, display,
+  networking).
+- `embedded-poc/m5stack-core2/` is the worked example for one
+  target; raw measurement logs in `embedded-poc/m5stack-core2/logs/`.
+
+### Known limitations
+
+- **SNR estimate on the embedded path** reads ~4–12 dB low on strong
+  signals vs the host wide-band `decode_frame`. Cause is structural
+  (the block path skips the Wiener equalisation that boosts strong-
+  signal estimates on the wide-band path), not quantisation —
+  reproducible identically on host f32 and fixed-point. Documented
+  in `docs/EMBEDDED.md`; proper fix deferred to a future minor.
+- I2S live-capture wiring on the m5stack-core2 example is not
+  shipped; the example decodes baked WAV assets.
+
+### Breaking changes
+
+None. The release is API-additive: new pub fns / types added; old
+ones keep working unchanged.
+
 ## 0.4.4 — LDPC min-sum kernels (NMS + OMS) for embedded targets
 
 Adds `NormalizedMinSum` and `OffsetMinSum` check-node update kernels
