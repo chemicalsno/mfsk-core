@@ -41,6 +41,15 @@ fn coarse_sync_candidate_diag() {
 
     for wav_path in QSO_WAVS {
         let path = Path::new(wav_path);
+        // Diagnostic reads absolute paths that only exist on the
+        // developer's box (rs-ft8n bench + WSJT-X samples); CI
+        // doesn't check those in. Skip silently rather than
+        // panicking — the diagnostic still runs locally for anyone
+        // with the recordings.
+        if !path.exists() {
+            println!("(skip {} — file not present)", path.display());
+            continue;
+        }
         let label = path.file_name().unwrap().to_string_lossy();
         let slot = load_wav_i16(path);
 
