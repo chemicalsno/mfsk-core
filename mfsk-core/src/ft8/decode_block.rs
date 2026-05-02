@@ -952,6 +952,11 @@ pub enum SymMask {
     /// Data symbols only (positions 7-35, 43-71). Skips the 21 sync
     /// positions — used to "top up" a `SyncOnly`-filled spectrum.
     DataOnly,
+    /// Costas blocks 1 and 2 only (positions 36-42, 72-78). 14
+    /// symbols — 2/3 the cost of `SyncOnly`. Used in stage 3 to top
+    /// up a `SyncBlock0`-filled cs (Pass 2 output) into a full
+    /// `SyncOnly`-equivalent without redoing block 0.
+    SyncBlocks12,
 }
 
 #[inline]
@@ -967,6 +972,7 @@ fn sym_in_mask(sym: usize, mask: SymMask) -> bool {
         SymMask::SyncBlock0 => in_block_a,
         SymMask::NotBlock0 => !in_block_a,
         SymMask::DataOnly => !is_sync,
+        SymMask::SyncBlocks12 => in_block_b || in_block_c,
     }
 }
 
@@ -1674,11 +1680,12 @@ where
         // Two-step fill: sync blocks first, gate by full sync_quality,
         // then fill data symbols only for survivors. Saves the 58 ×
         // 8 = 464 data-symbol DFTs on every candidate that fails the
-        // q gate (typically half of `max_cand`). Re-filling block 0
-        // (already done by Pass 2) is a 56-DFT waste per cand —
-        // small vs the data savings, and removable later by adding
-        // a SyncBlocks12 mask.
-        fill(&mut cs, &cand, SymMask::SyncOnly);
+        // q gate (typically half of `max_cand`). `SyncBlocks12`
+        // (instead of `SyncOnly`) skips re-filling block 0 — Pass 2
+        // already populated it via `symbol_spectra_direct_into` on
+        // `SyncBlock0`, and that data survives in `cs` here. Saves
+        // an additional 56 DFTs / candidate.
+        fill(&mut cs, &cand, SymMask::SyncBlocks12);
         let q = sync_quality(&cs);
         if q <= q_thr {
             continue;
