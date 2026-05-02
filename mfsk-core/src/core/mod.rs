@@ -41,6 +41,7 @@ pub mod llr;
 #[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub mod pipeline;
 pub mod protocol;
+pub mod scalar;
 #[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub mod sync;
 pub mod tx;

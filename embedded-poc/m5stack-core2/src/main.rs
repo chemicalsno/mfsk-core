@@ -332,33 +332,28 @@ fn decode_one(slot: &[i16], max_cand: usize, dt_grid: u8, df_grid: u8, q_thresh:
         //  3) OSD-2 (sync_q≥12) / OSD-3 (sync_q≥18)
         let mut accepted = None;
         let mut accepted_pass: u8 = 0;
-        let llr_a_fast = compute_llr_fast(&cs);
-        // i16 NMS BP under `fixed-point-bp` — mirrors the f32 path
-        // bit-for-bit on AWGN sweeps (Q11 LLR, α as Q15) so the
-        // entire embedded RX hot loop is integer-only.
-        #[cfg(feature = "fixed-point-bp")]
-        let bp_step1 = {
-            let mut llr_q11 = [0i16; mfsk_core::ft8::params::LDPC_N];
-            for (q, f) in llr_q11.iter_mut().zip(llr_a_fast.llra.iter()) {
-                *q = mfsk_core::fec::ldpc::bp::llr_f32_to_q11(*f);
-            }
-            mfsk_core::fec::ldpc::bp::bp_decode_nms_q11(
-                &llr_q11,
-                None,
-                30,
-                Some(check_crc14),
-                0.75,
-            )
-        };
-        #[cfg(not(feature = "fixed-point-bp"))]
-        let bp_step1 = bp_decode_kind(&llr_a_fast.llra, None, 30, Some(check_crc14), bp_kind);
+        // Compile-time scalar select. Under `fixed-point-llr` the
+        // entire LLR + BP path is i16 Q11; otherwise f32. Same
+        // generic NMS implementation either way.
+        #[cfg(feature = "fixed-point-llr")]
+        type LlrT = mfsk_core::core::scalar::Q11i16;
+        #[cfg(not(feature = "fixed-point-llr"))]
+        type LlrT = f32;
+        let llr_a_fast: mfsk_core::ft8::llr::LlrSet<LlrT> = compute_llr_fast(&cs);
+        let bp_step1 = mfsk_core::fec::ldpc::bp::bp_decode_nms::<LlrT>(
+            &llr_a_fast.llra,
+            None,
+            30,
+            Some(check_crc14),
+            0.75,
+        );
         if let Some(bp) = bp_step1 {
             accepted = Some(bp.message77);
             accepted_pass = 0;
         }
         let mut hard_errors_acc: u32 = 0;
         if accepted.is_none() {
-            let llr_full = compute_llr(&cs);
+            let llr_full: mfsk_core::ft8::llr::LlrSet<LlrT> = compute_llr(&cs);
             let variants = [
                 (&llr_full.llra, 0u8),
                 (&llr_full.llrb, 1),
@@ -366,22 +361,13 @@ fn decode_one(slot: &[i16], max_cand: usize, dt_grid: u8, df_grid: u8, q_thresh:
                 (&llr_full.llrd, 3),
             ];
             for (llr, pid) in variants {
-                #[cfg(feature = "fixed-point-bp")]
-                let bp_step2 = {
-                    let mut llr_q11 = [0i16; mfsk_core::ft8::params::LDPC_N];
-                    for (q, f) in llr_q11.iter_mut().zip(llr.iter()) {
-                        *q = mfsk_core::fec::ldpc::bp::llr_f32_to_q11(*f);
-                    }
-                    mfsk_core::fec::ldpc::bp::bp_decode_nms_q11(
-                        &llr_q11,
-                        None,
-                        30,
-                        Some(check_crc14),
-                        0.75,
-                    )
-                };
-                #[cfg(not(feature = "fixed-point-bp"))]
-                let bp_step2 = bp_decode_kind(llr, None, 30, Some(check_crc14), bp_kind);
+                let bp_step2 = mfsk_core::fec::ldpc::bp::bp_decode_nms::<LlrT>(
+                    llr,
+                    None,
+                    30,
+                    Some(check_crc14),
+                    0.75,
+                );
                 if let Some(bp) = bp_step2 {
                     accepted = Some(bp.message77);
                     accepted_pass = pid;

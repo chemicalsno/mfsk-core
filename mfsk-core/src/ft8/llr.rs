@@ -13,15 +13,20 @@ use super::Ft8;
 use num_complex::Complex;
 
 use super::params::{LDPC_N, LLR_SCALE};
+use crate::core::scalar::LlrScalar;
 
 pub use crate::core::llr::LlrSet as GenericLlrSet;
 
-/// FT8 LLR bundle: four fixed-length (174-bit) variants.
-pub struct LlrSet {
-    pub llra: [f32; LDPC_N],
-    pub llrb: [f32; LDPC_N],
-    pub llrc: [f32; LDPC_N],
-    pub llrd: [f32; LDPC_N],
+/// FT8 LLR bundle: four fixed-length (174-bit) variants. Generic over
+/// the [`LlrScalar`] storage; defaults to `f32` for backward
+/// compatibility (`LlrSet` ≡ `LlrSet<f32>`). The Q11i16 instantiation
+/// (`LlrSet<Q11i16>`) feeds the integer-only NMS BP under the
+/// `fixed-point-llr` feature.
+pub struct LlrSet<T: LlrScalar = f32> {
+    pub llra: [T; LDPC_N],
+    pub llrb: [T; LDPC_N],
+    pub llrc: [T; LDPC_N],
+    pub llrd: [T; LDPC_N],
 }
 
 #[inline]
@@ -34,8 +39,8 @@ fn flatten_cs(cs: &[[Complex<f32>; 8]; 79]) -> Vec<Complex<f32>> {
 }
 
 #[inline]
-fn inflate_llr(v: Vec<f32>) -> [f32; LDPC_N] {
-    let mut out = [0.0f32; LDPC_N];
+fn inflate_llr<T: LlrScalar>(v: Vec<T>) -> [T; LDPC_N] {
+    let mut out = [T::ZERO; LDPC_N];
     let n = v.len().min(LDPC_N);
     out[..n].copy_from_slice(&v[..n]);
     out
@@ -54,10 +59,12 @@ pub fn symbol_spectra(cd0: &[Complex<f32>], i_start: usize) -> Box<[[Complex<f32
     out
 }
 
-/// Compute soft LLRs from complex symbol spectra.
-pub fn compute_llr(cs: &[[Complex<f32>; 8]; 79]) -> LlrSet {
+/// Compute soft LLRs from complex symbol spectra. Generic wrapper —
+/// `compute_llr<f32>` for the host path, `compute_llr<Q11i16>` for the
+/// integer NMS BP path under `fixed-point-llr`.
+pub fn compute_llr<T: LlrScalar>(cs: &[[Complex<f32>; 8]; 79]) -> LlrSet<T> {
     let flat = flatten_cs(cs);
-    let g = crate::core::llr::compute_llr::<Ft8>(&flat);
+    let g = crate::core::llr::compute_llr::<Ft8, T>(&flat);
     // Sanity check scale consistency at build time.
     debug_assert!((crate::core::llr::LLR_SCALE - LLR_SCALE).abs() < 1e-6);
     LlrSet {
@@ -71,9 +78,9 @@ pub fn compute_llr(cs: &[[Complex<f32>; 8]; 79]) -> LlrSet {
 /// LLRs for the BP-only path: skips nsym=2 and nsym=3 (~5× faster
 /// than [`compute_llr`]). `llrb` / `llrc` come back zero — only
 /// `llra` and `llrd` are valid.
-pub fn compute_llr_fast(cs: &[[Complex<f32>; 8]; 79]) -> LlrSet {
+pub fn compute_llr_fast<T: LlrScalar>(cs: &[[Complex<f32>; 8]; 79]) -> LlrSet<T> {
     let flat = flatten_cs(cs);
-    let g = crate::core::llr::compute_llr_fast::<Ft8>(&flat);
+    let g = crate::core::llr::compute_llr_fast::<Ft8, T>(&flat);
     LlrSet {
         llra: inflate_llr(g.llra),
         llrb: inflate_llr(g.llrb),
@@ -102,7 +109,7 @@ mod tests {
     fn zero_spectra_zero_llr() {
         let cs: Box<[[Complex<f32>; 8]; 79]> =
             vec![[Complex::new(0.0f32, 0.0); 8]; 79].try_into().unwrap();
-        let llr_set = compute_llr(&cs);
+        let llr_set: LlrSet = compute_llr(&cs);
         let any_large = llr_set.llra.iter().any(|&x| x.abs() > 1.0);
         assert!(!any_large, "zero input should not produce large LLRs");
     }
@@ -111,7 +118,7 @@ mod tests {
     fn llr_length_is_174() {
         let cs: Box<[[Complex<f32>; 8]; 79]> =
             vec![[Complex::new(0.0f32, 0.0); 8]; 79].try_into().unwrap();
-        let llr_set = compute_llr(&cs);
+        let llr_set: LlrSet = compute_llr(&cs);
         assert_eq!(llr_set.llra.len(), 174);
         assert_eq!(llr_set.llrd.len(), 174);
     }

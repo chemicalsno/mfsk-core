@@ -27,14 +27,14 @@ use num_complex::Complex;
 use num_traits::Float;
 
 use super::decode::{DecodeDepth, DecodeResult};
-use super::llr::{compute_llr, compute_llr_fast, sync_quality};
+use super::llr::sync_quality;
 use super::message::unpack77;
 use super::params::{BP_MAX_ITER, COSTAS, COSTAS_POS, LDPC_N, NMAX, NN, NSPS, NTONES};
 use super::wave_gen::message_to_tones;
 #[cfg(not(feature = "fixed-point"))]
 use crate::core::fft::default_planner;
 use crate::core::sync::SyncCandidate;
-use crate::fec::ldpc::bp::{BpKind, bp_decode_kind, check_crc14};
+use crate::fec::ldpc::bp::check_crc14;
 use crate::fec::ldpc::osd::{osd_decode, osd_decode_deep};
 
 // ── Audio sample trait ──────────────────────────────────────────────────────
@@ -1223,6 +1223,16 @@ pub fn sync_quality_block0(cs: &[[Complex<f32>; 8]; 79]) -> u32 {
     count
 }
 
+/// LLR / BP scalar for the embedded RX hot loop. Selected at compile
+/// time: `Q11i16` under `fixed-point-bp` (integer-only, target FPU-less
+/// MCUs / architectural consistency); `f32` otherwise (host / FPU
+/// targets where soft-emu cost is irrelevant). Both routes go
+/// through the same generic NMS implementation in `fec::ldpc::bp`.
+#[cfg(feature = "fixed-point-llr")]
+type LlrT = crate::core::scalar::Q11i16;
+#[cfg(not(feature = "fixed-point-llr"))]
+type LlrT = f32;
+
 /// Stage 3: take Pass-2 refined candidates (cand + Costas-only cs +
 /// sync_quality), fill in the data-symbol spectra, run LLR + BP/OSD
 /// staircase. The Costas DFT was already done in Pass 2 — we only
@@ -1235,7 +1245,6 @@ pub fn process_candidates<S: AudioSample>(
     cands: Vec<RefinedCandidate>,
     depth: DecodeDepth,
 ) -> Vec<DecodeResult> {
-    let bp_kind = BpKind::NormalizedMinSum { alpha: NMS_ALPHA };
     // dt is already parabolically refined by coarse_sync; no grid here.
 
     let mut results: Vec<DecodeResult> = Vec::new();
@@ -1269,68 +1278,42 @@ pub fn process_candidates<S: AudioSample>(
         // `Bp` stops after step 1.
         let mut accepted: Option<(crate::fec::ldpc::bp::BpResult, u8)> = None;
 
-        // Step 1: fast llra. Under the `fixed-point-bp` feature the
-        // BP iteration loop runs in i16 Q11 rather than f32 — same
-        // NMS algorithm and convergence, integer arithmetic only, so
-        // the LLR/BP path matches the rest of the i16 fixed-point
-        // pipeline (no f32 ops in the embedded RX hot loop).
-        let llr_a_fast = compute_llr_fast(&cs);
-        #[cfg(not(feature = "fixed-point-bp"))]
-        let bp_step1 = bp_decode_kind(
+        // Step 1: fast llra. The LLR / BP scalar is selected at compile
+        // time via the `fixed-point-bp` feature (Q11i16 → integer-only
+        // hot loop on FPU-less embedded targets; f32 → host path).
+        // Both go through the *same* generic NMS implementation —
+        // bit-identical AWGN behaviour by design.
+        let llr_a_fast: super::llr::LlrSet<LlrT> = super::llr::compute_llr_fast(&cs);
+        let bp_step1 = crate::fec::ldpc::bp::bp_decode_nms::<LlrT>(
             &llr_a_fast.llra,
             None,
             BP_MAX_ITER,
             Some(check_crc14),
-            bp_kind,
+            NMS_ALPHA,
         );
-        #[cfg(feature = "fixed-point-bp")]
-        let bp_step1 = {
-            let mut llr_q11 = [0i16; LDPC_N];
-            for (q, f) in llr_q11.iter_mut().zip(llr_a_fast.llra.iter()) {
-                *q = crate::fec::ldpc::bp::llr_f32_to_q11(*f);
-            }
-            crate::fec::ldpc::bp::bp_decode_nms_q11(
-                &llr_q11,
-                None,
-                BP_MAX_ITER,
-                Some(check_crc14),
-                NMS_ALPHA,
-            )
-        };
         if let Some(bp) = bp_step1 {
             accepted = Some((bp, 0));
         }
 
-        // Step 2: deeper LLR + 4 variants. Same i16-NMS swap as Step 1
-        // when `fixed-point-bp` is on; the `compute_llr` call still
-        // returns f32 (Q-formatting LLR computation is a separate
-        // future migration), so we convert per-variant before the
-        // BP iteration.
-        let mut llr_full_opt: Option<super::llr::LlrSet> = None;
+        // Step 2: deeper LLR + 4 variants — same generic NMS as
+        // Step 1; OSD (Step 3) needs the f32 LLR set so we keep one
+        // around for that case.
+        let mut llr_full_opt: Option<super::llr::LlrSet<LlrT>> = None;
         if accepted.is_none() && matches!(depth, DecodeDepth::BpAll | DecodeDepth::BpAllOsd) {
-            let llr_full = compute_llr(&cs);
+            let llr_full: super::llr::LlrSet<LlrT> = super::llr::compute_llr(&cs);
             for (llr, pid) in [
                 (&llr_full.llra, 0u8),
                 (&llr_full.llrb, 1),
                 (&llr_full.llrc, 2),
                 (&llr_full.llrd, 3),
             ] {
-                #[cfg(not(feature = "fixed-point-bp"))]
-                let bp_step2 = bp_decode_kind(llr, None, BP_MAX_ITER, Some(check_crc14), bp_kind);
-                #[cfg(feature = "fixed-point-bp")]
-                let bp_step2 = {
-                    let mut llr_q11 = [0i16; LDPC_N];
-                    for (q, f) in llr_q11.iter_mut().zip(llr.iter()) {
-                        *q = crate::fec::ldpc::bp::llr_f32_to_q11(*f);
-                    }
-                    crate::fec::ldpc::bp::bp_decode_nms_q11(
-                        &llr_q11,
-                        None,
-                        BP_MAX_ITER,
-                        Some(check_crc14),
-                        NMS_ALPHA,
-                    )
-                };
+                let bp_step2 = crate::fec::ldpc::bp::bp_decode_nms::<LlrT>(
+                    llr,
+                    None,
+                    BP_MAX_ITER,
+                    Some(check_crc14),
+                    NMS_ALPHA,
+                );
                 if let Some(bp) = bp_step2 {
                     accepted = Some((bp, pid));
                     break;
@@ -1339,20 +1322,19 @@ pub fn process_candidates<S: AudioSample>(
             llr_full_opt = Some(llr_full);
         }
 
-        // Step 3: OSD fallback (sync_quality gated; only for BpAllOsd)
+        // Step 3: OSD fallback (sync_quality gated; only for BpAllOsd).
+        // OSD operates on `&[f32]` directly — independent of the
+        // `LlrT` choice — so we compute a fresh f32 LLR bundle here.
+        // Only fires when Steps 1+2 BP failed and `q >= 12`, so the
+        // extra compute_llr is cheap relative to the OSD work itself.
         if accepted.is_none() && matches!(depth, DecodeDepth::BpAllOsd) && q >= 12 {
-            let llr_full = match &llr_full_opt {
-                Some(l) => l,
-                None => {
-                    llr_full_opt = Some(compute_llr(&cs));
-                    llr_full_opt.as_ref().unwrap()
-                }
-            };
+            let llr_full_f32: super::llr::LlrSet<f32> = super::llr::compute_llr(&cs);
+            let _ = &llr_full_opt; // suppress unused warning when Step 2 ran
             for (llr, pid) in [
-                (&llr_full.llra, 4u8),
-                (&llr_full.llrb, 5),
-                (&llr_full.llrc, 6),
-                (&llr_full.llrd, 7),
+                (&llr_full_f32.llra, 4u8),
+                (&llr_full_f32.llrb, 5),
+                (&llr_full_f32.llrc, 6),
+                (&llr_full_f32.llrd, 7),
             ] {
                 let osd = if q >= 18 {
                     osd_decode_deep(llr, 3, Some(check_crc14))

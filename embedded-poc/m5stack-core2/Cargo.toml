@@ -38,7 +38,7 @@ embassy-time = { version = "0.5", features = ["generic-queue-8"] }
 # (see `src/esp_dsp_fft.rs`); the `embedded-rx` preset bundles the
 # alloc/no-rustfft/no-rayon flags. `ft8` only — FT4/WSPR/Q65 deferred
 # until decode timing is confirmed.
-mfsk-core = { path = "../../mfsk-core", default-features = false, features = ["alloc", "ft8", "fft-extern", "fixed-point", "fixed-point-bp"] }
+mfsk-core = { path = "../../mfsk-core", default-features = false, features = ["alloc", "ft8", "fft-extern", "fixed-point", "fixed-point-llr"] }
 num-complex = { version = "0.4", default-features = false }
 
 [build-dependencies]

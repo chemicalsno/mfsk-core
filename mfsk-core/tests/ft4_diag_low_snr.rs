@@ -135,7 +135,7 @@ fn why_does_neg16db_fail() {
         );
 
         // Try BP with AP on this timing
-        let llr_set = compute_llr::<Ft4>(&cs);
+        let llr_set = compute_llr::<Ft4, f32>(&cs);
         let (mask, values) = ap.build_bits(<Ft4 as Protocol>::Fec::N);
         let fec = <Ft4 as Protocol>::Fec::default();
         let opts = FecOpts {

@@ -455,45 +455,37 @@ pub fn bp_decode_kind(
 }
 
 // ──────────────────────────────────────────────────────────────────────────
-// Fixed-point NMS BP (i16 LLR / i16 message arrays)
+// Generic NMS BP — works on any [`LlrScalar`] (`f32` for host / FPU
+// targets, `Q11i16` for FPU-less / consistency-focused embedded).
 // ──────────────────────────────────────────────────────────────────────────
 
-/// LLR Q-format used by [`bp_decode_generic_nms_q11`] and friends:
-/// `i16` with 11 fractional bits → range [-16, +16) at 1/2048
-/// resolution. Typical LLR magnitudes after `LLR_SCALE` (≈2.83) sit
-/// in ±10, well inside the range.
-pub const LLR_Q11_FRAC: u32 = 11;
-const LLR_Q11_ONE: i32 = 1 << LLR_Q11_FRAC; // 2048
+use crate::core::scalar::LlrScalar;
 
 /// Convert an `f32` LLR to Q11 i16 with saturation.
+///
+/// Thin wrapper around [`crate::core::scalar::Q11i16::from_f32`] —
+/// kept for source compatibility with callers from before the
+/// generic refactor.
 #[inline]
 pub fn llr_f32_to_q11(x: f32) -> i16 {
-    let v = (x * (LLR_Q11_ONE as f32)).round() as i32;
-    v.clamp(i16::MIN as i32, i16::MAX as i32) as i16
+    use crate::core::scalar::Q11i16;
+    Q11i16::from_f32(x).0
 }
 
-/// α as Q15 fixed-point: 0.75 → 24576.
-#[inline]
-const fn alpha_q15(alpha: f32) -> i32 {
-    (alpha * 32768.0) as i32
-}
-
-/// Saturating i32→i16 cast.
-#[inline]
-fn sat_i16(v: i32) -> i16 {
-    v.clamp(i16::MIN as i32, i16::MAX as i32) as i16
-}
-
-/// Generic i16-NMS Belief-Propagation decode — Q11 LLR in/out.
+/// Generic Normalized-Min-Sum Belief-Propagation decode.
 ///
-/// Architectural mirror of [`bp_decode_generic_kind`] for the
-/// Normalized-Min-Sum kernel; SumProduct and OffsetMinSum are
-/// **not** ported (Core2 only uses NMS, RasPi/host can stay on the
-/// f32 path). Behaviour matches the f32 NMS branch including the
-/// `nrw_odd` extrinsic-sign correction that aligns with WSJT-X's
-/// `tanh ∘ atanh` SP convention.
-pub fn bp_decode_generic_nms_q11<P: LdpcParams>(
-    llr: &[i16],
+/// Architectural counterpart of [`bp_decode_generic_kind`]'s NMS
+/// branch, generic over the LLR scalar `T`. SumProduct and
+/// OffsetMinSum stay f32-only (`tanh` / `atanh` aren't worth
+/// quantising); embedded fixed-point callers only ever want NMS
+/// anyway.
+///
+/// Behaviour matches the f32 NMS branch byte-for-byte at the bit
+/// level (same convergence path on every AWGN seed I've tested),
+/// including the `nrw_odd` extrinsic-sign correction that aligns
+/// with WSJT-X's `tanh ∘ atanh` SumProduct convention.
+pub fn bp_decode_generic_nms<P: LdpcParams, T: LlrScalar>(
+    llr: &[T],
     ap_mask: Option<&[bool]>,
     max_iter: u32,
     verify: Option<fn(&[u8]) -> bool>,
@@ -508,15 +500,14 @@ pub fn bp_decode_generic_nms_q11<P: LdpcParams>(
     let m_checks = P::M;
     let k = P::K;
     let max_row = P::MAX_ROW;
-    let alpha_q15v = alpha_q15(alpha);
 
-    let mut tov = vec![0i16; n * NCW];
-    let mut toc = vec![0i16; m_checks * max_row];
-    let mut min1 = vec![0i16; m_checks];
-    let mut min2 = vec![0i16; m_checks];
+    let mut tov = vec![T::ZERO; n * NCW];
+    let mut toc = vec![T::ZERO; m_checks * max_row];
+    let mut min1 = vec![T::POS_INF_LIKE; m_checks];
+    let mut min2 = vec![T::POS_INF_LIKE; m_checks];
     let mut idx_min1 = vec![0u32; m_checks];
     let mut sign_xor = vec![false; m_checks];
-    let mut zn = vec![0i32; n];
+    let mut zn = vec![T::wide_zero(); n];
     let mut cw = vec![0u8; n];
 
     // Initial messages: each check edge carries the bit's raw LLR.
@@ -532,24 +523,24 @@ pub fn bp_decode_generic_nms_q11<P: LdpcParams>(
     let mut nclast = 0u32;
 
     for iter in 0..=max_iter {
-        // Variable-node belief sum. tov values are i16, summed in i32
-        // to avoid overflow before saturation for the hard decision.
+        // Variable-node belief sum. The wide accumulator avoids
+        // overflow when summing 1 LLR + NCW=3 tov entries.
         for i in 0..n {
             let ap = ap_mask.is_some_and(|mm| mm[i]);
             if !ap {
-                let mut sum = llr[i] as i32;
+                let mut sum = llr[i].to_wide();
                 for k_ in 0..NCW {
-                    sum += tov[i * NCW + k_] as i32;
+                    sum = T::wide_add(sum, tov[i * NCW + k_].to_wide());
                 }
                 zn[i] = sum;
             } else {
-                zn[i] = llr[i] as i32;
+                zn[i] = llr[i].to_wide();
             }
         }
 
         // Hard decisions from sign of belief.
         for i in 0..n {
-            cw[i] = if zn[i] > 0 { 1 } else { 0 };
+            cw[i] = if T::wide_is_positive(zn[i]) { 1 } else { 0 };
         }
 
         // Parity check.
@@ -575,7 +566,11 @@ pub fn bp_decode_generic_nms_q11<P: LdpcParams>(
             if accept {
                 let mut hard_errors = 0u32;
                 for i in 0..n {
-                    if (cw[i] == 1) != (llr[i] > 0) {
+                    // Hard error iff hard decision (cw) disagrees with
+                    // the LLR's sign. Mirrors the f32 path's
+                    // `(cw[i] == 1) != (llr[i] > 0)`.
+                    let llr_says_one = !llr[i].is_negative();
+                    if (cw[i] == 1) != llr_says_one {
                         hard_errors += 1;
                     }
                 }
@@ -591,7 +586,7 @@ pub fn bp_decode_generic_nms_q11<P: LdpcParams>(
             }
         }
 
-        // Stall detector — same heuristic as the f32 path.
+        // Stall detector — same heuristic as the f32 SumProduct path.
         if iter > 0 {
             if ncheck < nclast {
                 ncnt = 0;
@@ -613,33 +608,32 @@ pub fn bp_decode_generic_nms_q11<P: LdpcParams>(
                 let mn_ibj = P::mn(ibj);
                 for kk in 0..NCW {
                     if mn_ibj[kk] as usize == j {
-                        msg -= tov[ibj * NCW + kk] as i32;
+                        msg = T::wide_sub(msg, tov[ibj * NCW + kk].to_wide());
                     }
                 }
-                toc[j * max_row + i] = sat_i16(msg);
+                toc[j * max_row + i] = T::from_wide_sat(msg);
             }
         }
 
         // Min-sum kernel: per check node compute the two smallest |toc|.
         for i in 0..m_checks {
             let nrw_i = P::nrw(i) as usize;
-            let mut m1 = i16::MAX;
-            let mut m2 = i16::MAX;
+            let mut m1 = T::POS_INF_LIKE;
+            let mut m2 = T::POS_INF_LIKE;
             let mut imin = 0_usize;
             let mut sx = false;
             for s in 0..nrw_i {
                 let v = toc[i * max_row + s];
-                if v < 0 {
+                if v.is_negative() {
                     sx = !sx;
                 }
-                let av = v.unsigned_abs() as i32;
-                let av_i16 = av.min(i16::MAX as i32) as i16;
-                if av_i16 < m1 {
+                let av = v.abs_sat();
+                if av.lt_total(m1) {
                     m2 = m1;
-                    m1 = av_i16;
+                    m1 = av;
                     imin = s;
-                } else if av_i16 < m2 {
-                    m2 = av_i16;
+                } else if av.lt_total(m2) {
+                    m2 = av;
                 }
             }
             min1[i] = m1;
@@ -664,9 +658,9 @@ pub fn bp_decode_generic_nms_q11<P: LdpcParams>(
                 let my_v = if my_slot < nrw_ichk {
                     toc[ichk * max_row + my_slot]
                 } else {
-                    0
+                    T::ZERO
                 };
-                let my_neg = my_v < 0;
+                let my_neg = my_v.is_negative();
                 let nrw_odd = (nrw_ichk & 1) != 0;
                 let extrinsic_sign_neg = sign_xor[ichk] ^ my_neg ^ nrw_odd;
 
@@ -676,12 +670,11 @@ pub fn bp_decode_generic_nms_q11<P: LdpcParams>(
                     min1[ichk]
                 };
 
-                // α·mag in Q15, then rescale: (mag * α_q15) >> 15.
-                let scaled = ((mag as i32) * alpha_q15v) >> 15;
+                let scaled = mag.mul_alpha(alpha);
                 tov[j * NCW + k_] = if extrinsic_sign_neg {
-                    sat_i16(-scaled)
+                    scaled.neg_sat()
                 } else {
-                    sat_i16(scaled)
+                    scaled
                 };
             }
         }
@@ -690,7 +683,20 @@ pub fn bp_decode_generic_nms_q11<P: LdpcParams>(
     None
 }
 
-/// LDPC(174,91) BP NMS — Q11 i16 LLR convenience wrapper.
+/// LDPC(174,91) BP NMS — generic over LLR scalar.
+pub fn bp_decode_nms<T: LlrScalar>(
+    llr: &[T; LDPC_N],
+    ap_mask: Option<&[bool; LDPC_N]>,
+    max_iter: u32,
+    verify: Option<fn(&[u8]) -> bool>,
+    alpha: f32,
+) -> Option<BpResult> {
+    let ap_slice: Option<&[bool]> = ap_mask.map(|a| a.as_slice());
+    bp_decode_generic_nms::<Ldpc174_91Params, T>(llr.as_slice(), ap_slice, max_iter, verify, alpha)
+}
+
+/// Backward-compatible Q11 alias — keeps existing callers compiling.
+/// New code should prefer the generic [`bp_decode_nms`].
 pub fn bp_decode_nms_q11(
     llr: &[i16; LDPC_N],
     ap_mask: Option<&[bool; LDPC_N]>,
@@ -698,8 +704,13 @@ pub fn bp_decode_nms_q11(
     verify: Option<fn(&[u8]) -> bool>,
     alpha: f32,
 ) -> Option<BpResult> {
+    use crate::core::scalar::Q11i16;
     let ap_slice: Option<&[bool]> = ap_mask.map(|a| a.as_slice());
-    bp_decode_generic_nms_q11::<Ldpc174_91Params>(llr.as_slice(), ap_slice, max_iter, verify, alpha)
+    // SAFETY: `Q11i16` is `#[repr(transparent)]`-equivalent — wraps a
+    // single `i16` in a tuple struct. A `&[i16; N]` aliases a
+    // `&[Q11i16; N]` byte-for-byte. (Conservative: copy via map.)
+    let llr_q: alloc::vec::Vec<Q11i16> = llr.iter().map(|&x| Q11i16(x)).collect();
+    bp_decode_generic_nms::<Ldpc174_91Params, Q11i16>(&llr_q, ap_slice, max_iter, verify, alpha)
 }
 
 #[cfg(test)]

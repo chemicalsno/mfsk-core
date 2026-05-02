@@ -160,7 +160,7 @@ pub fn process_candidate_basic<P: Protocol>(
     let _ = ntones;
     let _ = n_sym;
     let decode = |cs: &[Complex<f32>]| -> Option<DecodeResult> {
-        let mut llr_set = compute_llr::<P>(cs);
+        let mut llr_set = compute_llr::<P, f32>(cs);
         // RX half of the optional bit interleaver: if the protocol
         // declares an interleave table, permute each LLR vector from
         // channel-bit order into codeword-bit order before BP/OSD.

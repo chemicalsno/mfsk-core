@@ -15,23 +15,26 @@ use num_traits::Float;
 
 use super::Protocol;
 use crate::core::fft::default_planner;
+use crate::core::scalar::LlrScalar;
 
 // ──────────────────────────────────────────────────────────────────────────
 // LLR bundle
 // ──────────────────────────────────────────────────────────────────────────
 
-/// Four LLR vectors (a, b, c, d) of length `codeword_len()` bits in LDPC
-/// bit-index order.
+/// Four LLR vectors (a, b, c, d) of length `codeword_len()` bits in
+/// LDPC bit-index order, generic over the [`LlrScalar`] storage type.
+/// `LlrSet<f32>` (default) is the host path; `LlrSet<Q11i16>` is the
+/// embedded fixed-point path used together with `bp_decode_generic_nms`.
 #[derive(Clone)]
-pub struct LlrSet {
+pub struct LlrSet<T: LlrScalar = f32> {
     /// nsym=1 soft metrics, scaled (matches WSJT-X llra).
-    pub llra: Vec<f32>,
+    pub llra: Vec<T>,
     /// nsym=2 soft metrics, scaled (matches WSJT-X llrb).
-    pub llrb: Vec<f32>,
+    pub llrb: Vec<T>,
     /// nsym=3 soft metrics, scaled (matches WSJT-X llrc).
-    pub llrc: Vec<f32>,
+    pub llrc: Vec<T>,
     /// nsym=1 bit-normalised (matches WSJT-X llrd).
-    pub llrd: Vec<f32>,
+    pub llrd: Vec<T>,
 }
 
 /// Default LLR scale factor from WSJT-X ft8b.f90. Individual protocols may
@@ -124,21 +127,28 @@ fn normalize_bmet(bmet: &mut [f32]) {
 /// because nt = 512 = 8³ tone-combinations. Callers that only need
 /// `llra`/`llrd` (the BP-only path) should use [`compute_llr_fast`]
 /// instead — it caps at nsym=1 and skips the heavy nsym=2/3 loops.
-pub fn compute_llr<P: Protocol>(cs: &[Complex<f32>]) -> LlrSet {
-    compute_llr_capped::<P>(cs, 3)
+pub fn compute_llr<P: Protocol, T: LlrScalar>(cs: &[Complex<f32>]) -> LlrSet<T> {
+    compute_llr_capped::<P, T>(cs, 3)
 }
 
 /// Same as [`compute_llr`] but stops at nsym=1. `llrb`/`llrc` come
 /// back zero-filled. Use when the caller will only ever read
 /// `llra` (or `llrd`), e.g. embedded `decode_block` with
 /// `DecodeDepth::Bp`. ~5× faster than the full computation.
-pub fn compute_llr_fast<P: Protocol>(cs: &[Complex<f32>]) -> LlrSet {
-    compute_llr_capped::<P>(cs, 1)
+pub fn compute_llr_fast<P: Protocol, T: LlrScalar>(cs: &[Complex<f32>]) -> LlrSet<T> {
+    compute_llr_capped::<P, T>(cs, 1)
 }
 
 /// Internal implementation — computes nsym=1..=`max_nsym`. The
-/// unused variants come back zero.
-fn compute_llr_capped<P: Protocol>(cs: &[Complex<f32>], max_nsym: usize) -> LlrSet {
+/// unused variants come back zero. Inner arithmetic stays in `f32`
+/// (the bmet computation does norms / max-min that are awkward to
+/// quantise mid-stream); the final scale-and-round to `T` happens
+/// at the bundle boundary, so for `T = Q11i16` you pay one
+/// saturating cast per LDPC bit.
+fn compute_llr_capped<P: Protocol, T: LlrScalar>(
+    cs: &[Complex<f32>],
+    max_nsym: usize,
+) -> LlrSet<T> {
     let ntones = P::NTONES as usize;
     let bps = P::BITS_PER_SYMBOL as usize;
     let gray_map = P::GRAY_MAP;
@@ -219,13 +229,15 @@ fn compute_llr_capped<P: Protocol>(cs: &[Complex<f32>], max_nsym: usize) -> LlrS
     normalize_bmet(&mut bmetd);
 
     let s = P::LLR_SCALE;
-    let scale = |v: Vec<f32>| -> Vec<f32> { v.into_iter().map(|x| x * s).collect() };
+    fn scale<U: LlrScalar>(v: Vec<f32>, s: f32) -> Vec<U> {
+        v.into_iter().map(|x| U::from_f32(x * s)).collect()
+    }
 
     LlrSet {
-        llra: scale(bmeta),
-        llrb: scale(bmetb),
-        llrc: scale(bmetc),
-        llrd: scale(bmetd),
+        llra: scale::<T>(bmeta, s),
+        llrb: scale::<T>(bmetb, s),
+        llrc: scale::<T>(bmetc, s),
+        llrd: scale::<T>(bmetd, s),
     }
 }
 

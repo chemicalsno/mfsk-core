@@ -154,7 +154,7 @@ where
 
     for (cs_ref, _used_eq) in try_order {
         let cs_ref: &[Complex<f32>] = cs_ref;
-        let llr_set = compute_llr::<P>(cs_ref);
+        let llr_set = compute_llr::<P, f32>(cs_ref);
         let variants: Vec<(&Vec<f32>, u8)> = match depth {
             DecodeDepth::Bp => vec![(&llr_set.llra, 0)],
             DecodeDepth::BpAll | DecodeDepth::BpAllOsd => vec![
