@@ -1263,20 +1263,39 @@ pub fn decode_block<S: AudioSample>(
     max_cand: usize,
 ) -> Vec<DecodeResult> {
     let spec = compute_spectrogram(audio, freq_max);
-    // Pass 1: coarse_sync with a wide net (PASS1_LIMIT cands).
-    // The ratio metric is good at separating "carrier band has
-    // signal-like energy" from "pure noise" but bad at fine ranking
-    // — we keep more candidates than stage 3 will eat so Pass 2 has
-    // material to re-rank by sync_quality.
     let pass1 = coarse_sync(&spec, freq_min, freq_max, sync_min, pass1_limit());
     drop(spec);
-    // Pass 2: per-cand Costas DFT (`SymMask::SyncOnly`) at the exact
-    // tone freqs (no FFT bin alignment issue) → `sync_quality`. Re-rank
-    // by sync_quality and truncate to `max_cand` for stage 3. The
-    // Costas spectra (`cs`) are kept and reused in stage 3 — no
-    // re-computation.
     let pass2 = refine_candidates(audio, pass1, max_cand);
     process_candidates(audio, pass2, depth)
+}
+
+/// Variant of [`decode_block`] that accepts caller-provided
+/// basis scratch — required on Core2 / Cortex-M for the asm dot
+/// product to reach its theoretical 1-cycle/sample speed (default
+/// heap allocation routes the 60 KB × 2 basis to PSRAM /
+/// non-cacheable RAM and erases the kernel's advantage).
+///
+/// Both `basis_re` and `basis_im` must be at least
+/// [`BASIS_SCRATCH_LEN`] long; place them in **internal-RAM `.bss`**
+/// (`static [i16; BASIS_SCRATCH_LEN]` arrays) for max throughput.
+/// Same recall / depth / staircase as `decode_block`, just no
+/// per-candidate allocation cycles.
+#[cfg(feature = "fixed-point")]
+pub fn decode_block_into<S: AudioSample>(
+    audio: &[S],
+    freq_min: f32,
+    freq_max: f32,
+    sync_min: f32,
+    depth: DecodeDepth,
+    max_cand: usize,
+    basis_re: &mut [i16],
+    basis_im: &mut [i16],
+) -> Vec<DecodeResult> {
+    let spec = compute_spectrogram(audio, freq_max);
+    let pass1 = coarse_sync(&spec, freq_min, freq_max, sync_min, pass1_limit());
+    drop(spec);
+    let pass2 = refine_candidates_into(audio, pass1, max_cand, basis_re, basis_im);
+    process_candidates_into(audio, pass2, depth, basis_re, basis_im)
 }
 
 /// Pass-1 candidate cap — coarse_sync emits at most this many
@@ -1335,6 +1354,45 @@ fn refine_candidates<S: AudioSample>(
     cands: Vec<SyncCandidate>,
     max_cand: usize,
 ) -> Vec<RefinedCandidate> {
+    refine_candidates_with(cands, max_cand, |c| {
+        symbol_spectra_direct(audio, c.freq_hz, c.dt_sec, SymMask::SyncBlock0)
+    })
+}
+
+/// Variant of [`refine_candidates`] that uses caller-provided basis
+/// scratch (forwards to `symbol_spectra_direct_into`).
+#[cfg(feature = "fixed-point")]
+fn refine_candidates_into<S: AudioSample>(
+    audio: &[S],
+    cands: Vec<SyncCandidate>,
+    max_cand: usize,
+    basis_re: &mut [i16],
+    basis_im: &mut [i16],
+) -> Vec<RefinedCandidate> {
+    refine_candidates_with(cands, max_cand, |c| {
+        symbol_spectra_direct_into(
+            audio,
+            c.freq_hz,
+            c.dt_sec,
+            SymMask::SyncBlock0,
+            basis_re,
+            basis_im,
+        )
+    })
+}
+
+/// Common min-heap selection logic used by both `refine_candidates`
+/// (heap-allocated basis per call) and `refine_candidates_into`
+/// (caller-provided basis scratch). The closure abstracts how each
+/// candidate's cs Box is produced.
+fn refine_candidates_with<F>(
+    cands: Vec<SyncCandidate>,
+    max_cand: usize,
+    mut cs_for: F,
+) -> Vec<RefinedCandidate>
+where
+    F: FnMut(&SyncCandidate) -> Box<[[Cmplx<f32>; 8]; 79]>,
+{
     use alloc::collections::BinaryHeap;
     use core::cmp::{Ordering, Reverse};
 
@@ -1375,7 +1433,7 @@ fn refine_candidates<S: AudioSample>(
 
     let mut heap: BinaryHeap<Reverse<Slot>> = BinaryHeap::with_capacity(max_cand + 1);
     for (idx, c) in cands.into_iter().enumerate() {
-        let cs = symbol_spectra_direct(audio, c.freq_hz, c.dt_sec, SymMask::SyncBlock0);
+        let cs = cs_for(&c);
         let q = sync_quality_block0(&cs);
         let slot = Slot {
             q,
@@ -1393,9 +1451,6 @@ fn refine_candidates<S: AudioSample>(
             // else branch: drop slot.cs immediately when it leaves scope
         }
     }
-    // Drain the heap and sort descending by q. `into_sorted_vec`
-    // sorts ascending then we reverse, so the strongest survivor
-    // ends up first — same order as the old `sort_by_key(Reverse)`.
     let mut out: Vec<RefinedCandidate> = heap
         .into_iter()
         .map(|r| {
@@ -1458,6 +1513,50 @@ pub fn process_candidates<S: AudioSample>(
     cands: Vec<RefinedCandidate>,
     depth: DecodeDepth,
 ) -> Vec<DecodeResult> {
+    process_candidates_with(audio, cands, depth, |cs, cand| {
+        fill_symbol_spectra(cs, audio, cand.freq_hz, cand.dt_sec, SymMask::NotBlock0);
+    })
+}
+
+/// Variant of [`process_candidates`] that uses caller-provided basis
+/// scratch — required on Core2 / Cortex-M for the asm dot product
+/// to reach its theoretical 1-cycle/sample speed (default heap
+/// allocation routes the 60 KB × 2 basis to PSRAM /
+/// non-cacheable RAM and erases the kernel's advantage).
+#[cfg(feature = "fixed-point")]
+fn process_candidates_into<S: AudioSample>(
+    audio: &[S],
+    cands: Vec<RefinedCandidate>,
+    depth: DecodeDepth,
+    basis_re: &mut [i16],
+    basis_im: &mut [i16],
+) -> Vec<DecodeResult> {
+    process_candidates_with(audio, cands, depth, |cs, cand| {
+        fill_symbol_spectra_into(
+            cs,
+            audio,
+            cand.freq_hz,
+            cand.dt_sec,
+            SymMask::NotBlock0,
+            basis_re,
+            basis_im,
+        );
+    })
+}
+
+/// Common body of `process_candidates` / `process_candidates_into`
+/// — the BP staircase logic is identical between the two; only the
+/// per-candidate `fill_symbol_spectra(_into)` call differs (heap-
+/// allocated basis vs caller-provided).
+fn process_candidates_with<S: AudioSample, F>(
+    _audio: &[S],
+    cands: Vec<RefinedCandidate>,
+    depth: DecodeDepth,
+    mut fill_data: F,
+) -> Vec<DecodeResult>
+where
+    F: FnMut(&mut [[Cmplx<f32>; 8]; 79], &SyncCandidate),
+{
     // dt is already parabolically refined by coarse_sync; no grid here.
 
     let mut results: Vec<DecodeResult> = Vec::new();
@@ -1466,13 +1565,7 @@ pub fn process_candidates<S: AudioSample>(
         // Fill the remaining 72 symbols (Costas blocks 1, 2 + all 58
         // data symbols). Pass 2 only filled block 0 — `q_block0` is
         // discarded once we have the full 21-symbol sync_quality.
-        fill_symbol_spectra(
-            &mut cs,
-            audio,
-            cand.freq_hz,
-            cand.dt_sec,
-            SymMask::NotBlock0,
-        );
+        fill_data(&mut cs, &cand);
         let q = sync_quality(&cs);
         if q <= q_thr {
             continue;
