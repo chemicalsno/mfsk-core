@@ -1,5 +1,75 @@
 # Changelog
 
+## 0.5.2 — streaming capture API + metadata rebalance
+
+API-additive minor over 0.5.1. Two threads:
+
+1. **`mfsk_ft8_stream_*` C ABI** — bridge real-time receivers (I2S
+   DMA, USB Audio, sound-card capture) to the slot-oriented decoder
+   without each consumer rewriting the same ring buffer + resampler.
+2. **README / Cargo.toml metadata** rebalanced so embedded targets
+   (ESP32-S3, RP2350, Cortex-M, fixed-point hot path) appear as the
+   primary positioning rather than a tail "PoC included" remark, and
+   `uvpacket` is honestly framed as an experimental applied example.
+   First crates.io release where the new wording surfaces.
+
+### What's new
+
+- `mfsk_core::core::dsp::resample::LinearResamplerI16To12k` — Q32
+  fixed-point streaming linear resampler. Carries phase + last_in
+  across calls so chunk boundaries don't introduce a discontinuity.
+  Caller-buffer output (no per-call `Vec` allocation). Pure scalar
+  i64 arithmetic — runs on FPU-less MCUs. Pairs with the new C ABI
+  below.
+- `mfsk-ffi-ft8::mfsk_ft8_stream_*` — opaque handle bundling the
+  resampler with a fixed-cap 12 kHz ring buffer. Seven entry points
+  (`_new` / `_free` / `_push_i16` / `_buffered_samples` /
+  `_peek_latest` / `_drain` / `_clear`). Decoding itself is *not*
+  bundled — capture and decode typically run on different cores or
+  RTOS tasks; the caller takes a snapshot via `_peek_latest` into
+  their own scratch and hands that to the existing
+  `mfsk_ft8_decode_i16`. Available in both `host` and
+  `embedded-fixed-point` builds — the streaming primitives are
+  pure-arithmetic with no FFT / DSP backend dependency.
+- `embedded-poc/m5stack-core2/src/bin/rx_skeleton.rs` — second
+  binary in the existing m5stack-core2 crate that pairs the working
+  FFT-planner glue with a placeholder PDM capture task and a 15 s
+  decode-trigger loop. **Cross-build status: UNVERIFIED at the time
+  of this release.** The file header lists four items the reader is
+  expected to verify on real hardware (I2S PDM driver init shape,
+  sample-rate clock, slot-boundary timer source, decode_one heap
+  discipline). Built only when explicitly named:
+  `cargo build --release --bin rx-skeleton`.
+- `mfsk-ffi-ft8/examples/streaming_recipe.c` — single-file C example
+  showing where the streaming wrapper fits in any I2S / USB Audio /
+  ALSA capture loop. Platform-agnostic placeholder hooks; compiles
+  via `gcc -c -I include`.
+- `docs/EMBEDDED.md` — new "Streaming capture: I2S / USB Audio →
+  12 kHz ring" section under §"Using from C / C++". Includes the
+  typical RTOS wiring (capture task pushes, decode task peeks every
+  15 s), notes on slot-boundary alignment (decode_block tolerates
+  ±2 s drift via coarse-sync, so NTP / GPS / freerunning all work),
+  and resampler-quality (~–55 dBc distortion in 200–3000 Hz, well
+  below FT8 LDPC operating SNR).
+
+### Tests
+
+- 4 new resampler unit tests (`passthrough`, `48k→12k decimation`,
+  `6k→12k upsample`, `chunked-input matches single-call`).
+- 7 new `MfskFt8Stream` ABI integration tests
+  (`new/free safety`, `passthrough`, `48k→12k`, `ring overwrite-oldest`,
+  `drain advances tail`, `chunk-boundary seamlessness`, `clear`).
+
+### Compatibility
+
+- All 0.5.0 / 0.5.1 entry points unchanged. `mfsk_ft8_decode_i16` /
+  `mfsk_ft8_decode_i16_alloc` / `mfsk_ft8_pack77` / `…_message_to_tones`
+  / `…_tones_to_i16` / `…_tones_to_f32` keep their signatures.
+- cbindgen-generated `mfsk_ft8.h` regenerated; new symbols append at
+  the bottom.
+- mfsk-ffi-ft8 stays `publish = false` (GitHub Releases binaries are
+  the channel).
+
 ## 0.5.1 — `mfsk-ffi-ft8` adds the FT8 transmit chain
 
 0.5.0 shipped the `mfsk-ffi-ft8` C ABI for the FT8 **decode** slice.
