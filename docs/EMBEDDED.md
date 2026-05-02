@@ -49,8 +49,8 @@ in the trait layer.
 
 | Target | MCU | Backend | Status |
 |---|---|---|---|
-| M5Stack Core2 | ESP32-D0WD-V3 (Xtensa LX6, single-issue f32 FPU) | esp-dsp ASM (`dsps_dotprod_s16_ae32`, `dsps_fft2r_*`) | Reference real-audio bench. Real-QSO 3-slot sweep ≈ 3.0 / 3.1 / 4.0 s wall-clock; see `embedded-poc/m5stack-core2/logs/`. |
-| ESP32-S3 (DevKitC) | Xtensa LX7 + PIE | esp-dsp ASM | Earlier reference; same `fft-extern` contract. |
+| **M5Stack Core2** | **ESP32-D0WD-V3** (Xtensa LX6, dual-core 240 MHz, single-issue f32 FPU, 16 MB flash, ~4 MB PSRAM) — confirmed by `espflash board-info`: `Chip type: esp32 (revision v3.1)` / `Features: WiFi, BT, Dual Core, 240MHz`. **Not** an ESP32-S2 (LX7, single-core, no BT) or S3. | esp-dsp ASM (`dsps_dotprod_s16_ae32`, `dsps_fft2r_*`) | Reference real-audio bench. See benchmark + footprint sections below. |
+| ESP32-S3 (DevKitC) | Xtensa LX7 + PIE SIMD | esp-dsp ASM | Earlier reference; same `fft-extern` contract. |
 
 The `fft-extern` + `dotprod-extern` contracts are designed to be
 target-portable (RP2040, RP2350-Hazard3, Cortex-M0/M3, etc.) but those
@@ -194,23 +194,59 @@ of those (using esp-idf-svc) for one specific board — it is an
 should expect to write their own glue. Reference what's there as a
 template; copy what's useful.
 
-## Performance ballpark (Core2 LX6, fixed-point + fixed-point-llr)
+## Performance benchmark (Core2 LX6, `fixed-point` + `fixed-point-llr`)
 
-Three on-air recordings, baked into the m5stack-core2 binary as
-WAV assets, decoded back-to-back:
+Three on-air recordings baked into the m5stack-core2 binary as WAV
+assets, decoded back-to-back over three full sweeps. Per-stage
+breakdown from the first (cold-cache) iteration; total range is the
+min–max across three iterations.
 
-| WAV | results | stage 1 | stage 2 | stage 3 | total |
+| WAV | results | stage 1 (spec) | stage 2 (sync) | stage 3 (refine + BP) | **total range** |
 |---|---|---|---|---|---|
-| qso1 (mid-band) | 3 | 1.01 s | 0.76 s | 0.69 s | **2.88 s** |
-| qso2 (mid-band) | 5 | 1.01 s | 0.76 s | 0.92 s | **3.10 s** |
-| qso3 (busy band) | 7 | 1.01 s | 0.73 s | 1.83 s | **3.99 s** |
+| qso1 (mid-band, 3 stations) | 3/3 vs `decode_frame` | 1.01 s | 0.77 s | 0.69 s | **2.87 – 3.24 s** |
+| qso2 (mid-band, 5 stations) | 5/5 vs `decode_frame` | 1.01 s | 0.77 s | 0.92 s | **3.10 – 3.47 s** |
+| qso3 (busy band, ≥7 of 10 stations) | 7 incl. block-only | 1.01 s | 0.75 s | 1.83 s | **3.99 – 4.36 s** |
 
-Stage 1 = spectrogram (92 × N=4096 FFT via two-for-one trick).
-Stage 2 = coarse Costas correlation across 991 carrier bins × 27
-lags. Stage 3 = per-candidate refine + LLR + BP staircase
-(no OSD on Core2). Raw logs in
-`embedded-poc/m5stack-core2/logs/stage3_lazy_llr_2026-05-02.log`
-and friends.
+- **Stage 1** = spectrogram, dominated by 92 × N=4096 i16 complex
+  FFTs via the two-for-one real-FFT trick (see `compute_spectrogram`
+  under `fixed-point`).
+- **Stage 2** = coarse Costas correlation across 991 carrier bins ×
+  27 lags. FPU-add bound on LX6 — the f32 path is faster than the
+  i32 path here (see `fixed-point-coarse-i32` rationale above).
+- **Stage 3** = per-candidate refine fill + LLR + BP staircase.
+  OSD off on Core2 (`OSD_ENABLED=false` in the example main.rs);
+  the spread between qso1 (3 results) and qso3 (7 results) is from
+  the per-result fill + Step-2 BP variant cost.
+
+Recall is preserved across all three iterations. Iteration-to-
+iteration drift (~10 %) on later runs is allocator and PSRAM cache
+warm-up.
+
+Raw monitor logs:
+`embedded-poc/m5stack-core2/logs/release_0_5_0_2026-05-02.log`
+(latest 0.5.0 release sweep) plus per-commit perf-chain logs
+(`stage3_bp_pool`, `stage3_syncblocks12`, `stage3_lazy_llr`,
+`two_for_one`, `phase3_coarse_i32`).
+
+## Binary footprint (Core2 reference, `xtensa-esp32-elf-size -A`)
+
+| Region | Size | Contents |
+|---|---|---|
+| **IRAM** (`.iram0.text` + `.iram0.vectors`) | **69 KB** | Internal-RAM code: esp-idf interrupt handlers, Wi-Fi/BT IRAM-resident routines |
+| **DRAM** (`.dram0.data` + `.dram0.bss`) | **76 KB** | Internal-RAM static data: BASIS scratch (60 KB) + spectrogram cache + esp-idf statics |
+| **Flash text** (`.flash.text`) | **448 KB** | App + esp-idf code |
+| **Flash rodata** (`.flash.rodata`) | **1.21 MB** | Read-only data — **incl. the three baked WAVs (~1.08 MB)** for the offline real-audio bench |
+| **Total app binary** | **1.997 MB** | What `espflash flash` writes |
+
+Subtracting the baked WAV assets (1.08 MB) and the bundled esp-idf
+runtime, `mfsk-core` itself plus the M5Stack Core2 example glue
+contributes roughly **150–200 KB** of flash text. The IRAM/DRAM
+totals shown include esp-idf — the library proper has no IRAM
+requirement and the only DRAM requirement is the 60 KB BASIS scratch
+plus an optional 8 KB-per-candidate cs Box (~120 KB peak across
+~15 surviving candidates), comfortably fitting the on-chip 320 KB
+SRAM budget on bare ESP32 (no PSRAM needed strictly for the decode
+path; PSRAM helps only for the wider spectrogram).
 
 ## Known limitations on the embedded path
 

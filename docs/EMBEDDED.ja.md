@@ -47,8 +47,8 @@ trait 層に新規追加は不要です。
 
 | ターゲット | MCU | バックエンド | 状況 |
 |---|---|---|---|
-| M5Stack Core2 | ESP32-D0WD-V3 (Xtensa LX6, 単発 f32 FPU) | esp-dsp ASM (`dsps_dotprod_s16_ae32`, `dsps_fft2r_*`) | リファレンス実音声ベンチ。3-slot 実 QSO sweep 約 3.0 / 3.1 / 4.0 s。`embedded-poc/m5stack-core2/logs/` 参照 |
-| ESP32-S3 (DevKitC) | Xtensa LX7 + PIE | esp-dsp ASM | 旧リファレンス。同じ `fft-extern` 契約 |
+| **M5Stack Core2** | **ESP32-D0WD-V3** (Xtensa LX6, dual-core 240 MHz, 単発 f32 FPU, 16 MB flash, 約 4 MB PSRAM) — `espflash board-info` で確認: `Chip type: esp32 (revision v3.1)` / `Features: WiFi, BT, Dual Core, 240MHz`。**ESP32-S2 ではない** (S2 は LX7 single-core で BT 無し) し S3 でもない | esp-dsp ASM (`dsps_dotprod_s16_ae32`, `dsps_fft2r_*`) | リファレンス実音声ベンチ。下のベンチ + フットプリント節参照 |
+| ESP32-S3 (DevKitC) | Xtensa LX7 + PIE SIMD | esp-dsp ASM | 旧リファレンス。同じ `fft-extern` 契約 |
 
 `fft-extern` + `dotprod-extern` 契約は他ターゲット (RP2040,
 RP2350-Hazard3, Cortex-M0/M3 など) にもポータブルな設計ですが、
@@ -187,23 +187,36 @@ mfsk-core はデコード/エンコードパイプラインまでです。以下
 あって、メンテされるアプリケーションではありません。他ターゲットは
 独自の glue を書いてください。中身を template として参照してください。
 
-## パフォーマンス目安 (Core2 LX6, fixed-point + fixed-point-llr)
+## パフォーマンスベンチマーク (Core2 LX6, `fixed-point` + `fixed-point-llr`)
 
-m5stack-core2 バイナリにベイクされた 3 つの実 QSO 録音を
-連続デコード:
+m5stack-core2 バイナリにベイクされた 3 つの実 QSO 録音を、3 sweep
+連続デコード。stage 内訳は 1 周目 (cold cache)、合計レンジは 3 sweep
+の最小〜最大。
 
-| WAV | 結果 | stage 1 | stage 2 | stage 3 | total |
+| WAV | 結果 | stage 1 (spec) | stage 2 (sync) | stage 3 (refine + BP) | **合計レンジ** |
 |---|---|---|---|---|---|
-| qso1 (mid-band) | 3 | 1.01 s | 0.76 s | 0.69 s | **2.88 s** |
-| qso2 (mid-band) | 5 | 1.01 s | 0.76 s | 0.92 s | **3.10 s** |
-| qso3 (busy band) | 7 | 1.01 s | 0.73 s | 1.83 s | **3.99 s** |
+| qso1 (mid-band, 3 局) | 3/3 vs `decode_frame` | 1.01 s | 0.77 s | 0.69 s | **2.87 – 3.24 s** |
+| qso2 (mid-band, 5 局) | 5/5 vs `decode_frame` | 1.01 s | 0.77 s | 0.92 s | **3.10 – 3.47 s** |
+| qso3 (busy band, 10 局のうち ≥7) | 7 (block-only 含む) | 1.01 s | 0.75 s | 1.83 s | **3.99 – 4.36 s** |
 
-stage 1 = spectrogram (two-for-one trick で N=4096 FFT × 92 回)。
-stage 2 = 991 carrier bin × 27 lag の Costas 粗同期。
-stage 3 = 候補ごとの refine + LLR + BP staircase (Core2 では
-OSD off)。生ログは
-`embedded-poc/m5stack-core2/logs/stage3_lazy_llr_2026-05-02.log`
-など。
+- **Stage 1** = spectrogram。92 × N=4096 i16 complex FFT を two-for-one
+  real-FFT trick で実行 (`compute_spectrogram` under `fixed-point`)。
+- **Stage 2** = 991 carrier bin × 27 lag の Costas 粗同期。LX6 では
+  FPU-add 律速 — i32 パスより f32 パスのほうが速い
+  (`fixed-point-coarse-i32` の節参照)。
+- **Stage 3** = 候補ごとの refine fill + LLR + BP staircase。
+  Core2 では OSD off (`OSD_ENABLED=false` in 例の main.rs)。
+  qso1 (3 結果) と qso3 (7 結果) の差は、結果あたりの fill +
+  Step-2 BP variant コスト。
+
+3 sweep 通して recall は維持。後続 sweep の ~10 % drift は
+allocator と PSRAM cache の warm-up。
+
+生モニタログ:
+`embedded-poc/m5stack-core2/logs/release_0_5_0_2026-05-02.log`
+(0.5.0 リリース sweep) + コミットごとの perf-chain ログ
+(`stage3_bp_pool`, `stage3_syncblocks12`, `stage3_lazy_llr`,
+`two_for_one`, `phase3_coarse_i32`)。
 
 ## バイナリフットプリント (Core2 リファレンス, ELF)
 
