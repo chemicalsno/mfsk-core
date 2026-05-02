@@ -57,6 +57,13 @@ fft-extern   = ["alloc"]
 # Q-format table therein.
 fixed-point  = []
 
+# Fixed-point LDPC BP (i16 NMS) — keeps the LLR/BP iteration loop in
+# integer arithmetic to match the rest of the `fixed-point` path.
+# Useful for FPU-less targets (RP2040, M0+) where f32 emulation
+# dominates BP cost; on Core2/LX6 the FPU makes f32 BP ~1 ms/decode
+# already, so this is mainly an architectural-consistency feature.
+fixed-point-bp = ["fixed-point"]
+
 # Lightweight modes — embedded-port-clean. `fft-rustfft` (host) or
 # `fft-extern` (embedded) is required at the crate level for the
 # decode pipeline; the protocol features themselves only enable the
@@ -98,7 +105,7 @@ rayon       = { version = "1", optional = true }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = [
-    'cfg(feature, values("std","alloc","ft8","ft4","fst4","wspr","jt9","jt65","q65","packet-bytes","uvpacket","parallel","osd-deep","eq-fallback","full","embedded-tx","embedded-rx","esp32s3","fft-rustfft","fft-extern","fixed-point"))',
+    'cfg(feature, values("std","alloc","ft8","ft4","fst4","wspr","jt9","jt65","q65","packet-bytes","uvpacket","parallel","osd-deep","eq-fallback","full","embedded-tx","embedded-rx","esp32s3","fft-rustfft","fft-extern","fixed-point","fixed-point-bp"))',
 ] }
 
 # Build docs.rs with every protocol feature enabled so users browsing

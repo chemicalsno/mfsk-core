@@ -454,6 +454,254 @@ pub fn bp_decode_kind(
     bp_decode_generic_kind::<Ldpc174_91Params>(llr.as_slice(), ap_slice, max_iter, verify, kind)
 }
 
+// ──────────────────────────────────────────────────────────────────────────
+// Fixed-point NMS BP (i16 LLR / i16 message arrays)
+// ──────────────────────────────────────────────────────────────────────────
+
+/// LLR Q-format used by [`bp_decode_generic_nms_q11`] and friends:
+/// `i16` with 11 fractional bits → range [-16, +16) at 1/2048
+/// resolution. Typical LLR magnitudes after `LLR_SCALE` (≈2.83) sit
+/// in ±10, well inside the range.
+pub const LLR_Q11_FRAC: u32 = 11;
+const LLR_Q11_ONE: i32 = 1 << LLR_Q11_FRAC; // 2048
+
+/// Convert an `f32` LLR to Q11 i16 with saturation.
+#[inline]
+pub fn llr_f32_to_q11(x: f32) -> i16 {
+    let v = (x * (LLR_Q11_ONE as f32)).round() as i32;
+    v.clamp(i16::MIN as i32, i16::MAX as i32) as i16
+}
+
+/// α as Q15 fixed-point: 0.75 → 24576.
+#[inline]
+const fn alpha_q15(alpha: f32) -> i32 {
+    (alpha * 32768.0) as i32
+}
+
+/// Saturating i32→i16 cast.
+#[inline]
+fn sat_i16(v: i32) -> i16 {
+    v.clamp(i16::MIN as i32, i16::MAX as i32) as i16
+}
+
+/// Generic i16-NMS Belief-Propagation decode — Q11 LLR in/out.
+///
+/// Architectural mirror of [`bp_decode_generic_kind`] for the
+/// Normalized-Min-Sum kernel; SumProduct and OffsetMinSum are
+/// **not** ported (Core2 only uses NMS, RasPi/host can stay on the
+/// f32 path). Behaviour matches the f32 NMS branch including the
+/// `nrw_odd` extrinsic-sign correction that aligns with WSJT-X's
+/// `tanh ∘ atanh` SP convention.
+pub fn bp_decode_generic_nms_q11<P: LdpcParams>(
+    llr: &[i16],
+    ap_mask: Option<&[bool]>,
+    max_iter: u32,
+    verify: Option<fn(&[u8]) -> bool>,
+    alpha: f32,
+) -> Option<BpResult> {
+    debug_assert_eq!(llr.len(), P::N);
+    if let Some(m) = ap_mask {
+        debug_assert_eq!(m.len(), P::N);
+    }
+
+    let n = P::N;
+    let m_checks = P::M;
+    let k = P::K;
+    let max_row = P::MAX_ROW;
+    let alpha_q15v = alpha_q15(alpha);
+
+    let mut tov = vec![0i16; n * NCW];
+    let mut toc = vec![0i16; m_checks * max_row];
+    let mut min1 = vec![0i16; m_checks];
+    let mut min2 = vec![0i16; m_checks];
+    let mut idx_min1 = vec![0u32; m_checks];
+    let mut sign_xor = vec![false; m_checks];
+    let mut zn = vec![0i32; n];
+    let mut cw = vec![0u8; n];
+
+    // Initial messages: each check edge carries the bit's raw LLR.
+    for j in 0..m_checks {
+        let nrw_j = P::nrw(j) as usize;
+        for i in 0..nrw_j {
+            let bit = P::nm(j, i) as usize;
+            toc[j * max_row + i] = llr[bit];
+        }
+    }
+
+    let mut ncnt = 0u32;
+    let mut nclast = 0u32;
+
+    for iter in 0..=max_iter {
+        // Variable-node belief sum. tov values are i16, summed in i32
+        // to avoid overflow before saturation for the hard decision.
+        for i in 0..n {
+            let ap = ap_mask.is_some_and(|mm| mm[i]);
+            if !ap {
+                let mut sum = llr[i] as i32;
+                for k_ in 0..NCW {
+                    sum += tov[i * NCW + k_] as i32;
+                }
+                zn[i] = sum;
+            } else {
+                zn[i] = llr[i] as i32;
+            }
+        }
+
+        // Hard decisions from sign of belief.
+        for i in 0..n {
+            cw[i] = if zn[i] > 0 { 1 } else { 0 };
+        }
+
+        // Parity check.
+        let mut ncheck = 0u32;
+        for i in 0..m_checks {
+            let nrw_i = P::nrw(i) as usize;
+            let mut parity = 0u8;
+            for s in 0..nrw_i {
+                parity ^= cw[P::nm(i, s) as usize];
+            }
+            if parity != 0 {
+                ncheck += 1;
+            }
+        }
+
+        if ncheck == 0 {
+            let mut decoded = vec![0u8; k];
+            decoded.copy_from_slice(&cw[..k]);
+            let accept = match verify {
+                Some(f) => f(&decoded),
+                None => true,
+            };
+            if accept {
+                let mut hard_errors = 0u32;
+                for i in 0..n {
+                    if (cw[i] == 1) != (llr[i] > 0) {
+                        hard_errors += 1;
+                    }
+                }
+                let mut message77 = [0u8; 77];
+                message77.copy_from_slice(&decoded[..77]);
+                return Some(BpResult {
+                    message77,
+                    info: decoded,
+                    codeword: cw,
+                    hard_errors,
+                    iterations: iter,
+                });
+            }
+        }
+
+        // Stall detector — same heuristic as the f32 path.
+        if iter > 0 {
+            if ncheck < nclast {
+                ncnt = 0;
+            } else {
+                ncnt += 1;
+            }
+            if ncnt >= 5 && iter >= 10 && ncheck > 15 {
+                return None;
+            }
+        }
+        nclast = ncheck;
+
+        // Variable-to-check messages: subtract own contribution.
+        for j in 0..m_checks {
+            let nrw_j = P::nrw(j) as usize;
+            for i in 0..nrw_j {
+                let ibj = P::nm(j, i) as usize;
+                let mut msg = zn[ibj];
+                let mn_ibj = P::mn(ibj);
+                for kk in 0..NCW {
+                    if mn_ibj[kk] as usize == j {
+                        msg -= tov[ibj * NCW + kk] as i32;
+                    }
+                }
+                toc[j * max_row + i] = sat_i16(msg);
+            }
+        }
+
+        // Min-sum kernel: per check node compute the two smallest |toc|.
+        for i in 0..m_checks {
+            let nrw_i = P::nrw(i) as usize;
+            let mut m1 = i16::MAX;
+            let mut m2 = i16::MAX;
+            let mut imin = 0_usize;
+            let mut sx = false;
+            for s in 0..nrw_i {
+                let v = toc[i * max_row + s];
+                if v < 0 {
+                    sx = !sx;
+                }
+                let av = v.unsigned_abs() as i32;
+                let av_i16 = av.min(i16::MAX as i32) as i16;
+                if av_i16 < m1 {
+                    m2 = m1;
+                    m1 = av_i16;
+                    imin = s;
+                } else if av_i16 < m2 {
+                    m2 = av_i16;
+                }
+            }
+            min1[i] = m1;
+            min2[i] = m2;
+            idx_min1[i] = imin as u32;
+            sign_xor[i] = sx;
+        }
+
+        // Per-edge check-to-variable update with α scaling (NMS).
+        for j in 0..n {
+            let mn_j = P::mn(j);
+            for k_ in 0..NCW {
+                let ichk = mn_j[k_] as usize;
+                let nrw_ichk = P::nrw(ichk) as usize;
+                let mut my_slot = nrw_ichk;
+                for s in 0..nrw_ichk {
+                    if P::nm(ichk, s) as usize == j {
+                        my_slot = s;
+                        break;
+                    }
+                }
+                let my_v = if my_slot < nrw_ichk {
+                    toc[ichk * max_row + my_slot]
+                } else {
+                    0
+                };
+                let my_neg = my_v < 0;
+                let nrw_odd = (nrw_ichk & 1) != 0;
+                let extrinsic_sign_neg = sign_xor[ichk] ^ my_neg ^ nrw_odd;
+
+                let mag = if my_slot < nrw_ichk && my_slot as u32 == idx_min1[ichk] {
+                    min2[ichk]
+                } else {
+                    min1[ichk]
+                };
+
+                // α·mag in Q15, then rescale: (mag * α_q15) >> 15.
+                let scaled = ((mag as i32) * alpha_q15v) >> 15;
+                tov[j * NCW + k_] = if extrinsic_sign_neg {
+                    sat_i16(-scaled)
+                } else {
+                    sat_i16(scaled)
+                };
+            }
+        }
+    }
+
+    None
+}
+
+/// LDPC(174,91) BP NMS — Q11 i16 LLR convenience wrapper.
+pub fn bp_decode_nms_q11(
+    llr: &[i16; LDPC_N],
+    ap_mask: Option<&[bool; LDPC_N]>,
+    max_iter: u32,
+    verify: Option<fn(&[u8]) -> bool>,
+    alpha: f32,
+) -> Option<BpResult> {
+    let ap_slice: Option<&[bool]> = ap_mask.map(|a| a.as_slice());
+    bp_decode_generic_nms_q11::<Ldpc174_91Params>(llr.as_slice(), ap_slice, max_iter, verify, alpha)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

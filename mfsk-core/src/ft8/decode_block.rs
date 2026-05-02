@@ -1269,19 +1269,43 @@ pub fn process_candidates<S: AudioSample>(
         // `Bp` stops after step 1.
         let mut accepted: Option<(crate::fec::ldpc::bp::BpResult, u8)> = None;
 
-        // Step 1: fast llra
+        // Step 1: fast llra. Under the `fixed-point-bp` feature the
+        // BP iteration loop runs in i16 Q11 rather than f32 — same
+        // NMS algorithm and convergence, integer arithmetic only, so
+        // the LLR/BP path matches the rest of the i16 fixed-point
+        // pipeline (no f32 ops in the embedded RX hot loop).
         let llr_a_fast = compute_llr_fast(&cs);
-        if let Some(bp) = bp_decode_kind(
+        #[cfg(not(feature = "fixed-point-bp"))]
+        let bp_step1 = bp_decode_kind(
             &llr_a_fast.llra,
             None,
             BP_MAX_ITER,
             Some(check_crc14),
             bp_kind,
-        ) {
+        );
+        #[cfg(feature = "fixed-point-bp")]
+        let bp_step1 = {
+            let mut llr_q11 = [0i16; LDPC_N];
+            for (q, f) in llr_q11.iter_mut().zip(llr_a_fast.llra.iter()) {
+                *q = crate::fec::ldpc::bp::llr_f32_to_q11(*f);
+            }
+            crate::fec::ldpc::bp::bp_decode_nms_q11(
+                &llr_q11,
+                None,
+                BP_MAX_ITER,
+                Some(check_crc14),
+                NMS_ALPHA,
+            )
+        };
+        if let Some(bp) = bp_step1 {
             accepted = Some((bp, 0));
         }
 
-        // Step 2: deeper LLR + 4 variants
+        // Step 2: deeper LLR + 4 variants. Same i16-NMS swap as Step 1
+        // when `fixed-point-bp` is on; the `compute_llr` call still
+        // returns f32 (Q-formatting LLR computation is a separate
+        // future migration), so we convert per-variant before the
+        // BP iteration.
         let mut llr_full_opt: Option<super::llr::LlrSet> = None;
         if accepted.is_none() && matches!(depth, DecodeDepth::BpAll | DecodeDepth::BpAllOsd) {
             let llr_full = compute_llr(&cs);
@@ -1291,8 +1315,23 @@ pub fn process_candidates<S: AudioSample>(
                 (&llr_full.llrc, 2),
                 (&llr_full.llrd, 3),
             ] {
-                if let Some(bp) = bp_decode_kind(llr, None, BP_MAX_ITER, Some(check_crc14), bp_kind)
-                {
+                #[cfg(not(feature = "fixed-point-bp"))]
+                let bp_step2 = bp_decode_kind(llr, None, BP_MAX_ITER, Some(check_crc14), bp_kind);
+                #[cfg(feature = "fixed-point-bp")]
+                let bp_step2 = {
+                    let mut llr_q11 = [0i16; LDPC_N];
+                    for (q, f) in llr_q11.iter_mut().zip(llr.iter()) {
+                        *q = crate::fec::ldpc::bp::llr_f32_to_q11(*f);
+                    }
+                    crate::fec::ldpc::bp::bp_decode_nms_q11(
+                        &llr_q11,
+                        None,
+                        BP_MAX_ITER,
+                        Some(check_crc14),
+                        NMS_ALPHA,
+                    )
+                };
+                if let Some(bp) = bp_step2 {
                     accepted = Some((bp, pid));
                     break;
                 }

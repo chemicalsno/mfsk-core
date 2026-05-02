@@ -333,7 +333,26 @@ fn decode_one(slot: &[i16], max_cand: usize, dt_grid: u8, df_grid: u8, q_thresh:
         let mut accepted = None;
         let mut accepted_pass: u8 = 0;
         let llr_a_fast = compute_llr_fast(&cs);
-        if let Some(bp) = bp_decode_kind(&llr_a_fast.llra, None, 30, Some(check_crc14), bp_kind) {
+        // i16 NMS BP under `fixed-point-bp` — mirrors the f32 path
+        // bit-for-bit on AWGN sweeps (Q11 LLR, α as Q15) so the
+        // entire embedded RX hot loop is integer-only.
+        #[cfg(feature = "fixed-point-bp")]
+        let bp_step1 = {
+            let mut llr_q11 = [0i16; mfsk_core::ft8::params::LDPC_N];
+            for (q, f) in llr_q11.iter_mut().zip(llr_a_fast.llra.iter()) {
+                *q = mfsk_core::fec::ldpc::bp::llr_f32_to_q11(*f);
+            }
+            mfsk_core::fec::ldpc::bp::bp_decode_nms_q11(
+                &llr_q11,
+                None,
+                30,
+                Some(check_crc14),
+                0.75,
+            )
+        };
+        #[cfg(not(feature = "fixed-point-bp"))]
+        let bp_step1 = bp_decode_kind(&llr_a_fast.llra, None, 30, Some(check_crc14), bp_kind);
+        if let Some(bp) = bp_step1 {
             accepted = Some(bp.message77);
             accepted_pass = 0;
         }
@@ -347,7 +366,23 @@ fn decode_one(slot: &[i16], max_cand: usize, dt_grid: u8, df_grid: u8, q_thresh:
                 (&llr_full.llrd, 3),
             ];
             for (llr, pid) in variants {
-                if let Some(bp) = bp_decode_kind(llr, None, 30, Some(check_crc14), bp_kind) {
+                #[cfg(feature = "fixed-point-bp")]
+                let bp_step2 = {
+                    let mut llr_q11 = [0i16; mfsk_core::ft8::params::LDPC_N];
+                    for (q, f) in llr_q11.iter_mut().zip(llr.iter()) {
+                        *q = mfsk_core::fec::ldpc::bp::llr_f32_to_q11(*f);
+                    }
+                    mfsk_core::fec::ldpc::bp::bp_decode_nms_q11(
+                        &llr_q11,
+                        None,
+                        30,
+                        Some(check_crc14),
+                        0.75,
+                    )
+                };
+                #[cfg(not(feature = "fixed-point-bp"))]
+                let bp_step2 = bp_decode_kind(llr, None, 30, Some(check_crc14), bp_kind);
+                if let Some(bp) = bp_step2 {
                     accepted = Some(bp.message77);
                     accepted_pass = pid;
                     hard_errors_acc = bp.hard_errors;
