@@ -127,8 +127,13 @@ fn normalize_bmet(bmet: &mut [f32]) {
 /// because nt = 512 = 8³ tone-combinations. Callers that only need
 /// `llra`/`llrd` (the BP-only path) should use [`compute_llr_fast`]
 /// instead — it caps at nsym=1 and skips the heavy nsym=2/3 loops.
+///
+/// The `Complex<f32>` cs API is a layout-compatible wrapper around
+/// the generic `compute_llr_generic` — use the generic form when
+/// the caller already holds [`Cmplx<S>`] storage (e.g. the
+/// embedded fixed-point cs Box on Phase 2+ of the i16 migration).
 pub fn compute_llr<P: Protocol, T: LlrScalar>(cs: &[Complex<f32>]) -> LlrSet<T> {
-    compute_llr_capped::<P, T>(cs, 3)
+    compute_llr_generic::<P, f32, T>(complex_slice_as_cmplx_f32(cs), 3)
 }
 
 /// Same as [`compute_llr`] but stops at nsym=1. `llrb`/`llrc` come
@@ -136,17 +141,16 @@ pub fn compute_llr<P: Protocol, T: LlrScalar>(cs: &[Complex<f32>]) -> LlrSet<T> 
 /// `llra` (or `llrd`), e.g. embedded `decode_block` with
 /// `DecodeDepth::Bp`. ~5× faster than the full computation.
 pub fn compute_llr_fast<P: Protocol, T: LlrScalar>(cs: &[Complex<f32>]) -> LlrSet<T> {
-    compute_llr_capped::<P, T>(cs, 1)
+    compute_llr_generic::<P, f32, T>(complex_slice_as_cmplx_f32(cs), 1)
 }
 
-/// Internal implementation — computes nsym=1..=`max_nsym`. The
-/// unused variants come back zero. Inner arithmetic stays in `f32`
-/// (the bmet computation does norms / max-min that are awkward to
-/// quantise mid-stream); the final scale-and-round to `T` happens
-/// at the bundle boundary, so for `T = Q11i16` you pay one
-/// saturating cast per LDPC bit.
-fn compute_llr_capped<P: Protocol, T: LlrScalar>(
-    cs: &[Complex<f32>],
+/// Generic LLR computation accepting any [`Cmplx<S>`] cs storage.
+/// Inner `bmet` arithmetic stays in `f32` (norms / max-min are
+/// awkward to quantise mid-stream) — `S` only changes how we read
+/// each cs entry (`S::to_f32` per component). Final scale-and-round
+/// to `T` happens at the bundle boundary.
+pub fn compute_llr_generic<P: Protocol, S: SpecScalar, T: LlrScalar>(
+    cs: &[Cmplx<S>],
     max_nsym: usize,
 ) -> LlrSet<T> {
     let ntones = P::NTONES as usize;
@@ -175,12 +179,19 @@ fn compute_llr_capped<P: Protocol, T: LlrScalar>(
                 let ks = chunk_start_sym + k;
 
                 // Precompute |Σ cs_k[gray[idx_k]]| for each tone-combination.
+                // Each cs entry is read in f32 components — for `S = f32`
+                // the `to_f32` calls compile to no-ops; for `S = Q14i16`
+                // they're a single multiply per read (Q14 → f32).
                 for (i, s2_i) in s2.iter_mut().enumerate() {
                     let digits = base_digits(i, ntones, nsym);
-                    let sum: Complex<f32> = (0..nsym)
-                        .map(|j| cs[(ks + j) * ntones + gray_map[digits[j]] as usize])
-                        .sum();
-                    *s2_i = sum.norm();
+                    let mut sum_re = 0.0f32;
+                    let mut sum_im = 0.0f32;
+                    for j in 0..nsym {
+                        let entry = cs[(ks + j) * ntones + gray_map[digits[j]] as usize];
+                        sum_re += entry.re.to_f32();
+                        sum_im += entry.im.to_f32();
+                    }
+                    *s2_i = (sum_re * sum_re + sum_im * sum_im).sqrt();
                 }
 
                 // Map each of the `ibmax+1` bits into the codeword.
