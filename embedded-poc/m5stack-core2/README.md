@@ -61,7 +61,14 @@ once the binary has been run.
 
 ## What's *not* in this PoC
 
-- I2S mic capture (live RX).
+- I2S mic capture (live RX) — see the `rx-skeleton` companion binary
+  (`src/bin/rx_skeleton.rs`) for an **unverified scaffold** that
+  pairs the same FFT planner glue with a placeholder PDM capture
+  loop and the new `mfsk_ft8_stream_*` ABI. Build with
+  `cargo build --release --bin rx-skeleton`. Cross-build status is
+  unconfirmed at the time of writing — see the file's docstring
+  for the four items the reader is expected to verify before
+  flashing.
 - LCD output / touch input.
 - Slot timing (NTP / GPS).
 - TX path (already validated on the S3 PoC).
@@ -93,4 +100,5 @@ not the LX7 ESP32-S3. Practical differences for this PoC:
 | `build.rs` | `embuild::espidf::sysenv::output()` |
 | `src/bindings.h` | esp-dsp bindgen header |
 | `src/esp_dsp_fft.rs` | `mfsk_core_make_default_fft_planner()` factory + `EspDspPlanner` (verbatim from S3 PoC) |
-| `src/main.rs` | synth + decode + UART log |
+| `src/main.rs` | synth + decode + UART log (compute bench, baked WAVs) |
+| `src/bin/rx_skeleton.rs` | live-RX scaffold: I2S PDM → `mfsk_ft8_stream_*` → decode (**UNVERIFIED**) |
