@@ -247,13 +247,21 @@ pub struct Spectrogram {
 }
 
 /// coarse_sync inner-loop accumulator. Phase 3 of the integer-pure
-/// embedded port: under `fixed-point` the allsum / t_blocks / t0_blocks
-/// chain stays in `i32` (sums of u16 power cells, max ~2^25 ≪ i31), and
-/// only the final score division converts to f32. Under host f32 the
-/// alias collapses to f32 so the path stays bit-identical.
-#[cfg(feature = "fixed-point")]
+/// embedded port: under `fixed-point-coarse-i32` the allsum / t_blocks
+/// / t0_blocks chain stays in `i32` (sums of u16 power cells, max
+/// ~2^25 ≪ i31), and only the final score division converts to f32.
+/// Otherwise the alias collapses to f32 so the host path is
+/// bit-identical and the LX6/LX7 FPU+ALU parallelism is preserved.
+///
+/// **Why a separate feature from `fixed-point`**: on ESP32 LX6 the f32
+/// allsum loop overlaps on the FPU with integer index arithmetic on
+/// the ALU; switching to i32 serialises onto the integer ALU and costs
+/// ~25 % stage-2 wall-clock (~+200 ms / qso on Core2). FPU-less targets
+/// (RP2040, Cortex-M0+, Hazard3) are the opposite — flip this feature
+/// on there to avoid f32 emulation in stage 2.
+#[cfg(feature = "fixed-point-coarse-i32")]
 type CoarseAcc = i32;
-#[cfg(not(feature = "fixed-point"))]
+#[cfg(not(feature = "fixed-point-coarse-i32"))]
 type CoarseAcc = f32;
 
 impl Spectrogram {

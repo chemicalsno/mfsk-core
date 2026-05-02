@@ -78,6 +78,16 @@ fixed-point-bp = ["fixed-point-llr"]
 # pulls in `fixed-point-llr` so the integer pipeline runs end-to-end.
 fixed-point-cs = ["fixed-point", "fixed-point-llr"]
 
+# Fixed-point coarse_sync inner loop (allsum / t / t0 in i32 instead of
+# f32). Architecturally completes the integer pipeline so FPU-less
+# targets (RP2040, Cortex-M0+, RP2350-Hazard3) avoid f32 emulation in
+# stage 2. **Hurts** on targets with a hardware FPU + separate INT/FPU
+# units (notably ESP32 LX6 / LX7), where the f32 path overlapped allsum
+# updates on the FPU with index arithmetic on the ALU; collapsing both
+# onto the integer ALU serialises them and costs ~25 % stage-2
+# wall-clock on Core2. Off by default — flip on for FPU-less builds.
+fixed-point-coarse-i32 = ["fixed-point"]
+
 # Lightweight modes — embedded-port-clean. `fft-rustfft` (host) or
 # `fft-extern` (embedded) is required at the crate level for the
 # decode pipeline; the protocol features themselves only enable the
@@ -119,7 +129,7 @@ rayon       = { version = "1", optional = true }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = [
-    'cfg(feature, values("std","alloc","ft8","ft4","fst4","wspr","jt9","jt65","q65","packet-bytes","uvpacket","parallel","osd-deep","eq-fallback","full","embedded-tx","embedded-rx","esp32s3","fft-rustfft","fft-extern","fixed-point","fixed-point-bp","fixed-point-llr","fixed-point-cs"))',
+    'cfg(feature, values("std","alloc","ft8","ft4","fst4","wspr","jt9","jt65","q65","packet-bytes","uvpacket","parallel","osd-deep","eq-fallback","full","embedded-tx","embedded-rx","esp32s3","fft-rustfft","fft-extern","fixed-point","fixed-point-bp","fixed-point-llr","fixed-point-cs","fixed-point-coarse-i32"))',
 ] }
 
 # Build docs.rs with every protocol feature enabled so users browsing
