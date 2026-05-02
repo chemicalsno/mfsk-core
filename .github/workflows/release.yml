@@ -8,6 +8,10 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Opt every JS-based action into the Node.js 24 runtime ahead of
+  # GitHub's 2026-09-16 deprecation of Node 20. See ci.yml for the
+  # rationale.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
   publish:

@@ -16,6 +16,12 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  # Opt every JS-based action into the Node.js 24 runtime ahead of
+  # GitHub's 2026-09-16 deprecation of Node 20. Lets us keep the
+  # actions pinned at @v4 / @v2 / @v1.5 without chasing individual
+  # release bumps; the action authors will republish Node-24-native
+  # versions over time and this env var becomes a no-op.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 # Cancel in-flight runs on the same ref when a new commit arrives
 # (typical case: a PR force-push or a fast-follow `--amend`). The
