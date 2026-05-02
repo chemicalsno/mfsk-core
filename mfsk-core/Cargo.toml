@@ -69,6 +69,15 @@ fixed-point-llr = ["fixed-point"]
 # release.
 fixed-point-bp = ["fixed-point-llr"]
 
+# Fixed-point cs (complex symbol spectra) — stores cs entries as
+# `Cmplx<Q14i16>` (Q14 fixed-point i16 per re/im) instead of
+# `Cmplx<f32>`. Halves cs memory footprint (8 KB → 4 KB per
+# Box<[[Cmplx<S>;8];79]>) and removes the f32 cast at the DFT-output
+# boundary on the embedded fixed-point path. Only valuable in
+# combination with `fixed-point` (the spec / DFT-internal i16 path);
+# pulls in `fixed-point-llr` so the integer pipeline runs end-to-end.
+fixed-point-cs = ["fixed-point", "fixed-point-llr"]
+
 # Lightweight modes — embedded-port-clean. `fft-rustfft` (host) or
 # `fft-extern` (embedded) is required at the crate level for the
 # decode pipeline; the protocol features themselves only enable the
@@ -110,7 +119,7 @@ rayon       = { version = "1", optional = true }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = [
-    'cfg(feature, values("std","alloc","ft8","ft4","fst4","wspr","jt9","jt65","q65","packet-bytes","uvpacket","parallel","osd-deep","eq-fallback","full","embedded-tx","embedded-rx","esp32s3","fft-rustfft","fft-extern","fixed-point","fixed-point-bp","fixed-point-llr"))',
+    'cfg(feature, values("std","alloc","ft8","ft4","fst4","wspr","jt9","jt65","q65","packet-bytes","uvpacket","parallel","osd-deep","eq-fallback","full","embedded-tx","embedded-rx","esp32s3","fft-rustfft","fft-extern","fixed-point","fixed-point-bp","fixed-point-llr","fixed-point-cs"))',
 ] }
 
 # Build docs.rs with every protocol feature enabled so users browsing

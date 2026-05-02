@@ -1209,16 +1209,18 @@ fn refine_candidates<S: AudioSample>(
 /// PoC's manual Pass 2) can re-rank coarse_sync candidates by this
 /// metric without pulling in the full `decode_block` D-pattern.
 #[doc(hidden)]
-pub fn sync_quality_block0(cs: &[[Cmplx<f32>; 8]; 79]) -> u32 {
+pub fn sync_quality_block0<S: crate::core::scalar::SpecScalar>(cs: &[[Cmplx<S>; 8]; 79]) -> u32
+where
+    S::Wide: PartialOrd,
+{
     let mut count = 0u32;
     for (t, &expected) in COSTAS.iter().enumerate() {
         let sym = t; // block 0 starts at symbol 0
         let best = (0..NTONES)
             .max_by(|&a, &b| {
-                cs[sym][a]
-                    .norm_sqr_f32()
-                    .partial_cmp(&cs[sym][b].norm_sqr_f32())
-                    .unwrap_or(core::cmp::Ordering::Equal)
+                let na = cs[sym][a].norm_sqr_wide();
+                let nb = cs[sym][b].norm_sqr_wide();
+                na.partial_cmp(&nb).unwrap_or(core::cmp::Ordering::Equal)
             })
             .unwrap_or(0);
         if best == expected {
