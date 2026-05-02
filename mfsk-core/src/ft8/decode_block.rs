@@ -1335,17 +1335,76 @@ fn refine_candidates<S: AudioSample>(
     cands: Vec<SyncCandidate>,
     max_cand: usize,
 ) -> Vec<RefinedCandidate> {
-    let mut refined: Vec<RefinedCandidate> = cands
+    use alloc::collections::BinaryHeap;
+    use core::cmp::{Ordering, Reverse};
+
+    // Min-heap on q so the smallest survivor is at the top — replace
+    // it whenever a stronger candidate arrives. Bounds the live heap
+    // footprint at `max_cand × cs Box` regardless of PASS1_LIMIT,
+    // which is the heap-fragmentation fix Task #2 was opened for.
+    // Old code collected all PASS1=30 cs Boxes (240 KB) before the
+    // truncate; new code never holds more than max_cand=15 Boxes
+    // (120 KB peak, halving again to 60 KB once `fixed-point-cs`
+    // ships Cmplx<Q14i16>).
+    //
+    // The heap stores (q, cand_idx, RefinedCandidate); cand_idx
+    // breaks ties deterministically (insertion order) so the
+    // truncation result is reproducible across runs.
+    struct Slot {
+        q: u32,
+        idx: u32,
+        cand: SyncCandidate,
+        cs: Box<[[Cmplx<f32>; 8]; 79]>,
+    }
+    impl PartialEq for Slot {
+        fn eq(&self, other: &Self) -> bool {
+            self.q == other.q && self.idx == other.idx
+        }
+    }
+    impl Eq for Slot {}
+    impl Ord for Slot {
+        fn cmp(&self, other: &Self) -> Ordering {
+            self.q.cmp(&other.q).then_with(|| self.idx.cmp(&other.idx))
+        }
+    }
+    impl PartialOrd for Slot {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
+    let mut heap: BinaryHeap<Reverse<Slot>> = BinaryHeap::with_capacity(max_cand + 1);
+    for (idx, c) in cands.into_iter().enumerate() {
+        let cs = symbol_spectra_direct(audio, c.freq_hz, c.dt_sec, SymMask::SyncBlock0);
+        let q = sync_quality_block0(&cs);
+        let slot = Slot {
+            q,
+            idx: idx as u32,
+            cand: c,
+            cs,
+        };
+        if heap.len() < max_cand {
+            heap.push(Reverse(slot));
+        } else if let Some(Reverse(top)) = heap.peek()
+            && slot.q > top.q
+        {
+            heap.pop();
+            heap.push(Reverse(slot));
+            // else branch: drop slot.cs immediately when it leaves scope
+        }
+    }
+    // Drain the heap and sort descending by q. `into_sorted_vec`
+    // sorts ascending then we reverse, so the strongest survivor
+    // ends up first — same order as the old `sort_by_key(Reverse)`.
+    let mut out: Vec<RefinedCandidate> = heap
         .into_iter()
-        .map(|c| {
-            let cs = symbol_spectra_direct(audio, c.freq_hz, c.dt_sec, SymMask::SyncBlock0);
-            let q = sync_quality_block0(&cs);
-            (c, cs, q)
+        .map(|r| {
+            let s = r.0;
+            (s.cand, s.cs, s.q)
         })
         .collect();
-    refined.sort_by_key(|r| core::cmp::Reverse(r.2));
-    refined.truncate(max_cand);
-    refined
+    out.sort_by_key(|r| core::cmp::Reverse(r.2));
+    out
 }
 
 /// Hard-decision sync quality on Costas **block 0 only** (symbols
