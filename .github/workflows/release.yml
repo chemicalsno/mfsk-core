@@ -131,13 +131,19 @@ jobs:
           ldproxy: false
       - uses: Swatinem/rust-cache@v2
       - name: Build static lib for xtensa-esp32-espidf
+        # The +esp toolchain ships rust-src but no precompiled core
+        # for `xtensa-esp32-espidf`; `-Z build-std=core,alloc,panic_abort`
+        # builds the missing crates from source. Mirrors the
+        # m5stack-core2 example's `.cargo/config.toml` `[unstable]
+        # build-std` setting.
         env:
           RUSTFLAGS: "-C panic=abort"
         run: |
-          cargo build -p mfsk-ffi-ft8 --release \
+          cargo +esp build -p mfsk-ffi-ft8 --release \
               --no-default-features \
               --features embedded-fixed-point,embedded-runtime \
-              --target xtensa-esp32-espidf
+              --target xtensa-esp32-espidf \
+              -Z build-std=core,alloc,panic_abort
       - name: Package
         run: |
           set -euo pipefail
@@ -168,13 +174,15 @@ jobs:
           ldproxy: false
       - uses: Swatinem/rust-cache@v2
       - name: Build static lib for xtensa-esp32s3-espidf
+        # See the esp32 job for why `-Z build-std=...` is needed.
         env:
           RUSTFLAGS: "-C panic=abort"
         run: |
-          cargo build -p mfsk-ffi-ft8 --release \
+          cargo +esp build -p mfsk-ffi-ft8 --release \
               --no-default-features \
               --features embedded-fixed-point,embedded-runtime \
-              --target xtensa-esp32s3-espidf
+              --target xtensa-esp32s3-espidf \
+              -Z build-std=core,alloc,panic_abort
       - name: Package
         run: |
           set -euo pipefail
