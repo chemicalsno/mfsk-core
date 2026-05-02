@@ -484,7 +484,112 @@ pub fn llr_f32_to_q11(x: f32) -> i16 {
 /// level (same convergence path on every AWGN seed I've tested),
 /// including the `nrw_odd` extrinsic-sign correction that aligns
 /// with WSJT-X's `tanh ∘ atanh` SumProduct convention.
+/// Reusable working memory for [`bp_decode_generic_nms_with_scratch`].
+///
+/// Owns the seven `Vec` buffers that the NMS hot loop used to allocate
+/// per call (~12 KB for `T = Q11i16`, ~24 KB for `T = f32` on FT8
+/// LDPC(174,91); ~17 KB / ~33 KB on FST4 LDPC(240,101)). One instance
+/// amortises N decode calls — `process_candidates_with` holds a single
+/// pool across all candidates so all 5 BP calls × ~15 survivors / slot
+/// share the same `Vec` backing storage instead of hammering
+/// `tlsf_malloc` (the dominant non-DFT cost on Core2 stage 3).
+///
+/// Generic over the same `P: LdpcParams` + `T: LlrScalar` pair as the
+/// decoder itself, so FT8 LDPC(174,91) and FST4/uvpacket LDPC(240,101)
+/// each get the right capacity. Capacities are sized once in [`new`];
+/// [`reset`] re-establishes the per-decode initial state without
+/// reallocating.
+///
+/// `no_std + alloc` clean — only uses `Vec` + `vec!`.
+///
+/// [`new`]: BpScratch::new
+/// [`reset`]: BpScratch::reset
+pub struct BpScratch<P: LdpcParams, T: LlrScalar> {
+    tov: Vec<T>,
+    toc: Vec<T>,
+    min1: Vec<T>,
+    min2: Vec<T>,
+    idx_min1: Vec<u32>,
+    sign_xor: Vec<bool>,
+    zn: Vec<T::Wide>,
+    cw: Vec<u8>,
+    _p: core::marker::PhantomData<P>,
+}
+
+impl<P: LdpcParams, T: LlrScalar> BpScratch<P, T> {
+    /// Allocate the seven scratch buffers at the right capacities for
+    /// `P`. Single instance can be reused across many BP calls.
+    pub fn new() -> Self {
+        let n = P::N;
+        let m_checks = P::M;
+        let max_row = P::MAX_ROW;
+        Self {
+            tov: vec![T::ZERO; n * NCW],
+            toc: vec![T::ZERO; m_checks * max_row],
+            min1: vec![T::POS_INF_LIKE; m_checks],
+            min2: vec![T::POS_INF_LIKE; m_checks],
+            idx_min1: vec![0u32; m_checks],
+            sign_xor: vec![false; m_checks],
+            zn: vec![T::wide_zero(); n],
+            cw: vec![0u8; n],
+            _p: core::marker::PhantomData,
+        }
+    }
+
+    /// Re-establish the pre-loop state of a fresh allocation. Matches
+    /// the `vec![…; cap]` initialisers of the pre-pool implementation
+    /// byte-for-byte so the inner algorithm's behaviour is unchanged.
+    /// `zn` / `cw` are written unconditionally on every iter so they
+    /// don't need resetting; everything else does.
+    #[inline]
+    fn reset(&mut self) {
+        for v in self.tov.iter_mut() {
+            *v = T::ZERO;
+        }
+        for v in self.toc.iter_mut() {
+            *v = T::ZERO;
+        }
+        for v in self.min1.iter_mut() {
+            *v = T::POS_INF_LIKE;
+        }
+        for v in self.min2.iter_mut() {
+            *v = T::POS_INF_LIKE;
+        }
+        for v in self.idx_min1.iter_mut() {
+            *v = 0;
+        }
+        for v in self.sign_xor.iter_mut() {
+            *v = false;
+        }
+    }
+}
+
+impl<P: LdpcParams, T: LlrScalar> Default for BpScratch<P, T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Allocate-per-call shim over [`bp_decode_generic_nms_with_scratch`]
+/// for callers that don't (yet) thread a [`BpScratch`] through. New
+/// code on the embedded hot path should prefer the `_with_scratch`
+/// variant — see the FT8 stage-3 driver in
+/// `ft8::decode_block::process_candidates_with`.
 pub fn bp_decode_generic_nms<P: LdpcParams, T: LlrScalar>(
+    llr: &[T],
+    ap_mask: Option<&[bool]>,
+    max_iter: u32,
+    verify: Option<fn(&[u8]) -> bool>,
+    alpha: f32,
+) -> Option<BpResult> {
+    let mut scratch = BpScratch::<P, T>::new();
+    bp_decode_generic_nms_with_scratch::<P, T>(&mut scratch, llr, ap_mask, max_iter, verify, alpha)
+}
+
+/// [`bp_decode_generic_nms`] with caller-provided scratch — eliminates
+/// the per-call ~12 KB allocation churn on the BP staircase hot path.
+pub fn bp_decode_generic_nms_with_scratch<P: LdpcParams, T: LlrScalar>(
+    scratch: &mut BpScratch<P, T>,
     llr: &[T],
     ap_mask: Option<&[bool]>,
     max_iter: u32,
@@ -501,14 +606,18 @@ pub fn bp_decode_generic_nms<P: LdpcParams, T: LlrScalar>(
     let k = P::K;
     let max_row = P::MAX_ROW;
 
-    let mut tov = vec![T::ZERO; n * NCW];
-    let mut toc = vec![T::ZERO; m_checks * max_row];
-    let mut min1 = vec![T::POS_INF_LIKE; m_checks];
-    let mut min2 = vec![T::POS_INF_LIKE; m_checks];
-    let mut idx_min1 = vec![0u32; m_checks];
-    let mut sign_xor = vec![false; m_checks];
-    let mut zn = vec![T::wide_zero(); n];
-    let mut cw = vec![0u8; n];
+    scratch.reset();
+    let BpScratch {
+        tov,
+        toc,
+        min1,
+        min2,
+        idx_min1,
+        sign_xor,
+        zn,
+        cw,
+        ..
+    } = scratch;
 
     // Initial messages: each check edge carries the bit's raw LLR.
     for j in 0..m_checks {
@@ -576,10 +685,13 @@ pub fn bp_decode_generic_nms<P: LdpcParams, T: LlrScalar>(
                 }
                 let mut message77 = [0u8; 77];
                 message77.copy_from_slice(&decoded[..77]);
+                // Codeword is small (174 / 240 bytes); clone instead
+                // of moving so the scratch's `cw` Vec stays in the pool
+                // for the next call.
                 return Some(BpResult {
                     message77,
                     info: decoded,
-                    codeword: cw,
+                    codeword: cw.clone(),
                     hard_errors,
                     iterations: iter,
                 });
@@ -693,6 +805,30 @@ pub fn bp_decode_nms<T: LlrScalar>(
 ) -> Option<BpResult> {
     let ap_slice: Option<&[bool]> = ap_mask.map(|a| a.as_slice());
     bp_decode_generic_nms::<Ldpc174_91Params, T>(llr.as_slice(), ap_slice, max_iter, verify, alpha)
+}
+
+/// LDPC(174,91) BP NMS with caller-provided scratch — pool-aware
+/// variant of [`bp_decode_nms`]. Lets the FT8 stage-3 driver instantiate
+/// one [`BpScratch`] per slot and reuse it across all 5 BP calls × ~15
+/// surviving candidates, saving ~900 KB of `tlsf_malloc` traffic per
+/// slot on Core2.
+pub fn bp_decode_nms_with_scratch<T: LlrScalar>(
+    scratch: &mut BpScratch<Ldpc174_91Params, T>,
+    llr: &[T; LDPC_N],
+    ap_mask: Option<&[bool; LDPC_N]>,
+    max_iter: u32,
+    verify: Option<fn(&[u8]) -> bool>,
+    alpha: f32,
+) -> Option<BpResult> {
+    let ap_slice: Option<&[bool]> = ap_mask.map(|a| a.as_slice());
+    bp_decode_generic_nms_with_scratch::<Ldpc174_91Params, T>(
+        scratch,
+        llr.as_slice(),
+        ap_slice,
+        max_iter,
+        verify,
+        alpha,
+    )
 }
 
 /// Backward-compatible Q11 alias — keeps existing callers compiling.

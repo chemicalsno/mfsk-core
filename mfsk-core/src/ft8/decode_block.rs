@@ -1663,6 +1663,13 @@ where
 
     let mut results: Vec<DecodeResult> = Vec::new();
     let q_thr = q_thresh();
+    // BP scratch pool — instantiated once and reused across all
+    // candidates × all 5 BP calls per candidate. Eliminates the
+    // ~12 KB-per-call `tlsf_malloc` traffic that dominated stage-3
+    // non-DFT cost on Core2 (~50–100 ms / qso). See
+    // `mfsk_core::fec::ldpc::bp::BpScratch`.
+    let mut bp_scratch =
+        crate::fec::ldpc::bp::BpScratch::<crate::fec::ldpc::params::Ldpc174_91Params, LlrT>::new();
     for (cand, mut cs, _q_block0) in cands {
         // Two-step fill: sync blocks first, gate by full sync_quality,
         // then fill data symbols only for survivors. Saves the 58 ×
@@ -1697,7 +1704,8 @@ where
         // Both go through the *same* generic NMS implementation —
         // bit-identical AWGN behaviour by design.
         let llr_a_fast: super::llr::LlrSet<LlrT> = super::llr::compute_llr_fast(&cs);
-        let bp_step1 = crate::fec::ldpc::bp::bp_decode_nms::<LlrT>(
+        let bp_step1 = crate::fec::ldpc::bp::bp_decode_nms_with_scratch::<LlrT>(
+            &mut bp_scratch,
             &llr_a_fast.llra,
             None,
             BP_MAX_ITER,
@@ -1720,7 +1728,8 @@ where
                 (&llr_full.llrc, 2),
                 (&llr_full.llrd, 3),
             ] {
-                let bp_step2 = crate::fec::ldpc::bp::bp_decode_nms::<LlrT>(
+                let bp_step2 = crate::fec::ldpc::bp::bp_decode_nms_with_scratch::<LlrT>(
+                    &mut bp_scratch,
                     llr,
                     None,
                     BP_MAX_ITER,
