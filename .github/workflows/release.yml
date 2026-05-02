@@ -40,44 +40,30 @@ jobs:
             exit 1
           fi
 
-      # The tag version must match every published crate's
-      # `version =`. Both `mfsk-core` and `mfsk-ffi-ft8` follow the
-      # workspace tag — bumping needs to land in both Cargo.toml
-      # files atomically.
-      - name: Check tag matches Cargo.toml versions
+      # The tag version must match `mfsk-core/Cargo.toml`, the only
+      # published crate. mfsk-ffi-ft8's version is bumped in lockstep
+      # for binary-tarball naming consistency, but the workflow only
+      # needs to gate on the publishable one.
+      - name: Check tag matches Cargo.toml version
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF#refs/tags/v}"
-          for f in mfsk-core/Cargo.toml mfsk-ffi-ft8/Cargo.toml; do
-            V=$(awk -F'"' '/^version[[:space:]]*=/ { print $2; exit }' "$f")
-            if [ "$TAG" != "$V" ]; then
-              echo "::error::Tag v$TAG does not match $f version $V"
-              exit 1
-            fi
-          done
+          V=$(awk -F'"' '/^version[[:space:]]*=/ { print $2; exit }' mfsk-core/Cargo.toml)
+          if [ "$TAG" != "$V" ]; then
+            echo "::error::Tag v$TAG does not match mfsk-core/Cargo.toml version $V"
+            exit 1
+          fi
 
       - name: Publish mfsk-core to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        # Mirrors ci.yml's publish-dry-run: --features full so the
-        # in-package verification compile exercises every protocol.
+        # mfsk-core is the only crate we publish to crates.io.
+        # `mfsk-ffi` and `mfsk-ffi-ft8` both `publish = false` —
+        # they are binary deliverables (the cbindgen-generated `.h`
+        # + the staticlib), distributed via the GitHub release
+        # tarballs attached below. Keeps the crates.io index
+        # focused on the actual library consumers depend on.
         run: cargo publish -p mfsk-core --features full
-
-      # crates.io needs a moment to index the new mfsk-core version
-      # before mfsk-ffi-ft8's `version = "0.5.x"` dep resolves on
-      # the verification compile. ~45 s is conservative.
-      - name: Wait for crates.io index
-        run: sleep 45
-
-      - name: Publish mfsk-ffi-ft8 to crates.io
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        # Default features (host) — pulls rustfft so the in-package
-        # verification compile exercises the actual host link path
-        # users get with `cargo add mfsk-ffi-ft8`. The prebuilt
-        # binaries attached below cover users who don't want to
-        # cross-compile.
-        run: cargo publish -p mfsk-ffi-ft8
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
