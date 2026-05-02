@@ -223,6 +223,148 @@ impl LlrScalar for Q11i16 {
     }
 }
 
+// ──────────────────────────────────────────────────────────────────────────
+// Spec scalar — for cs (complex symbol spectra) entries
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Scalar trait for complex symbol-spectra (cs) entries: `f32` and
+/// [`Q14i16`] both implement it. Separated from [`LlrScalar`] because
+/// the Q-format (Q14 vs Q11) and the operations needed (norm² for
+/// sync_quality / LLR, conversion to f32 for SNR estimation) differ.
+///
+/// The DFT (`symbol_spectra_direct_into` on the fixed-point path)
+/// natively produces i16 Q15-ish output; `Q14i16` is one bit
+/// narrower to give the squared sum (norm²) a 1-bit headroom in
+/// i32 even when both re and im saturate.
+pub trait SpecScalar: Copy + Default + core::fmt::Debug {
+    /// Wide accumulator for `re² + im²` and other squared sums —
+    /// `f32` for `f32`, `i32` for [`Q14i16`].
+    type Wide: Copy + Default + core::fmt::Debug;
+
+    /// Lossless promotion to f32 (`× 2^-14` for [`Q14i16`]).
+    fn to_f32(self) -> f32;
+    /// Saturating cast from f32 (rounds in the natural direction).
+    fn from_f32(x: f32) -> Self;
+
+    /// `re² + im²` in the wide type. For `f32` this is just
+    /// `re*re + im*im`; for `Q14i16` it's `(re as i32)² + (im as i32)²`.
+    fn norm_sqr_wide(re: Self, im: Self) -> Self::Wide;
+    /// Wide → f32 (used by SNR / debug paths that accept some
+    /// precision loss in exchange for downstream f32 maths).
+    fn wide_to_f32(w: Self::Wide) -> f32;
+}
+
+impl SpecScalar for f32 {
+    type Wide = f32;
+    #[inline]
+    fn to_f32(self) -> f32 {
+        self
+    }
+    #[inline]
+    fn from_f32(x: f32) -> Self {
+        x
+    }
+    #[inline]
+    fn norm_sqr_wide(re: Self, im: Self) -> Self::Wide {
+        re * re + im * im
+    }
+    #[inline]
+    fn wide_to_f32(w: Self::Wide) -> f32 {
+        w
+    }
+}
+
+/// Complex spectrum value Q14: inner i16 = `value × 2^14`, range
+/// ±2 at 1/16384 resolution. The DFT inner loop on Core2 outputs
+/// roughly i16 Q15; one bit headroom (Q14) keeps `re² + im²` in
+/// i32 even when both components saturate.
+#[derive(Copy, Clone, Default, Debug, PartialEq, Eq)]
+pub struct Q14i16(pub i16);
+
+const Q14_FRAC: u32 = 14;
+const Q14_ONE: i32 = 1 << Q14_FRAC; // 16384
+
+impl SpecScalar for Q14i16 {
+    type Wide = i32;
+    #[inline]
+    fn to_f32(self) -> f32 {
+        (self.0 as f32) / (Q14_ONE as f32)
+    }
+    #[inline]
+    fn from_f32(x: f32) -> Self {
+        let v = (x * Q14_ONE as f32) as i32;
+        Q14i16(v.clamp(i16::MIN as i32, i16::MAX as i32) as i16)
+    }
+    #[inline]
+    fn norm_sqr_wide(re: Self, im: Self) -> Self::Wide {
+        let r = re.0 as i32;
+        let i = im.0 as i32;
+        r * r + i * i
+    }
+    #[inline]
+    fn wide_to_f32(w: Self::Wide) -> f32 {
+        // The wide is `re*re + im*im` in raw Q14² units (i.e.
+        // (value × 2^14)² = value² × 2^28). Convert back by dividing
+        // by 2^28 to get the true |z|².
+        (w as f32) / ((Q14_ONE as f32) * (Q14_ONE as f32))
+    }
+}
+
+/// Complex sample with both components in scalar type `S`. Replaces
+/// `num_complex::Complex<f32>` for the embedded path's cs spectra
+/// once Phase 2 of the i16 migration lands; for now (Phase 2 step
+/// 1) this type is defined but call sites still use `Complex<f32>`.
+///
+/// Field order matches `num_complex::Complex` so a `Cmplx<f32>` is
+/// layout-compatible with `Complex<f32>` (`#[repr(C)]` on both).
+#[repr(C)]
+#[derive(Copy, Clone, Default, Debug, PartialEq, Eq)]
+pub struct Cmplx<S: SpecScalar> {
+    pub re: S,
+    pub im: S,
+}
+
+impl<S: SpecScalar> Cmplx<S> {
+    #[inline]
+    pub const fn new(re: S, im: S) -> Self {
+        Self { re, im }
+    }
+
+    /// `|z|²` in the wide accumulator type. For `f32` this returns
+    /// `f32`; for `Q14i16` it returns `i32` raw — divide by `2^28`
+    /// to recover the f32 magnitude squared (see
+    /// [`SpecScalar::wide_to_f32`]).
+    #[inline]
+    pub fn norm_sqr_wide(self) -> S::Wide {
+        S::norm_sqr_wide(self.re, self.im)
+    }
+
+    /// `|z|²` as `f32` (lossy for `Q14i16`, but the SNR / sync_quality
+    /// paths only need an ordering-correct float).
+    #[inline]
+    pub fn norm_sqr_f32(self) -> f32 {
+        S::wide_to_f32(self.norm_sqr_wide())
+    }
+
+    /// `|z|` as `f32`. Convenience for places that already use
+    /// `Complex::norm()`.
+    #[inline]
+    pub fn norm_f32(self) -> f32 {
+        // Compute via the wide product so f32 quantisation noise on
+        // small magnitudes doesn't compound.
+        let n2 = self.norm_sqr_f32();
+        #[cfg(feature = "std")]
+        {
+            n2.sqrt()
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            use num_traits::Float;
+            n2.sqrt()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,5 +407,40 @@ mod tests {
     #[test]
     fn f32_mul_alpha_unchanged() {
         assert!((8.0_f32.mul_alpha(0.75) - 6.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn q14_round_trip() {
+        for f in [-1.5, -0.001, 0.0, 0.001, 1.5] {
+            let q = Q14i16::from_f32(f);
+            let back = q.to_f32();
+            assert!(
+                (f - back).abs() < 1.0 / Q14_ONE as f32 + 1e-6,
+                "f={f} back={back}"
+            );
+        }
+    }
+
+    #[test]
+    fn cmplx_q14_norm_matches_f32() {
+        let cf = Cmplx::<f32>::new(0.6, 0.8); // |z|² = 1.0
+        let cq = Cmplx::<Q14i16>::new(Q14i16::from_f32(0.6), Q14i16::from_f32(0.8));
+        assert!((cf.norm_sqr_f32() - 1.0).abs() < 1e-6);
+        assert!((cq.norm_sqr_f32() - 1.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn cmplx_layout_compat_with_num_complex() {
+        // sanity: Cmplx<f32> must be layout-compatible with
+        // num_complex::Complex<f32> for the future zero-copy bridge.
+        // `#[repr(C)]` on both + same field order does the trick.
+        assert_eq!(
+            core::mem::size_of::<Cmplx<f32>>(),
+            core::mem::size_of::<num_complex::Complex<f32>>()
+        );
+        assert_eq!(
+            core::mem::align_of::<Cmplx<f32>>(),
+            core::mem::align_of::<num_complex::Complex<f32>>()
+        );
     }
 }
