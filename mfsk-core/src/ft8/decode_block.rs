@@ -33,7 +33,7 @@ use super::params::{BP_MAX_ITER, COSTAS, COSTAS_POS, LDPC_N, NMAX, NN, NSPS, NTO
 use super::wave_gen::message_to_tones;
 #[cfg(not(feature = "fixed-point"))]
 use crate::core::fft::default_planner;
-use crate::core::scalar::{Cmplx, cmplx_f32_2d_as_complex_mut};
+use crate::core::scalar::Cmplx;
 use crate::core::sync::SyncCandidate;
 use crate::fec::ldpc::bp::check_crc14;
 use crate::fec::ldpc::osd::{osd_decode, osd_decode_deep};
@@ -877,6 +877,8 @@ fn sym_in_mask(sym: usize, mask: SymMask) -> bool {
 }
 
 /// **Pub for benchmarking only — do not depend on it.**
+///
+/// f32 wrapper around the generic [`fill_symbol_spectra_generic`].
 #[doc(hidden)]
 #[cfg(not(feature = "fixed-point"))]
 pub fn fill_symbol_spectra<S: AudioSample>(
@@ -886,15 +888,30 @@ pub fn fill_symbol_spectra<S: AudioSample>(
     dt_sec: f32,
     mask: SymMask,
 ) {
-    // Reuse the existing `Complex<f32>` rotator inner loops by
-    // viewing the layout-compat Cmplx<f32> storage as Complex<f32>.
-    let out: &mut [[Complex<f32>; 8]; 79] = cmplx_f32_2d_as_complex_mut(out);
+    fill_symbol_spectra_generic::<f32, S>(out, audio, freq_hz, dt_sec, mask);
+}
+
+/// Generic per-symbol DFT — writes `Cmplx<Sc>` for any spec scalar
+/// `Sc: SpecScalar`. For `Sc = f32` (`NEEDS_AUTOGAIN = false`) the
+/// inner loop writes f32 components directly — byte-identical to the
+/// pre-Phase-2.6 implementation. For fixed-point `Sc` (`NEEDS_AUTOGAIN
+/// = true`) the function runs a 2-pass scan-and-scale: compute all
+/// 79 × 8 Complex<f32> entries into a stack tmp buffer (~5 KB), find
+/// the peak |re|/|im| across the active mask, then write
+/// `Sc::from_f32_scaled(value, scale)` with `scale = i16::MAX × 0.95
+/// / peak` so the i16 range is fully utilised without saturation.
+#[doc(hidden)]
+#[cfg(not(feature = "fixed-point"))]
+pub fn fill_symbol_spectra_generic<Sc: crate::core::scalar::SpecScalar, S: AudioSample>(
+    out: &mut [[Cmplx<Sc>; 8]; 79],
+    audio: &[S],
+    freq_hz: f32,
+    dt_sec: f32,
+    mask: SymMask,
+) {
     let i0 = ((TX_START_OFFSET_S + dt_sec) * SAMPLE_RATE_HZ).round() as i64;
     let two_pi_over_fs = core::f32::consts::TAU / SAMPLE_RATE_HZ;
 
-    // Per-tone rotators precomputed once per candidate (8 cos/sin calls
-    // total — vs 8 × 79 = 632 per candidate if recomputed inside the
-    // loop).
     let mut rotators = [Complex::new(0.0f32, 0.0); NTONES];
     for tone in 0..NTONES {
         let tone_freq = freq_hz + tone as f32 * TONE_SPACING_HZ;
@@ -902,16 +919,51 @@ pub fn fill_symbol_spectra<S: AudioSample>(
         rotators[tone] = Complex::new(dphi.cos(), dphi.sin());
     }
 
-    // Stack buffer: one symbol of audio cast to f32. Internal-RAM
-    // resident — 1920 × 4 = 7.7 KB, fits the default main-task stack.
     let mut sym_buf = [0.0f32; NSPS];
 
+    if !Sc::NEEDS_AUTOGAIN {
+        // Sc = f32: inline write via `Sc::from_f32` (no-op for f32).
+        // Const dispatch — LLVM eliminates the `else` branch when
+        // monomorphised for `Sc = f32`.
+        for sym in 0..NN {
+            if !sym_in_mask(sym, mask) {
+                continue;
+            }
+            let sym_start = i0 + (sym as i64) * (NSPS as i64);
+            for k in 0..NSPS {
+                let idx = sym_start + k as i64;
+                sym_buf[k] = if idx >= 0 && (idx as usize) < audio.len() {
+                    audio[idx as usize].to_f32()
+                } else {
+                    0.0
+                };
+            }
+            for tone in 0..NTONES {
+                let rotator = rotators[tone];
+                let mut osc = Complex::new(1.0f32, 0.0);
+                let mut acc = Complex::new(0.0f32, 0.0);
+                for &s in sym_buf.iter() {
+                    acc.re += s * osc.re;
+                    acc.im += s * osc.im;
+                    osc *= rotator;
+                }
+                out[sym][tone] = Cmplx {
+                    re: Sc::from_f32(acc.re),
+                    im: Sc::from_f32(acc.im),
+                };
+            }
+        }
+        return;
+    }
+
+    // Fixed-point path: 2-pass with auto-gain.
+    let mut tmp = [[Complex::new(0.0f32, 0.0); 8]; 79];
+    let mut peak: f32 = 0.0;
     for sym in 0..NN {
         if !sym_in_mask(sym, mask) {
             continue;
         }
         let sym_start = i0 + (sym as i64) * (NSPS as i64);
-        // ── PSRAM → internal SRAM copy, once per symbol ──
         for k in 0..NSPS {
             let idx = sym_start + k as i64;
             sym_buf[k] = if idx >= 0 && (idx as usize) < audio.len() {
@@ -920,7 +972,6 @@ pub fn fill_symbol_spectra<S: AudioSample>(
                 0.0
             };
         }
-        // ── 8 tone integrations on the in-cache buffer ──
         for tone in 0..NTONES {
             let rotator = rotators[tone];
             let mut osc = Complex::new(1.0f32, 0.0);
@@ -930,7 +981,25 @@ pub fn fill_symbol_spectra<S: AudioSample>(
                 acc.im += s * osc.im;
                 osc *= rotator;
             }
-            out[sym][tone] = acc;
+            tmp[sym][tone] = acc;
+            peak = peak.max(acc.re.abs()).max(acc.im.abs());
+        }
+    }
+    let scale = if peak > 1e-9 {
+        (i16::MAX as f32 * 0.95) / peak
+    } else {
+        0.0
+    };
+    for sym in 0..NN {
+        if !sym_in_mask(sym, mask) {
+            continue;
+        }
+        for tone in 0..NTONES {
+            let c = tmp[sym][tone];
+            out[sym][tone] = Cmplx {
+                re: Sc::from_f32_scaled(c.re, scale),
+                im: Sc::from_f32_scaled(c.im, scale),
+            };
         }
     }
 }
@@ -960,9 +1029,23 @@ pub fn fill_symbol_spectra<S: AudioSample>(
     dt_sec: f32,
     mask: SymMask,
 ) {
+    fill_symbol_spectra_generic::<f32, S>(out, audio, freq_hz, dt_sec, mask);
+}
+
+/// Generic fixed-point fill — writes `Cmplx<Sc>`. f32 wrapper above;
+/// Q14i16 path used under `fixed-point-cs`.
+#[doc(hidden)]
+#[cfg(feature = "fixed-point")]
+pub fn fill_symbol_spectra_generic<Sc: crate::core::scalar::SpecScalar, S: AudioSample>(
+    out: &mut [[Cmplx<Sc>; 8]; 79],
+    audio: &[S],
+    freq_hz: f32,
+    dt_sec: f32,
+    mask: SymMask,
+) {
     let mut basis_re: Vec<i16> = alloc::vec![0i16; BASIS_SCRATCH_LEN];
     let mut basis_im: Vec<i16> = alloc::vec![0i16; BASIS_SCRATCH_LEN];
-    fill_symbol_spectra_into(
+    fill_symbol_spectra_into_generic::<Sc, S>(
         out,
         audio,
         freq_hz,
@@ -1009,8 +1092,26 @@ pub fn fill_symbol_spectra_into<S: AudioSample>(
     basis_re: &mut [i16],
     basis_im: &mut [i16],
 ) {
+    fill_symbol_spectra_into_generic::<f32, S>(
+        out, audio, freq_hz, dt_sec, mask, basis_re, basis_im,
+    );
+}
+
+/// Generic version of [`fill_symbol_spectra_into`] — writes
+/// `Cmplx<Sc>` for any spec scalar. f32 wrapper above; Q14i16 path
+/// used under `fixed-point-cs`.
+#[doc(hidden)]
+#[cfg(feature = "fixed-point")]
+pub fn fill_symbol_spectra_into_generic<Sc: crate::core::scalar::SpecScalar, S: AudioSample>(
+    out: &mut [[Cmplx<Sc>; 8]; 79],
+    audio: &[S],
+    freq_hz: f32,
+    dt_sec: f32,
+    mask: SymMask,
+    basis_re: &mut [i16],
+    basis_im: &mut [i16],
+) {
     use crate::core::dotprod::dot_q15_i32;
-    let out: &mut [[Complex<f32>; 8]; 79] = cmplx_f32_2d_as_complex_mut(out);
     debug_assert!(basis_re.len() >= BASIS_SCRATCH_LEN);
     debug_assert!(basis_im.len() >= BASIS_SCRATCH_LEN);
     let i0 = ((TX_START_OFFSET_S + dt_sec) * SAMPLE_RATE_HZ).round() as i64;
@@ -1039,6 +1140,18 @@ pub fn fill_symbol_spectra_into<S: AudioSample>(
     let mut sym_buf = [0i16; NSPS];
 
     // ── Phase 2: per-symbol dot products (audio × basis).
+    //
+    // For `Sc = f32` (no autogain) we write each cell straight into
+    // `out` via `Sc::from_f32` (no-op cast). For fixed-point types
+    // we collect i32 accumulators into a stack tmp buffer
+    // (~40 KB i32×8×79×2), find the peak, and write
+    // `Sc::from_f32_scaled(acc as f32, scale)` so the i16 output
+    // range is fully utilised. The scratch is a stack array — fits
+    // the 32 KB Core2 main task stack with the existing 16 KB used
+    // by basis scratch references and the spec.
+    let mut tmp_re = [[0i32; 8]; 79];
+    let mut tmp_im = [[0i32; 8]; 79];
+    let mut peak: i32 = 0;
     for sym in 0..NN {
         if !sym_in_mask(sym, mask) {
             continue;
@@ -1058,7 +1171,41 @@ pub fn fill_symbol_spectra_into<S: AudioSample>(
             let basis_im_tone = &basis_im[base..base + NSPS];
             let acc_re = dot_q15_i32(&sym_buf, basis_re_tone);
             let acc_im = dot_q15_i32(&sym_buf, basis_im_tone);
-            out[sym][tone] = Complex::new(acc_re as f32, acc_im as f32);
+            if !Sc::NEEDS_AUTOGAIN {
+                // f32 fast path — direct write, identical to the
+                // pre-2.6 cast.
+                out[sym][tone] = Cmplx {
+                    re: Sc::from_f32(acc_re as f32),
+                    im: Sc::from_f32(acc_im as f32),
+                };
+            } else {
+                tmp_re[sym][tone] = acc_re;
+                tmp_im[sym][tone] = acc_im;
+                peak = peak.max(acc_re.unsigned_abs() as i32);
+                peak = peak.max(acc_im.unsigned_abs() as i32);
+            }
+        }
+    }
+
+    // 2-pass auto-gain: scale i32 accumulators into i16 range,
+    // saturating safe, peak ≈ 95 % of i16::MAX. Skipped on the f32
+    // fast path (`out` is already populated above).
+    if Sc::NEEDS_AUTOGAIN {
+        let scale = if peak > 0 {
+            (i16::MAX as f32 * 0.95) / peak as f32
+        } else {
+            0.0
+        };
+        for sym in 0..NN {
+            if !sym_in_mask(sym, mask) {
+                continue;
+            }
+            for tone in 0..NTONES {
+                out[sym][tone] = Cmplx {
+                    re: Sc::from_f32_scaled(tmp_re[sym][tone] as f32, scale),
+                    im: Sc::from_f32_scaled(tmp_im[sym][tone] as f32, scale),
+                };
+            }
         }
     }
 }
@@ -1442,5 +1589,49 @@ mod tests {
             "decode_block should recover clean CQ; got {} results",
             results.len()
         );
+    }
+
+    /// Fill a clean CQ signal with `Sc = Q14i16` cs storage and
+    /// verify the autogain produces non-saturated output that the
+    /// generic `sync_quality_block0` recognises as a Costas hit.
+    /// Exercises the Phase 2.6 fill / autogain path end-to-end.
+    #[test]
+    fn fill_q14i16_autogain_recovers_costas() {
+        use crate::core::scalar::Q14i16;
+        let msg = pack_cq();
+        let audio = synth_clean(&msg, 1500.0);
+
+        let mut cs_q14: alloc::boxed::Box<[[Cmplx<Q14i16>; 8]; 79]> =
+            alloc::vec![[Cmplx::<Q14i16>::default(); 8]; 79]
+                .try_into()
+                .unwrap();
+        // Use the host f32 fill on the f32 path; under fixed-point
+        // the i16 fill (with autogain) is exercised. Both must yield
+        // a Costas-perfect block 0 sync_quality.
+        #[cfg(not(feature = "fixed-point"))]
+        fill_symbol_spectra_generic::<Q14i16, i16>(
+            &mut cs_q14,
+            &audio,
+            1500.0,
+            0.0,
+            SymMask::SyncBlock0,
+        );
+        #[cfg(feature = "fixed-point")]
+        fill_symbol_spectra_generic::<Q14i16, i16>(
+            &mut cs_q14,
+            &audio,
+            1500.0,
+            0.0,
+            SymMask::SyncBlock0,
+        );
+
+        // Spot-check: non-zero entries (autogain didn't kill the signal).
+        let nonzero = cs_q14.iter().flatten().any(|c| c.re.0 != 0 || c.im.0 != 0);
+        assert!(nonzero, "Q14 autogain produced all-zero cs");
+
+        // sync_quality_block0 generic with S=Q14i16 should recognise
+        // the Costas pattern at full strength on a clean signal.
+        let q = sync_quality_block0(&cs_q14);
+        assert_eq!(q, 7, "expected perfect Costas block-0 hit, got q={q}");
     }
 }

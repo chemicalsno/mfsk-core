@@ -245,6 +245,17 @@ pub trait SpecScalar: Copy + Default + core::fmt::Debug {
     fn to_f32(self) -> f32;
     /// Saturating cast from f32 (rounds in the natural direction).
     fn from_f32(x: f32) -> Self;
+    /// Saturating cast from f32 with a pre-applied scale factor.
+    /// `f32` ignores `scale` (no-op for the host path); fixed-point
+    /// types compute `(x * scale)` and saturate to their range.
+    /// Used by `fill_symbol_spectra` to apply a per-cs auto-gain.
+    fn from_f32_scaled(x: f32, scale: f32) -> Self;
+    /// Whether this scalar requires a peak-scan auto-gain pass before
+    /// writing. `f32` returns `false` (one-pass, bit-identical to
+    /// the pre-Phase-2.6 implementation); fixed-point types return
+    /// `true` so `fill_symbol_spectra_generic` knows to scan and
+    /// scale.
+    const NEEDS_AUTOGAIN: bool;
 
     /// `re² + im²` in the wide type. For `f32` this is just
     /// `re*re + im*im`; for `Q14i16` it's `(re as i32)² + (im as i32)²`.
@@ -256,12 +267,19 @@ pub trait SpecScalar: Copy + Default + core::fmt::Debug {
 
 impl SpecScalar for f32 {
     type Wide = f32;
+    const NEEDS_AUTOGAIN: bool = false;
     #[inline]
     fn to_f32(self) -> f32 {
         self
     }
     #[inline]
     fn from_f32(x: f32) -> Self {
+        x
+    }
+    #[inline]
+    fn from_f32_scaled(x: f32, _scale: f32) -> Self {
+        // f32 path: scale is ignored (the auto-gain dispatch via
+        // `NEEDS_AUTOGAIN = false` skips the scan entirely).
         x
     }
     #[inline]
@@ -286,6 +304,7 @@ const Q14_ONE: i32 = 1 << Q14_FRAC; // 16384
 
 impl SpecScalar for Q14i16 {
     type Wide = i32;
+    const NEEDS_AUTOGAIN: bool = true;
     #[inline]
     fn to_f32(self) -> f32 {
         (self.0 as f32) / (Q14_ONE as f32)
@@ -293,6 +312,14 @@ impl SpecScalar for Q14i16 {
     #[inline]
     fn from_f32(x: f32) -> Self {
         let v = (x * Q14_ONE as f32) as i32;
+        Q14i16(v.clamp(i16::MIN as i32, i16::MAX as i32) as i16)
+    }
+    #[inline]
+    fn from_f32_scaled(x: f32, scale: f32) -> Self {
+        // Apply caller-supplied auto-gain scale; saturate to i16.
+        // The `scale` brings raw cs magnitudes (typically 1e4-1e8)
+        // into ±i16 range so relative magnitudes are preserved.
+        let v = (x * scale) as i32;
         Q14i16(v.clamp(i16::MIN as i32, i16::MAX as i32) as i16)
     }
     #[inline]
