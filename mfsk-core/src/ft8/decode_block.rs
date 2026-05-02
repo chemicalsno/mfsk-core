@@ -171,6 +171,29 @@ fn sync_lag_s() -> f32 {
 /// Same NMS α as the bench-tuned default in `mfsk-core/src/fec/ldpc/bp.rs`.
 const NMS_ALPHA: f32 = 0.75;
 
+/// `process_candidates` early-rejects cands whose full-21-symbol
+/// `sync_quality` is at or below this threshold — they almost never
+/// decode and their BP attempts are pure waste. Host real-QSO sweep
+/// (fp i16, BpAll) showed q ∈ {6, 12} give identical 13/18 truth
+/// recall but q=12 cuts stage 3 ~12-21 % wall-clock by skipping the
+/// `compute_llr` (full nsym=3) + 4-variant BP staircase on dead-end
+/// candidates. q ≥ 14 starts losing borderline weak signals
+/// (W1DIG -14 dB, etc.) — the W1DIG-style "e=15" full-LLR-fallback
+/// decodes have q in the 12-13 range. Override per-call via
+/// `MFSK_Q_THRESH` when std is enabled.
+const Q_THRESH_DEFAULT: u32 = 12;
+fn q_thresh() -> u32 {
+    #[cfg(feature = "std")]
+    {
+        if let Ok(s) = std::env::var("MFSK_Q_THRESH")
+            && let Ok(v) = s.parse::<u32>()
+        {
+            return v;
+        }
+    }
+    Q_THRESH_DEFAULT
+}
+
 // ── Spectrogram ─────────────────────────────────────────────────────────────
 
 /// Spectrogram cell type. f32 (4 bytes) by default; u16 (2 bytes)
@@ -1216,6 +1239,7 @@ pub fn process_candidates<S: AudioSample>(
     // dt is already parabolically refined by coarse_sync; no grid here.
 
     let mut results: Vec<DecodeResult> = Vec::new();
+    let q_thr = q_thresh();
     for (cand, mut cs, _q_block0) in cands {
         // Fill the remaining 72 symbols (Costas blocks 1, 2 + all 58
         // data symbols). Pass 2 only filled block 0 — `q_block0` is
@@ -1228,7 +1252,7 @@ pub fn process_candidates<S: AudioSample>(
             SymMask::NotBlock0,
         );
         let q = sync_quality(&cs);
-        if q <= 6 {
+        if q <= q_thr {
             continue;
         }
         let refined_dt = cand.dt_sec;
