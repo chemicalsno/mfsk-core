@@ -5,6 +5,14 @@ exposes the WSJT-family decoders and synthesisers to C, C++, and JNI
 (Android) consumers. Not published to crates.io — consumers clone this
 repo and link against the local `cdylib` / `staticlib`.
 
+> **Embedded (no_std + alloc) targets — ESP32-S3, RP2350, Cortex-M:**
+> use the sibling [`mfsk-ffi-ft8`](../mfsk-ffi-ft8/) crate instead.
+> It exposes the FT8 decode + transmit slice with the fixed-point
+> hot path enabled, distributed as prebuilt static libraries on the
+> [GitHub Releases](https://github.com/jl1nie/mfsk-core/releases) page
+> (linux-x86_64 / esp32-xtensa / esp32s3-xtensa). `mfsk-ffi` (this
+> crate) is the host-only superset covering all seven WSJT modes.
+
 ## Build
 
 ```

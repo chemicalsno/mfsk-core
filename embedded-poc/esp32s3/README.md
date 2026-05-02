@@ -1,7 +1,14 @@
 # `mfsk-core` ESP32-S3 PoC
 
-Proof-of-concept binary that exercises `mfsk-core`'s embedded port
-(`embedded` branch) on real ESP32-S3 hardware.
+Minimal benchmark binary that exercises `mfsk-core`'s `FftPlanner`
+trait + caller-buffer FT4 synth on real ESP32-S3 hardware via the
+[`esp-dsp`](https://github.com/espressif/esp-dsp) ASM FFT.
+
+This is the **synth + FFT round-trip** PoC. For end-to-end
+**FT8 decode-on-hardware** measurements, see the sibling
+[`embedded-poc/m5stack-core2/`](../m5stack-core2/) — that's the
+active reference platform driving the fixed-point hot path
+(`decode_block` on Xtensa LX6).
 
 This is **not** a separate crate — it lives under
 `mfsk-core/embedded-poc/esp32s3/` and is excluded from the host
