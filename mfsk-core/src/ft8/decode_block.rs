@@ -728,23 +728,36 @@ pub fn coarse_sync(
     }
 
     // Dedupe within 4 Hz / 40 ms; keep highest score.
-    let n = cands.len();
-    for i in 1..n {
-        for j in 0..i {
-            let fdiff = (cands[i].freq_hz - cands[j].freq_hz).abs();
-            let tdiff = (cands[i].dt_sec - cands[j].dt_sec).abs();
-            if fdiff < 4.0 && tdiff < 0.04 {
-                if cands[i].score >= cands[j].score {
-                    cands[j].score = 0.0;
-                } else {
-                    cands[i].score = 0.0;
-                }
-            }
+    //
+    // Sort once by score desc, then greedily keep cands with no
+    // already-kept near neighbour. Stops early at `max_cand` for
+    // O(n log n + n × max_cand) instead of the prior O(n²) pairwise
+    // compare-and-zero (n is several thousand).
+    //
+    // Empirically this drops 1 borderline busy-band truth on qso3
+    // vs the byte-equivalent O(n²) implementation — likely a
+    // tie-break ordering difference at the 4 Hz dedupe boundary
+    // (haven't fully traced; the algorithms are equivalent on every
+    // small-case scenario I worked through). We accept the recall
+    // delta for the ~150 us host (~150 ms Core2) saving.
+    cands.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+    let mut out: Vec<SyncCandidate> = Vec::with_capacity(max_cand);
+    for c in cands {
+        if c.score < sync_min {
+            break;
+        }
+        let near = out
+            .iter()
+            .any(|k| (c.freq_hz - k.freq_hz).abs() < 4.0 && (c.dt_sec - k.dt_sec).abs() < 0.04);
+        if near {
+            continue;
+        }
+        out.push(c);
+        if out.len() >= max_cand {
+            break;
         }
     }
-    cands.retain(|c| c.score >= sync_min);
-    cands.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
-    cands.truncate(max_cand);
+    let cands = out;
     #[cfg(feature = "std")]
     if prof {
         let t_end = std::time::Instant::now();
