@@ -89,12 +89,18 @@ mod tests {
 
     #[test]
     fn dot_q15_anti_phase() {
-        // a · (-a) Q15-normalised
+        // a · (-a) Q15-normalised. The per-term `>>15` is an
+        // arithmetic shift right (floor toward −∞); for non-divisible
+        // products this rounds positive products toward 0 and negative
+        // products away from 0, so `pos + neg` can differ by up to
+        // 1 per term (≈ a.len()) without indicating a real bug.
         let a: alloc::vec::Vec<i16> = (0..1000).map(|k| (k * 30).clamp(0, 30000) as i16).collect();
         let neg_a: alloc::vec::Vec<i16> = a.iter().map(|&x| -x).collect();
         let pos = dot_q15_i32(&a, &a);
         let neg = dot_q15_i32(&a, &neg_a);
-        assert_eq!(pos, -neg);
+        let n = a.len() as i32;
+        let drift = (pos + neg).abs();
+        assert!(drift <= n, "pos={pos} neg={neg} drift={drift} (max {n})");
         assert!(pos > 0);
     }
 }

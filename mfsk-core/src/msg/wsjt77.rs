@@ -690,22 +690,21 @@ fn is_known_letter_digit_prefix(prefix: &[u8]) -> bool {
 /// Stricter callsign validator than [`is_valid_callsign`] — gates the
 /// CRC-14 false-positive filter in the FT8 block decoder.
 ///
-/// The structural validator [`is_base_callsign`] accepts any
-/// alphanumeric prefix that has at least one letter, including
+/// The internal structural validator (`is_base_callsign`) accepts
+/// any alphanumeric prefix that has at least one letter, including
 /// letter+digit pairs the ITU never allocates for amateur use
 /// (e.g. `Z7`, `Q4`). Random codewords passing CRC-14 land in those
 /// gaps disproportionately often (`Z74QTJ/R`, `Q1FOO` — observed in
 /// the qso3 busy-band block-decode path before this filter).
 ///
 /// Compared to [`is_valid_callsign`]:
-/// - Accepts standard callsigns (`is_standard_callsign`) and
+/// - Accepts standard callsigns ([`is_standard_callsign`]) and
 ///   letter+letter / digit+letter prefix base callsigns unchanged
 ///   (~all ITU 2-char allocations are letter+letter blocks).
 /// - **Letter+digit 2-char prefixes** (the gap-prone case) must
-///   appear in [`VALID_LETTER_DIGIT_PREFIXES`].
+///   appear in an internal ITU Appendix-42 allowlist (~80 entries).
 /// - Compound `A/B`: at least one side must pass
-///   `is_plausible_callsign` (instead of just `is_base_callsign`);
-///   the modifier side stays as today.
+///   `is_plausible_callsign`; the modifier side stays as today.
 pub fn is_plausible_callsign(call: &str) -> bool {
     if !is_valid_callsign(call) {
         return false;

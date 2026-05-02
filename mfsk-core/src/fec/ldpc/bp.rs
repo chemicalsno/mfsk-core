@@ -496,14 +496,14 @@ pub fn llr_f32_to_q11(x: f32) -> i16 {
 ///
 /// Generic over the same `P: LdpcParams` + `T: LlrScalar` pair as the
 /// decoder itself, so FT8 LDPC(174,91) and FST4/uvpacket LDPC(240,101)
-/// each get the right capacity. Capacities are sized once in [`new`];
-/// [`reset`] re-establishes the per-decode initial state without
-/// reallocating.
+/// each get the right capacity. Capacities are sized once in [`new`],
+/// and the internal pre-decode reset is run automatically by every
+/// [`bp_decode_generic_nms_with_scratch`] call so callers only need
+/// to construct the pool once and reuse it.
 ///
 /// `no_std + alloc` clean — only uses `Vec` + `vec!`.
 ///
 /// [`new`]: BpScratch::new
-/// [`reset`]: BpScratch::reset
 pub struct BpScratch<P: LdpcParams, T: LlrScalar> {
     tov: Vec<T>,
     toc: Vec<T>,

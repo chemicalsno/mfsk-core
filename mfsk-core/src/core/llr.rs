@@ -282,9 +282,10 @@ pub fn compute_llr_generic<P: Protocol, S: SpecScalar, T: LlrScalar>(
 /// Compute a single LLR variant by `nsym` level. Returns the bmet
 /// vector matching that nsym (llra at 1, llrb at 2, llrc at 3),
 /// normalised + scaled exactly the way [`compute_llr_generic`] would
-/// produce that array on its own. For nsym=1 see
-/// [`compute_llr_partial_d`] when the bit-normalised variant (llrd)
-/// is the one wanted.
+/// produce that array on its own. nsym=1 returns the same llra
+/// [`compute_llr_generic`] produces; the bit-normalised variant
+/// (llrd) isn't separately exposed because the staircase consumer
+/// already obtains llrd from Step 1's [`compute_llr_fast`] output.
 ///
 /// Used by the FT8 stage-3 BP staircase to lazy-compute Step-2
 /// variants — Step-1 already did the nsym=1 work, so Step 2 only
