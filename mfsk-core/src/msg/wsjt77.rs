@@ -653,6 +653,134 @@ pub fn is_valid_callsign(call: &str) -> bool {
     }
 }
 
+/// ITU-allocated **letter+digit** 2-char prefix list. The structural
+/// `is_valid_callsign` accepts any letter+digit pair (e.g. `Z7` from
+/// `Z74QTJ`), but real ITU amateur prefix series only allocate
+/// specific letter+digit blocks (mostly digits 2-9 for small countries).
+/// `Z7` and similar gaps are common landing spots for CRC-14
+/// false-positive bit patterns, so allow-listing the real entries
+/// catches garbage on the busy-band block-decode path without
+/// needing the full ITU table for the (numerous) letter+letter and
+/// digit+letter cases.
+///
+/// Source: ITU Radio Regulations Appendix 42 / DXCC entity prefixes,
+/// 2024 revision. Sorted for binary search.
+const VALID_LETTER_DIGIT_PREFIXES: &[&[u8; 2]] = &[
+    b"A2", b"A3", b"A4", b"A5", b"A6", b"A7", b"A8", b"A9", b"B0", b"B1", b"B2", b"B3", b"B4",
+    b"B5", b"B6", b"B7", b"B8", b"B9", b"C2", b"C3", b"C4", b"C5", b"C6", b"C7", b"C8", b"C9",
+    b"D2", b"D3", b"D4", b"D6", b"D7", b"D8", b"D9", b"E2", b"E3", b"E4", b"E5", b"E6", b"E7",
+    b"H2", b"H4", b"H6", b"H7", b"H8", b"H9", b"J2", b"J3", b"J5", b"J6", b"J7", b"J8", b"P2",
+    b"P3", b"P4", b"P5", b"P6", b"P7", b"P8", b"P9", b"S0", b"S2", b"S5", b"S7", b"S9", b"T2",
+    b"T3", b"T4", b"T5", b"T6", b"T7", b"T8", b"V2", b"V3", b"V4", b"V5", b"V6", b"V7", b"V8",
+    b"Z2", b"Z3", b"Z6", b"Z8",
+];
+
+#[inline]
+fn is_known_letter_digit_prefix(prefix: &[u8]) -> bool {
+    if prefix.len() != 2 {
+        return false;
+    }
+    let key: &[u8; 2] = match prefix.try_into() {
+        Ok(k) => k,
+        Err(_) => return false,
+    };
+    VALID_LETTER_DIGIT_PREFIXES.binary_search(&key).is_ok()
+}
+
+/// Stricter callsign validator than [`is_valid_callsign`] — gates the
+/// CRC-14 false-positive filter in the FT8 block decoder.
+///
+/// The structural validator [`is_base_callsign`] accepts any
+/// alphanumeric prefix that has at least one letter, including
+/// letter+digit pairs the ITU never allocates for amateur use
+/// (e.g. `Z7`, `Q4`). Random codewords passing CRC-14 land in those
+/// gaps disproportionately often (`Z74QTJ/R`, `Q1FOO` — observed in
+/// the qso3 busy-band block-decode path before this filter).
+///
+/// Compared to [`is_valid_callsign`]:
+/// - Accepts standard callsigns (`is_standard_callsign`) and
+///   letter+letter / digit+letter prefix base callsigns unchanged
+///   (~all ITU 2-char allocations are letter+letter blocks).
+/// - **Letter+digit 2-char prefixes** (the gap-prone case) must
+///   appear in [`VALID_LETTER_DIGIT_PREFIXES`].
+/// - Compound `A/B`: at least one side must pass
+///   `is_plausible_callsign` (instead of just `is_base_callsign`);
+///   the modifier side stays as today.
+pub fn is_plausible_callsign(call: &str) -> bool {
+    if !is_valid_callsign(call) {
+        return false;
+    }
+    // Apply prefix allowlist on top of structural validation.
+    let parts: Vec<&str> = call.split('/').collect();
+    match parts.len() {
+        1 => has_plausible_prefix(parts[0]),
+        2 => {
+            // Compound — accept iff at least one side is a base
+            // callsign with a plausible ITU prefix. The modifier
+            // side ("R", "P", "QRP", etc.) is short by structure
+            // but doesn't qualify on its own; the base side carries
+            // the country.
+            let a_plausible = is_base_callsign(parts[0]) && has_plausible_prefix(parts[0]);
+            let b_plausible = is_base_callsign(parts[1]) && has_plausible_prefix(parts[1]);
+            a_plausible || b_plausible
+        }
+        _ => false,
+    }
+}
+
+/// Locate the prefix of a base callsign (or a /-side that looks like
+/// one) and check it against the letter+digit ITU allowlist. Other
+/// prefix shapes (1-char letter, letter+letter, digit+letter, 3-char)
+/// pass through — they cover ~all real ITU allocations.
+fn has_plausible_prefix(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.len() < 2 || b.len() > 7 {
+        // Short modifier or out-of-spec — defer to caller's compound
+        // logic; `is_valid_callsign` already validated shape.
+        return true;
+    }
+    // Strip trailing /R or /P (only meaningful on a full callsign,
+    // but harmless to apply here).
+    let b = if b.len() >= 2
+        && b[b.len() - 2] == b'/'
+        && (b[b.len() - 1] == b'R' || b[b.len() - 1] == b'P')
+    {
+        &b[..b.len() - 2]
+    } else {
+        b
+    };
+    // Find the rightmost digit followed by only letters → that's
+    // the separator between prefix and suffix.
+    let mut split = None;
+    for i in (0..b.len()).rev() {
+        if b[i].is_ascii_digit() && b[i + 1..].iter().all(|c| c.is_ascii_uppercase()) {
+            split = Some(i);
+            break;
+        }
+    }
+    let split = match split {
+        Some(s) => s,
+        None => return true, // no separator → caller already handles
+    };
+    let prefix = &b[..split];
+    // 1-char letter prefix: only F, G, I, K, M, N, R, W are
+    // assigned to amateur as standalone (everything else uses a
+    // 2-char prefix in practice). Q especially is reserved for
+    // Q-codes — common landing spot for CRC false positives.
+    if prefix.len() == 1 && prefix[0].is_ascii_uppercase() {
+        return matches!(
+            prefix[0],
+            b'F' | b'G' | b'I' | b'K' | b'M' | b'N' | b'R' | b'W'
+        );
+    }
+    // Letter+digit 2-char prefix: must be in the ITU allowlist
+    // (the other gap-prone shape that catches CRC false-positives).
+    if prefix.len() == 2 && prefix[0].is_ascii_uppercase() && prefix[1].is_ascii_digit() {
+        return is_known_letter_digit_prefix(prefix);
+    }
+    true
+}
+
 /// Check if a decoded FT8 message looks plausible (not a false positive).
 ///
 /// CRC-14 provides 1/16384 false-positive probability per candidate.  This
@@ -711,8 +839,11 @@ pub fn is_plausible_message(text: &str) -> bool {
             }
         }
 
-        // Remaining tokens should be callsigns — validate per ITU + FT8 rules
-        if !is_valid_callsign(w) {
+        // Remaining tokens should be callsigns — validate against
+        // the ITU prefix allowlist (stricter than is_valid_callsign,
+        // catches CRC-14 false positives whose decoded callsign-like
+        // tokens land in unallocated letter+digit prefix gaps).
+        if !is_plausible_callsign(w) {
             return false;
         }
     }
@@ -1038,6 +1169,60 @@ pub fn pack77_free_text(text: &str) -> Option<[u8; 77]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plausible_callsign_accepts_real_calls() {
+        // Standard 2-char letter+letter prefixes — most real amateur calls.
+        for c in [
+            "W1AW", "JA1XYZ", "DL3DB", "EA6VQ", "HB9CQK", "F5RXL", "G3WDG", "VK6ABC", "K1JT",
+            "N1PJT", "JL1NIE", "WM3PEN",
+        ] {
+            assert!(is_plausible_callsign(c), "should accept {c}");
+        }
+        // Letter+digit prefix (ITU-allocated): A2 (Botswana), V5 (Namibia),
+        // S5 (Slovenia), T7 (San Marino).
+        for c in ["A22ZZ", "V51AAA", "S55BC", "T77QQ"] {
+            assert!(is_plausible_callsign(c), "should accept {c}");
+        }
+        // Digit+letter prefix: 3D2, 4X, 5B, 9V — all real.
+        for c in ["3D2RA", "4X4ABC", "5B4XYZ", "9V1ABC"] {
+            assert!(is_plausible_callsign(c), "should accept {c}");
+        }
+        // Compound / portable
+        for c in ["JA1XYZ/P", "JA1XYZ/QRP", "F/JA1XYZ", "KH6/N1ABC"] {
+            assert!(is_plausible_callsign(c), "should accept {c}");
+        }
+    }
+
+    #[test]
+    fn plausible_callsign_rejects_letter_digit_gaps() {
+        // Prefixes outside the ITU letter+digit allowlist — common
+        // landing spots for CRC-14 false-positive bit patterns.
+        for c in [
+            "Z74QTJ", // observed qso3 garbage
+            "Q1ABC",  // Q reserved (no amateur)
+            "Q4ABCD", "X0FOO", // X+digit unassigned
+            "Y0ABC",
+        ] {
+            assert!(
+                !is_plausible_callsign(c),
+                "should reject {c} (unallocated letter+digit prefix)"
+            );
+        }
+    }
+
+    #[test]
+    fn plausible_callsign_compound_garbage() {
+        // Compound where one side is garbage but the other passes —
+        // accept (mirrors WSJT-X's tolerance for portable modifiers).
+        assert!(is_plausible_callsign("JA1XYZ/P"));
+        // Compound where both sides have unallocated letter+digit
+        // prefixes — reject.
+        assert!(!is_plausible_callsign("Z74QTJ/Q4ABCD"));
+        // Compound with one Z7-prefix base + valid mod token — reject
+        // (mod alone can't make Z74QTJ plausible).
+        assert!(!is_plausible_callsign("Z74QTJ/R"));
+    }
 
     /// Regression: `n28` in the extended CQ-XXXX region (3..NTOKENS) could
     /// panic with an out-of-bounds C4 access. AP-decoded garbage codewords
