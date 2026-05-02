@@ -17,7 +17,7 @@ default      = ["std", "ft8", "ft4", "parallel", "fft-rustfft"]
 # protocol's wide-band decode path because `rustfft::FftPlanner` is
 # the default FFT backend. `no_std + alloc` builds turn this off and
 # pick a no_std FFT implementation via the `fft-*` features below.
-std          = ["alloc", "dep:rustfft"]
+std          = ["alloc"]
 
 # `no_std + alloc` baseline. All protocol modules that allocate
 # (`Vec`, `Box`, `String`) need this; only purely-stack code can
@@ -88,6 +88,13 @@ fixed-point-cs = ["fixed-point", "fixed-point-llr"]
 # wall-clock on Core2. Off by default — flip on for FPU-less builds.
 fixed-point-coarse-i32 = ["fixed-point"]
 
+# Always-on coarse_sync sub-stage profiling. Same output as setting
+# `MFSK_PROFILE_COARSE=1` on host, but works on embedded targets where
+# the env var is not reachable. Only useful when investigating stage-2
+# wall-clock breakdown — adds 4 timestamp reads per `coarse_sync` call,
+# negligible cost.
+profile-coarse = ["std"]
+
 # Lightweight modes — embedded-port-clean. `fft-rustfft` (host) or
 # `fft-extern` (embedded) is required at the crate level for the
 # decode pipeline; the protocol features themselves only enable the
@@ -129,7 +136,7 @@ rayon       = { version = "1", optional = true }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = [
-    'cfg(feature, values("std","alloc","ft8","ft4","fst4","wspr","jt9","jt65","q65","packet-bytes","uvpacket","parallel","osd-deep","eq-fallback","full","embedded-tx","embedded-rx","esp32s3","fft-rustfft","fft-extern","fixed-point","fixed-point-bp","fixed-point-llr","fixed-point-cs","fixed-point-coarse-i32"))',
+    'cfg(feature, values("std","alloc","ft8","ft4","fst4","wspr","jt9","jt65","q65","packet-bytes","uvpacket","parallel","osd-deep","eq-fallback","full","embedded-tx","embedded-rx","esp32s3","fft-rustfft","fft-extern","fixed-point","fixed-point-bp","fixed-point-llr","fixed-point-cs","fixed-point-coarse-i32","profile-coarse"))',
 ] }
 
 # Build docs.rs with every protocol feature enabled so users browsing

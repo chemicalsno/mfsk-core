@@ -495,7 +495,7 @@ pub fn coarse_sync(
     let idx = |fi: usize, lag: i32| fi * n_lag + (lag + jz) as usize;
     let ratio_eps = ratio_eps();
     #[cfg(feature = "std")]
-    let prof = std::env::var("MFSK_PROFILE_COARSE").is_ok();
+    let prof = cfg!(feature = "profile-coarse") || std::env::var("MFSK_PROFILE_COARSE").is_ok();
     #[cfg(feature = "std")]
     let t_setup = std::time::Instant::now();
 
