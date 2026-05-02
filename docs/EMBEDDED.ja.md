@@ -169,6 +169,206 @@ PSRAM 構成の ESP32 では低速 basis でホットパスが走ります。
 | LLR | f32 (ホスト) または Q11 i16 (`fixed-point-llr`) | f32 制限なし、Q11 ±16 | `core::scalar::LlrScalar` |
 | BP メッセージ | T (LLR と同じ) | — | `fec::ldpc::bp::bp_decode_generic_nms_with_scratch` |
 
+## C / C++ / 非 Rust ESP-IDF プロジェクトから使う (`mfsk-ffi-ft8`)
+
+[`mfsk-ffi-ft8`](https://github.com/jl1nie/mfsk-core/tree/main/mfsk-ffi-ft8)
+は FT8 ブロックデコーダ部分の小さな C ABI です。組み込み (ESP-IDF /
+RP2040 / Cortex-M) C/C++ プロジェクトから FT8 デコードを使う
+推奨方法。
+
+`embedded-fixed-point` feature 下で `no_std + alloc` 構成のため、
+出力される `libmfsk_ft8.a` は Rust の `std` ランタイムを抱え込まず、
+C 側から libc 二重リンク等の問題なく drop-in リンク可能。
+
+**ESP32 Core2 で end-to-end 動作検証済み** (m5stack-core2 例):
+別途 `ffi_smoke_one` パスが `mfsk_ft8_decode_i16` (C ABI) を同じ
+ベイク済み WAV に対して呼んだ結果、直接 Rust の `decode_one` パスと
+完全一致 — qso1 (3/3)、qso2 (5/5)、**qso3 busy band (7/7)**。
+caller-managed BASIS scratch を内部 RAM に置けば、同じ FFI 呼び出しを
+内部 heap-alloc で行ったケースの **約 2.6 倍速い** (qso3 で
+3.74 s vs 9.57 s)、直接 Rust process_candidates_into パスとも 5 % 以内。
+ログ:
+- `embedded-poc/m5stack-core2/logs/ffi_into_2026-05-02.log`
+  (推奨 caller-scratch)
+- `embedded-poc/m5stack-core2/logs/ffi_smoke_2026-05-02.log`
+  (heap-alloc 比較用)
+
+### API 概要
+
+cbindgen 生成 header — `mfsk-ffi-ft8/include/mfsk_ft8.h`、ビルド毎に
+再生成。全 surface:
+
+```c
+typedef struct MfskFt8Result {
+    char     text[40];   // NUL-終端 unpack メッセージ
+    float    freq_hz;    // キャリア周波数
+    float    dt_sec;     // スロット先頭からの時間オフセット
+    float    snr_db;     // 既知制限 — embedded path は強信号で
+                         // ~4–12 dB 低めに出る
+    uint32_t hard_errors;
+    uint8_t  pass;       // staircase ステージ (0=fast Bp, 1=full Bp,…)
+} MfskFt8Result;
+
+typedef struct MfskFt8ResultList {
+    MfskFt8Result *items;
+    size_t         len;
+    size_t         _capacity;  // 内部使用
+} MfskFt8ResultList;
+
+// プライマリ decode 関数の所要 scratch 長 (i16 個数)。
+// 同じ長さの 2 配列を呼び出し側で確保。
+size_t mfsk_ft8_basis_scratch_len(void);
+
+// PRIMARY 組み込みエントリ。caller-managed scratch — dot-product ASM
+// kernel をピーク速度で回すには、必ず内部 RAM に置く (PSRAM 不可)。
+MfskFt8Status mfsk_ft8_decode_i16(
+    const int16_t *audio, size_t n_samples,   // 12 kHz mono、≥168 000
+    float freq_min_hz, float freq_max_hz,     // 典型 200, 3000
+    float sync_min, int max_cand,             // 典型 1.0, 30
+    MfskFt8Depth depth,                       // 0=Bp, 1=BpAll, 2=BpAllOsd
+    int16_t *basis_re, int16_t *basis_im,     // scratch
+    MfskFt8ResultList *out);                  // 結果
+
+// HOST 専用簡便版 — basis を内部 heap-alloc。組み込みビルドでは
+// 意図的に提供しない (下記「caller-supply scratch の理由」参照)。
+#ifdef MFSK_FT8_HOST  // default `host` feature 有効時
+MfskFt8Status mfsk_ft8_decode_i16_alloc(
+    const int16_t *audio, size_t n_samples,
+    float freq_min_hz, float freq_max_hz,
+    float sync_min, int max_cand,
+    MfskFt8Depth depth,
+    MfskFt8ResultList *out);
+#endif
+
+void mfsk_ft8_result_list_free(MfskFt8ResultList *list);
+```
+
+### なぜ caller-supply scratch (組み込みでは選択肢ですらない)
+
+60 KB の `BASIS` scratch (cos/sin Q15 rotator × 8 tone × 1920 sample) は
+**dot-product 内ループの hot data** です。esp-dsp の ASM kernel
+`dsps_dotprod_s16_ae32` が 2 MAC / cycle のピークで回るのは、
+basis が**高速な内部 SRAM (DRAM)** にあるときのみ。Core2 で PSRAM が
+有効 (デフォルト) の場合、標準 `malloc` heap は PSRAM に流れ、
+PSRAM-resident な読み出しはキャッシュ越しで **5–10 cycle/sample の
+ストール**を発生させ、kernel が定格の ~30 % まで落ちます。BASIS が
+PSRAM にあると stage 3 wall-clock が文字通り **2〜3 倍**になります。
+
+C から `malloc` の戻り先は予測できません — ESP-IDF の heap は
+size と capability flag で内部 RAM/PSRAM をルーティングし、60 KB
+要求は明示的に絞らない限り PSRAM に行きます。なので 60 KB malloc を
+裏で隠す「簡便版」は組み込み側で必ず性能を毀損する。組み込みには
+わざと用意せず、`mfsk_ft8_decode_i16` は scratch を引数で受け取る
+形に統一しています。呼び出し側がポリシーを決める:
+
+```c
+// 一番シンプルで正しいパターン: static .bss 配列。
+// 自動的に内部 DRAM に乗り、プロセス寿命中保持される。
+#include "mfsk_ft8.h"
+static int16_t basis_re[15360];   // = mfsk_ft8_basis_scratch_len()
+static int16_t basis_im[15360];
+
+MfskFt8ResultList results = {0};
+MfskFt8Status st = mfsk_ft8_decode_i16(
+    audio, n_samples,
+    200.0f, 3000.0f, 1.0f, 30,
+    MFSK_FT8_DEPTH_BP_ALL,
+    basis_re, basis_im,
+    &results);
+```
+
+動的確保したいなら ESP-IDF の capability-flag アロケータを:
+`heap_caps_malloc(15360 * sizeof(int16_t),
+MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)`。複数 decode 呼び出しを
+跨いで保持してください — slot ごとに reset 不要。
+
+### Build flag
+
+#### Host (`libmfsk_ft8.so` / `libmfsk_ft8.a` ホストテスト用)
+
+```sh
+cargo build -p mfsk-ffi-ft8 --release
+# → target/release/libmfsk_ft8.{so,a}
+# → mfsk-ffi-ft8/include/mfsk_ft8.h (cbindgen 生成)
+```
+
+デフォルト feature で `mfsk-core/std + ft8 + fft-rustfft` が入る。
+`.so` を C テストから link する例が
+`mfsk-ffi-ft8/tests/c_smoke/smoke.c`:
+
+```sh
+gcc -O2 -I mfsk-ffi-ft8/include \
+    mfsk-ffi-ft8/tests/c_smoke/smoke.c \
+    -L target/release -lmfsk_ft8 -lm -lpthread -ldl \
+    -Wl,-rpath,$PWD/target/release \
+    -o /tmp/mfsk_smoke
+/tmp/mfsk_smoke embedded-poc/m5stack-core2/assets/qso3_busy.wav
+```
+
+#### 組み込み (Xtensa ESP32, `libmfsk_ft8.a` を ESP-IDF link)
+
+```sh
+source ~/export-esp.sh                     # Xtensa toolchain
+RUSTFLAGS="-C panic=abort" \
+cargo build -p mfsk-ffi-ft8 --release \
+    --no-default-features \
+    --features embedded-fixed-point,embedded-runtime \
+    --target xtensa-esp32-espidf
+# → target/xtensa-esp32-espidf/release/libmfsk_ft8.a
+```
+
+`-C panic=abort` 必須 — Rust unwinding panic は `std` を要求し、
+組み込みでは `panic = "abort"` 一択。ESP-IDF プロジェクトでは通常
+`.cargo/config.toml` に書く:
+
+```toml
+[target.xtensa-esp32-espidf]
+rustflags = ["-C", "link-arg=-nostartfiles", "-C", "panic=abort"]
+```
+
+#### Feature 一覧
+
+| Feature | Default | 用途 |
+|---|---|---|
+| `host` | ✓ | ホストビルド — `mfsk-core/std + ft8 + fft-rustfft`。`mfsk_ft8_decode_i16` (caller scratch) と `mfsk_ft8_decode_i16_alloc` (heap 簡便) の**両方**を export |
+| `embedded-fixed-point` | — | `no_std + alloc`。`mfsk-core/fft-extern + fixed-point + fixed-point-llr`。**`mfsk_ft8_decode_i16` のみ** export — heap-alloc 簡便版は意図的に除外 (上記参照)。`mfsk_core_make_default_fft_planner_*` と `mfsk_core_dot_q15_i32` を linker が解決する必要 (典型的には小さな Rust shim が esp-dsp に橋渡し) |
+| `embedded-runtime` | — | crate 内に default `#[panic_handler]` (libc `abort` 呼び) + `#[global_allocator]` (libc `malloc`/`free`) を提供。自己完結 `staticlib` 用。同じイメージに別の Rust ランタイムを重ねるときは OFF |
+
+### ESP-IDF (CMake) プロジェクトへの組み込み
+
+```
+your-app/                          # esp-idf project ルート
+├── main/main.c                    # mfsk_ft8_decode_i16(...) を呼ぶ
+├── components/mfsk_ft8/
+│   ├── CMakeLists.txt             # IMPORTED static-lib コンポーネント
+│   ├── include/mfsk_ft8.h         # mfsk-ffi-ft8 ビルド成果物
+│   └── lib/libmfsk_ft8.a          # mfsk-ffi-ft8 ビルド成果物
+└── shim/                          # 小さな Rust crate (esp-dsp bridge)
+    ├── Cargo.toml                 # mfsk-ffi-ft8 に依存
+    ├── .cargo/config.toml         # target = xtensa-esp32-espidf, panic=abort
+    └── src/lib.rs                 # mfsk_core_make_default_fft_planner と
+                                   # mfsk_core_dot_q15_i32 を esp-dsp 経由で提供
+```
+
+shim/ の Rust crate が必要なのは、mfsk-core の FFT-extern 契約が
+`extern "Rust"` (C と ABI が違う) を使うため、純 C コンパイルユニットからは
+提供不可。shim は ~50 行 Rust + `embedded-poc/m5stack-core2/src/esp_dsp_fft.rs`
+の vendor copy で済みます。
+
+`components/mfsk_ft8/CMakeLists.txt` 最小例:
+
+```cmake
+idf_component_register(INCLUDE_DIRS "include"
+                       REQUIRES espressif__esp-dsp)
+add_library(mfsk_ft8_rust STATIC IMPORTED)
+set_target_properties(mfsk_ft8_rust PROPERTIES
+    IMPORTED_LOCATION ${CMAKE_CURRENT_LIST_DIR}/lib/libmfsk_ft8.a)
+target_link_libraries(${COMPONENT_LIB} INTERFACE mfsk_ft8_rust)
+```
+
+完成 skeleton は
+[`embedded-poc/idf-component/`](https://github.com/jl1nie/mfsk-core/tree/main/embedded-poc/idf-component)。
+
 ## ライブラリで提供しないもの
 
 mfsk-core はデコード/エンコードパイプラインまでです。以下は

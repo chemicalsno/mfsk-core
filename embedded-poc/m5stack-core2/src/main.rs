@@ -186,6 +186,23 @@ fn main() {
         }
     }
 
+    // ── FFI smoke check ──────────────────────────────────────────────
+    // Verify that the `mfsk-ffi-ft8` C ABI works on Xtensa: same
+    // decoder, called once per WAV through `mfsk_ft8_decode_i16`
+    // instead of the manually-staged Rust API. The same
+    // `mfsk_core_make_default_fft_planner_*` and `mfsk_core_dot_q15_i32`
+    // extern Rust symbols (provided by `esp_dsp_fft.rs`) resolve
+    // both code paths from one .a — so success here means a pure-C
+    // ESP-IDF project linking `libmfsk_ft8.a` would see the same
+    // decode results.
+    log::info!("\n════════════════════════════════════════════");
+    log::info!("FFI smoke: mfsk_ft8_decode_i16 (C ABI) on each WAV");
+    log::info!("════════════════════════════════════════════");
+    for (label, slot) in &slots {
+        log::info!("\nWAV: {label} (via FFI)");
+        ffi_smoke_one(slot);
+    }
+
     log::info!("\n=== Sweep complete. Idling. ===");
     // `std::thread::sleep` on esp-idf goes through pthread/condvar
     // shims that pushed main task past the 16 KB stack canary right
@@ -198,6 +215,71 @@ fn main() {
             esp_idf_svc::sys::vTaskDelay(u32::MAX);
         }
     }
+}
+
+/// FFI smoke: call `mfsk_ft8_decode_i16` (C ABI) on a slot and
+/// print results via `log::info!`. Verifies the `libmfsk_ft8.a`
+/// surface end-to-end on Xtensa — the same decoder a pure-C
+/// ESP-IDF project linking the .a would see.
+fn ffi_smoke_one(slot: &[i16]) {
+    use mfsk_ft8::{
+        MfskFt8Depth, MfskFt8ResultList, mfsk_ft8_decode_i16, mfsk_ft8_result_list_free,
+    };
+    let mut results = MfskFt8ResultList {
+        items: core::ptr::null_mut(),
+        len: 0,
+        _capacity: 0,
+    };
+    let t0 = now_us();
+    // SAFETY: slot is a valid &[i16] for its lifetime; we own
+    // `results` for the duration of this call and free it before
+    // return. BASIS_RE / BASIS_IM are .bss-resident static i16
+    // arrays of `BASIS_SCRATCH_LEN` elements — the same scratch the
+    // direct-Rust path uses, so the FFI call lands in fast internal
+    // RAM exactly like `process_candidates_into`.
+    let st = unsafe {
+        mfsk_ft8_decode_i16(
+            slot.as_ptr(),
+            slot.len(),
+            100.0,
+            3_000.0,
+            1.0,
+            30,
+            MfskFt8Depth::BpAll,
+            BASIS_RE.as_mut_ptr(),
+            BASIS_IM.as_mut_ptr(),
+            &mut results,
+        )
+    };
+    let t1 = now_us();
+    log::info!(
+        "  ffi status={:?}  {:>3} result(s)  {:>8} us",
+        st,
+        results.len,
+        t1 - t0,
+    );
+    // SAFETY: results was just populated by the FFI call.
+    if !results.items.is_null() {
+        let items = unsafe { core::slice::from_raw_parts(results.items, results.len) };
+        for (i, r) in items.iter().enumerate() {
+            // r.text is NUL-terminated UTF-8; find the NUL.
+            let bytes: &[u8] = unsafe {
+                core::slice::from_raw_parts(r.text.as_ptr() as *const u8, r.text.len())
+            };
+            let n = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+            let text = core::str::from_utf8(&bytes[..n]).unwrap_or("<bad utf8>");
+            log::info!(
+                "    [{i}]  {:>4.0} Hz  SNR={:>5.1} dB  e={}  '{}'",
+                r.freq_hz,
+                r.snr_db,
+                r.hard_errors,
+                text,
+            );
+        }
+    }
+    // SAFETY: results was populated by the FFI call; freeing returns
+    // the underlying Box to the heap.
+    unsafe { mfsk_ft8_result_list_free(&mut results) };
 }
 
 /// Run the staged `decode_block` on one slot, log per-stage timings

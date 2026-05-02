@@ -175,6 +175,213 @@ slow basis on the hot path.
 | LLR | f32 (host) or Q11 i16 (`fixed-point-llr`) | f32 unbounded; Q11 ±16 | `core::scalar::LlrScalar` |
 | BP messages | T (same as LLR) | — | `fec::ldpc::bp::bp_decode_generic_nms_with_scratch` |
 
+## Using from C / C++ / non-Rust ESP-IDF projects (`mfsk-ffi-ft8`)
+
+[`mfsk-ffi-ft8`](https://github.com/jl1nie/mfsk-core/tree/main/mfsk-ffi-ft8)
+exposes a tiny C ABI for the FT8 block decoder slice. It is the
+recommended way to call the embedded FT8 decoder from a non-Rust
+ESP-IDF (or RP2040 / Cortex-M) project.
+
+The crate is `no_std + alloc` under its `embedded-fixed-point`
+feature so the resulting `libmfsk_ft8.a` doesn't carry Rust's `std`
+runtime — drop-in linkable from C without the toolchain weirdness
+that would come from mixing two libc layers.
+
+**Verified end-to-end on ESP32 Core2** (m5stack-core2 example): a
+separate `ffi_smoke_one` path calls `mfsk_ft8_decode_i16` (C ABI)
+on the same baked WAVs as the direct-Rust `decode_one` path and
+gets identical recall — qso1 (3 / 3), qso2 (5 / 5),
+**qso3 busy band (7 / 7)**. With caller-managed BASIS scratch in
+internal RAM the FFI path lands ~2.6 × faster than the same FFI
+call with internal heap allocation (qso3 3.74 s vs 9.57 s) and
+within ~5 % of the direct-Rust process_candidates_into path.
+Logs:
+- `embedded-poc/m5stack-core2/logs/ffi_into_2026-05-02.log`
+  (recommended caller-scratch path)
+- `embedded-poc/m5stack-core2/logs/ffi_smoke_2026-05-02.log`
+  (heap-alloc reference for comparison)
+
+### API at a glance
+
+cbindgen-generated header — `mfsk-ffi-ft8/include/mfsk_ft8.h`,
+regenerated on every build. The full surface is:
+
+```c
+typedef struct MfskFt8Result {
+    char     text[40];   // NUL-terminated unpacked message
+    float    freq_hz;    // carrier
+    float    dt_sec;     // time offset relative to slot start
+    float    snr_db;     // see "Known limitations" — embedded
+                         // path reads ~4–12 dB low on strong sigs
+    uint32_t hard_errors;
+    uint8_t  pass;       // staircase stage (0=fast Bp, 1=full Bp,…)
+} MfskFt8Result;
+
+typedef struct MfskFt8ResultList {
+    MfskFt8Result *items;
+    size_t         len;
+    size_t         _capacity;  // private
+} MfskFt8ResultList;
+
+// Required scratch length for the primary decode entry, in i16
+// elements. Caller allocates two arrays of this length each.
+size_t mfsk_ft8_basis_scratch_len(void);
+
+// PRIMARY embedded entry. Caller-managed scratch — must live in
+// fast internal RAM (NOT PSRAM) for the dot-product ASM kernel to
+// hit peak throughput.
+MfskFt8Status mfsk_ft8_decode_i16(
+    const int16_t *audio, size_t n_samples,   // 12 kHz, mono, ≥168 000
+    float freq_min_hz, float freq_max_hz,     // typical 200, 3000
+    float sync_min, int max_cand,             // typical 1.0, 30
+    MfskFt8Depth depth,                       // 0=Bp, 1=BpAll, 2=BpAllOsd
+    int16_t *basis_re, int16_t *basis_im,     // scratch
+    MfskFt8ResultList *out);                  // populated by callee
+
+// HOST-ONLY convenience — heap-allocs basis internally. Excluded
+// from embedded builds: see "Why caller-supplied scratch" below.
+#ifdef MFSK_FT8_HOST  // built with default `host` feature
+MfskFt8Status mfsk_ft8_decode_i16_alloc(
+    const int16_t *audio, size_t n_samples,
+    float freq_min_hz, float freq_max_hz,
+    float sync_min, int max_cand,
+    MfskFt8Depth depth,
+    MfskFt8ResultList *out);
+#endif
+
+void mfsk_ft8_result_list_free(MfskFt8ResultList *list);
+```
+
+### Why caller-supplied scratch (and why it's not optional on Core2)
+
+The 60 KB `BASIS` scratch (cos/sin Q15 rotators × 8 tones × 1920
+samples) is the **dot-product inner-loop hot data**. The esp-dsp
+ASM kernel `dsps_dotprod_s16_ae32` runs at 1 cycle per 2 MACs only
+when the basis sits in fast internal SRAM (DRAM). On a Core2 with
+PSRAM enabled (the default), the standard `malloc` heap lands in
+PSRAM, and PSRAM-resident reads cost **5–10 cycles/sample of stall**
+through the cache, dropping the kernel to ~30 % of its rated speed.
+Stage 3 wall-clock literally **doubles to triples** if BASIS is in
+PSRAM.
+
+You can't predict which heap a `malloc` call lands in from C —
+ESP-IDF's heap allocator routes between internal RAM and PSRAM by
+size and capability flags, and a 60 KB request lands in PSRAM
+unless explicitly capped. So a "convenience" entry that hides a
+60 KB `malloc` would silently de-tune any embedded caller. We
+deliberately don't ship one for embedded — `mfsk_ft8_decode_i16`
+takes the scratch as parameters, full stop. The caller decides:
+
+```c
+// The simplest correct pattern: static .bss arrays.
+// They land in internal DRAM automatically and persist for the
+// process lifetime.
+#include "mfsk_ft8.h"
+static int16_t basis_re[15360];   // = mfsk_ft8_basis_scratch_len()
+static int16_t basis_im[15360];
+
+MfskFt8ResultList results = {0};
+MfskFt8Status st = mfsk_ft8_decode_i16(
+    audio, n_samples,
+    200.0f, 3000.0f, 1.0f, 30,
+    MFSK_FT8_DEPTH_BP_ALL,
+    basis_re, basis_im,
+    &results);
+```
+
+If you must allocate dynamically, use ESP-IDF's capability-flagged
+allocator: `heap_caps_malloc(15360 * sizeof(int16_t),
+MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)`. Keep the buffers around
+across decode calls — they don't need to be reset between slots.
+
+### Build flags
+
+#### Host (`libmfsk_ft8.so` / `libmfsk_ft8.a` for desktop testing)
+
+```sh
+cargo build -p mfsk-ffi-ft8 --release
+# → target/release/libmfsk_ft8.{so,a}
+# → mfsk-ffi-ft8/include/mfsk_ft8.h (cbindgen-generated)
+```
+
+Default features pull `mfsk-core/std + ft8 + fft-rustfft`. A C smoke
+test linking the resulting `.so` lives at
+`mfsk-ffi-ft8/tests/c_smoke/smoke.c`:
+
+```sh
+gcc -O2 -I mfsk-ffi-ft8/include \
+    mfsk-ffi-ft8/tests/c_smoke/smoke.c \
+    -L target/release -lmfsk_ft8 -lm -lpthread -ldl \
+    -Wl,-rpath,$PWD/target/release \
+    -o /tmp/mfsk_smoke
+/tmp/mfsk_smoke embedded-poc/m5stack-core2/assets/qso3_busy.wav
+```
+
+#### Embedded (Xtensa ESP32, `libmfsk_ft8.a` for ESP-IDF link)
+
+```sh
+source ~/export-esp.sh                     # Xtensa toolchain
+RUSTFLAGS="-C panic=abort" \
+cargo build -p mfsk-ffi-ft8 --release \
+    --no-default-features \
+    --features embedded-fixed-point,embedded-runtime \
+    --target xtensa-esp32-espidf
+# → target/xtensa-esp32-espidf/release/libmfsk_ft8.a
+```
+
+`-C panic=abort` is required because Rust unwinding panics need
+`std`; embedded uses `panic = "abort"` everywhere. ESP-IDF projects
+typically set this in their `.cargo/config.toml`:
+
+```toml
+[target.xtensa-esp32-espidf]
+rustflags = ["-C", "link-arg=-nostartfiles", "-C", "panic=abort"]
+```
+
+#### Feature reference
+
+| Feature | Default | Purpose |
+|---|---|---|
+| `host` | ✓ | Host build — pulls `mfsk-core/std + ft8 + fft-rustfft`. Both `mfsk_ft8_decode_i16` (caller scratch) and `mfsk_ft8_decode_i16_alloc` (heap convenience) are exported. |
+| `embedded-fixed-point` | — | `no_std + alloc`. Pulls `mfsk-core/fft-extern + fixed-point + fixed-point-llr`. **Only `mfsk_ft8_decode_i16` is exported** — the heap-alloc convenience is excluded by design (see above). The linker must resolve `mfsk_core_make_default_fft_planner_*` and `mfsk_core_dot_q15_i32` (typically via a small Rust shim that bridges esp-dsp). |
+| `embedded-runtime` | — | Provides default `#[panic_handler]` (calls libc `abort`) + `#[global_allocator]` (libc `malloc`/`free`). Needed for a self-contained `staticlib`; turn off when stacking another Rust runtime in the same image. |
+
+### Linking it into an ESP-IDF (CMake) project
+
+```
+your-app/                          # esp-idf project root
+├── main/main.c                    # calls mfsk_ft8_decode_i16(...)
+├── components/mfsk_ft8/
+│   ├── CMakeLists.txt             # IMPORTED static-lib component
+│   ├── include/mfsk_ft8.h         # from mfsk-ffi-ft8 build
+│   └── lib/libmfsk_ft8.a          # from mfsk-ffi-ft8 build
+└── shim/                          # tiny Rust crate (esp-dsp bridges)
+    ├── Cargo.toml                 # depends on mfsk-ffi-ft8
+    ├── .cargo/config.toml         # target = xtensa-esp32-espidf, panic=abort
+    └── src/lib.rs                 # provides mfsk_core_make_default_fft_planner
+                                   # and mfsk_core_dot_q15_i32 via esp-dsp
+```
+
+The `shim/` Rust crate is needed because mfsk-core's FFT-extern
+contract uses `extern "Rust"` symbols (different ABI from `extern
+"C"`), which a pure-C compilation unit can't satisfy. The shim is
+~50 lines of Rust + a vendored copy of
+`embedded-poc/m5stack-core2/src/esp_dsp_fft.rs`.
+
+`components/mfsk_ft8/CMakeLists.txt` minimal example:
+
+```cmake
+idf_component_register(INCLUDE_DIRS "include"
+                       REQUIRES espressif__esp-dsp)
+add_library(mfsk_ft8_rust STATIC IMPORTED)
+set_target_properties(mfsk_ft8_rust PROPERTIES
+    IMPORTED_LOCATION ${CMAKE_CURRENT_LIST_DIR}/lib/libmfsk_ft8.a)
+target_link_libraries(${COMPONENT_LIB} INTERFACE mfsk_ft8_rust)
+```
+
+A worked skeleton lives at
+[`embedded-poc/idf-component/`](https://github.com/jl1nie/mfsk-core/tree/main/embedded-poc/idf-component).
+
 ## What we don't ship
 
 mfsk-core stops at the decode/encode pipeline. The following are
