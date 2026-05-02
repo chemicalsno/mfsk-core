@@ -62,17 +62,20 @@ static mut BASIS_IM: [i16; BASIS_SCRATCH_LEN] = [0; BASIS_SCRATCH_LEN];
 const OSD_ENABLED: bool = false;
 
 /// Pass 1 (coarse_sync) candidate cap, BEFORE the manual Pass 2
-/// `sync_quality_block0` re-rank. The earlier 100 was needed because
-/// coarse_sync's bare `t / mean_others` ratio exploded on the fp path
-/// (u16-quantised `mean_others` underflowing on phantom carriers,
-/// inflating their scores 100-1000× over real signals). With the
-/// regularised `t / (mean_others + ε)` shipped in mfsk-core, host
-/// real-QSO sweep showed PASS1 ∈ {75, 100} both hit the 15/22 recall
-/// ceiling on the 3-WAV corpus; PASS1 ∈ {30, 50} drops one weak qso1
-/// signal (-17 dB OH3NIV ZS6S). 75 is the smallest cap that keeps
-/// full recall — Pass 2 cost is linear in PASS1 so 100 → 75 saves
-/// ~0.33 s/slot.
-const PASS1_LIMIT: usize = 75;
+/// `sync_quality_block0` re-rank. With the regularised
+/// `t / (mean_others + ε)` ratio in mfsk-core, host real-QSO sweep
+/// showed:
+/// - PASS1=15 (Pass 2 effectively eliminated): qso3 2/13 truth ⚠️ —
+///   strong-but-rank-16-30 signals (W1FC, WM3PEN, K1BZM, W1DIG)
+///   never reach Pass 2 for the sync_quality re-rank that promotes
+///   them. Pass 2 is **necessary**, not redundant.
+/// - PASS1=30: qso3 6/13 (full ceiling), 14/22 total (loses qso1 -17 dB
+///   OH3NIV).
+/// - PASS1=75: 15/22 total (recovers OH3NIV at extra Pass 2 cost).
+///
+/// 30 ships as Core2 default — accepts the marginal -17 dB loss for
+/// ~0.6 s saved on Pass 2 (linear in PASS1, per-cand block-0 DFT).
+const PASS1_LIMIT: usize = 30;
 
 /// Real on-air FT8 slots — 12 kHz / mono / 16-bit PCM. Each ≈ 360 KB.
 /// Two consecutive slots from `jl1nie/rs-ft8n`'s benchmark data plus

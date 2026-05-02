@@ -155,7 +155,18 @@ const TX_START_OFFSET_S: f32 = 0.5;
 /// GPS) live well within ±1 s; halving the lag range cuts
 /// `coarse_sync` work by ~60 % (linear in `n_lag`). If the live
 /// timing source is loose, raise this back to 2.5.
-const SYNC_LAG_S: f32 = 1.0;
+const SYNC_LAG_S_DEFAULT: f32 = 1.0;
+fn sync_lag_s() -> f32 {
+    #[cfg(feature = "std")]
+    {
+        if let Ok(s) = std::env::var("MFSK_SYNC_LAG_S")
+            && let Ok(v) = s.parse::<f32>()
+        {
+            return v;
+        }
+    }
+    SYNC_LAG_S_DEFAULT
+}
 
 /// Same NMS α as the bench-tuned default in `mfsk-core/src/fec/ldpc/bp.rs`.
 const NMS_ALPHA: f32 = 0.75;
@@ -422,7 +433,7 @@ pub fn coarse_sync(
     let df = SAMPLE_RATE_HZ / NFFT_SPEC as f32;
     let tstep = NSTEP as f32 / SAMPLE_RATE_HZ;
     let jstrt = (TX_START_OFFSET_S / tstep).round() as i32;
-    let jz = (SYNC_LAG_S / tstep).round() as i32;
+    let jz = (sync_lag_s() / tstep).round() as i32;
     let tone_step_bins = TONE_SPACING_HZ / df;
 
     // Carrier-bin search range. Reserve room above the carrier for the
@@ -956,9 +967,12 @@ pub fn decode_block<S: AudioSample>(
 ///   is at coarse_sync rank 100+, beyond Pass 2's reach).
 ///
 /// 75 is the smallest PASS1 that keeps the full recall ceiling.
-/// Core2 Pass 2 cost is linear in PASS1 (per-cand block-0 DFT) —
-/// 100 → 75 saves ~0.33 s/slot.
-const PASS1_LIMIT_DEFAULT: usize = 75;
+/// 30 is the smallest PASS1 that keeps the qso3 (busy band) truth
+/// ceiling — it loses one borderline -17 dB qso1 signal (OH3NIV).
+/// Core2 ships with 30 (speed-priority — Pass 2 cost ≈ 0.4 s vs
+/// 1.0 s at PASS1=75). Override per-call via `MFSK_PASS1_LIMIT`
+/// when std is enabled.
+const PASS1_LIMIT_DEFAULT: usize = 30;
 fn pass1_limit() -> usize {
     #[cfg(feature = "std")]
     {
