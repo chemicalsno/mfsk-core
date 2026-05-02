@@ -424,25 +424,88 @@ pub fn compute_spectrogram<S: AudioSample>(audio: &[S], max_freq_hz: f32) -> Spe
     let mut data: Vec<u16> = vec![0u16; n_freq * n_time];
     let mut buf: Vec<Complex<i16>> = vec![Complex::new(0i16, 0i16); NFFT_SPEC];
 
-    for j in 0..n_time {
-        let ia = j * NSTEP;
+    // **Two-for-one real-FFT trick**. Each frame's audio is real; we
+    // pack two consecutive frames as `re = windowed(frame_a)`,
+    // `im = windowed(frame_b)` into a single complex FFT. From
+    //     Y[k] = X_a[k] + j·X_b[k]
+    // and the real-input conjugate symmetry `X_•[N-k] = conj(X_•[k])`,
+    // we recover the per-frame spectra via post-butterfly:
+    //     X_a[k] = (Y[k] + conj(Y[N-k])) / 2
+    //     X_b[k] = -j · (Y[k] - conj(Y[N-k])) / 2
+    // i.e.
+    //     A_re = (Y[k].re + Y[N-k].re) / 2,
+    //     A_im = (Y[k].im - Y[N-k].im) / 2
+    //     B_re = (Y[k].im + Y[N-k].im) / 2,
+    //     B_im = (Y[N-k].re - Y[k].re) / 2
+    // Halves the FFT count (184 → 92 on the standard FT8 slot) — the
+    // dominant stage-1 cost on Core2. Demux is O(n_freq) per pair,
+    // negligible vs an N=4096 FFT. Magnitude scaling matches the
+    // single-frame path (the >>1 in demux exactly cancels the √2
+    // amplitude headroom that |Y[k]|² = |X_a[k]|² + |X_b[k]|² would
+    // otherwise give); auto-gain `shift` is reused unchanged.
+    let n_pairs = n_time / 2;
+    let n_odd = n_time & 1;
+
+    let pack = |buf: &mut [Complex<i16>], ia_a: usize, ia_b: Option<usize>| {
         for (k, c) in buf.iter_mut().enumerate() {
-            *c = if k < NSPS && ia + k < audio.len() {
-                let raw = audio[ia + k].to_i16() as i32;
+            let re = if k < NSPS && ia_a + k < audio.len() {
+                let raw = audio[ia_a + k].to_i16() as i32;
                 let scaled = (raw << shift).clamp(i16::MIN as i32, i16::MAX as i32);
-                let windowed = (scaled * hann[k] as i32) >> 15;
-                Complex::new(windowed as i16, 0)
+                ((scaled * hann[k] as i32) >> 15) as i16
             } else {
-                Complex::new(0, 0)
+                0
             };
+            let im = match ia_b {
+                Some(ia_b) if k < NSPS && ia_b + k < audio.len() => {
+                    let raw = audio[ia_b + k].to_i16() as i32;
+                    let scaled = (raw << shift).clamp(i16::MIN as i32, i16::MAX as i32);
+                    ((scaled * hann[k] as i32) >> 15) as i16
+                }
+                _ => 0,
+            };
+            *c = Complex::new(re, im);
         }
+    };
+
+    for jj in 0..n_pairs {
+        let j_a = 2 * jj;
+        let j_b = j_a + 1;
+        pack(&mut buf, j_a * NSTEP, Some(j_b * NSTEP));
+        fft.process(&mut buf);
+
+        let row_a = j_a * n_freq;
+        let row_b = j_b * n_freq;
+        // Demux. NFFT_SPEC is a power of two so `(NFFT_SPEC - k)
+        // & (NFFT_SPEC - 1)` wraps k=0 to 0, where the formula
+        // collapses to A_re = Y[0].re, A_im = 0 (and B = Im(Y[0]))
+        // — i.e. the DC bin is real, as expected for real input.
+        let mask = NFFT_SPEC - 1;
+        for k in 0..n_freq {
+            let kn = (NFFT_SPEC - k) & mask;
+            let yk_re = buf[k].re as i32;
+            let yk_im = buf[k].im as i32;
+            let yn_re = buf[kn].re as i32;
+            let yn_im = buf[kn].im as i32;
+            let a_re = (yk_re + yn_re) >> 1;
+            let a_im = (yk_im - yn_im) >> 1;
+            let b_re = (yk_im + yn_im) >> 1;
+            let b_im = (yn_re - yk_re) >> 1;
+            let mag2_a = ((a_re * a_re + a_im * a_im) as u32) >> FP_SPEC_SHIFT;
+            let mag2_b = ((b_re * b_re + b_im * b_im) as u32) >> FP_SPEC_SHIFT;
+            data[row_a + k] = mag2_a as u16;
+            data[row_b + k] = mag2_b as u16;
+        }
+    }
+
+    // Odd-frame fallback: single-frame FFT for the trailing slice when
+    // n_time is odd. n_time=184 on the standard FT8 slot so this path
+    // is exercised only by truncated inputs / regression-test fixtures.
+    if n_odd != 0 {
+        let j = 2 * n_pairs;
+        pack(&mut buf, j * NSTEP, None);
         fft.process(&mut buf);
         let row_base = j * n_freq;
         for i in 0..n_freq {
-            // Magnitude squared, right-shifted to fit u16. The
-            // i16² ≤ ~1.07 × 10⁹ (≈ 2³⁰) so sum ≤ ~2.15 × 10⁹ (~2³¹);
-            // shifting right by 16 keeps the top 16 bits — plenty for
-            // the relative-magnitude comparisons in coarse_sync.
             let re = buf[i].re as i32;
             let im = buf[i].im as i32;
             let mag2 = ((re * re + im * im) as u32) >> FP_SPEC_SHIFT;
