@@ -144,6 +144,99 @@ pub fn compute_llr_fast<P: Protocol, T: LlrScalar>(cs: &[Complex<f32>]) -> LlrSe
     compute_llr_generic::<P, f32, T>(complex_slice_as_cmplx_f32(cs), 1)
 }
 
+/// Compute the unnormalised, unscaled bit-metric arrays for ONE
+/// `nsym` level. Internal helper shared by [`compute_llr_generic`]
+/// (which calls it 1..=max_nsym times) and the lazy single-nsym
+/// [`compute_llr_partial`] used to feed the BP staircase one variant
+/// at a time without re-doing the cheaper levels.
+///
+/// `bmet_primary` receives `max_one - max_zero` (= llra at nsym=1,
+/// llrb at nsym=2, llrc at nsym=3). At nsym=1 only, `bmet_norm`
+/// receives the bit-normalised variant (= llrd). For nsym ≥ 2 pass
+/// `bmet_norm = None`.
+fn fill_bmet_for_nsym<P: Protocol, S: SpecScalar>(
+    cs: &[Cmplx<S>],
+    nsym: usize,
+    bmet_primary: &mut [f32],
+    bmet_norm: Option<&mut [f32]>,
+) {
+    let ntones = P::NTONES as usize;
+    let bps = P::BITS_PER_SYMBOL as usize;
+    let gray_map = P::GRAY_MAP;
+    let chunks = data_chunks::<P>();
+    let codeword_len = bmet_primary.len();
+
+    let nt = ntones.pow(nsym as u32);
+    let ibmax = bps * nsym - 1;
+    let mut s2 = vec![0.0f32; nt];
+
+    // Bit-normalised array (llrd) is only produced for nsym=1.
+    let mut bmet_norm_holder = bmet_norm;
+
+    let mut chunk_bit_base = 0usize;
+    for &(chunk_start_sym, chunk_len) in &chunks {
+        let mut k = 0usize;
+        while k + nsym <= chunk_len {
+            let ks = chunk_start_sym + k;
+
+            // |Σ cs_k[gray[idx_k]]| for each tone-combination.
+            for (i, s2_i) in s2.iter_mut().enumerate() {
+                let digits = base_digits(i, ntones, nsym);
+                let mut sum_re = 0.0f32;
+                let mut sum_im = 0.0f32;
+                for j in 0..nsym {
+                    let entry = cs[(ks + j) * ntones + gray_map[digits[j]] as usize];
+                    sum_re += entry.re.to_f32();
+                    sum_im += entry.im.to_f32();
+                }
+                *s2_i = (sum_re * sum_re + sum_im * sum_im).sqrt();
+            }
+
+            let i_bit_base = chunk_bit_base + k * bps;
+            for ib in 0..=ibmax {
+                let bit_idx = i_bit_base + ib;
+                if bit_idx >= codeword_len {
+                    break;
+                }
+                let bit_sel = ibmax - ib;
+                let max_one = s2
+                    .iter()
+                    .enumerate()
+                    .filter(|&(i, _)| (i >> bit_sel) & 1 == 1)
+                    .map(|(_, &v)| v)
+                    .fold(f32::NEG_INFINITY, f32::max);
+                let max_zero = s2
+                    .iter()
+                    .enumerate()
+                    .filter(|&(i, _)| (i >> bit_sel) & 1 == 0)
+                    .map(|(_, &v)| v)
+                    .fold(f32::NEG_INFINITY, f32::max);
+                let bm = max_one - max_zero;
+                bmet_primary[bit_idx] = bm;
+                if let Some(b) = bmet_norm_holder.as_deref_mut() {
+                    let den = max_one.max(max_zero);
+                    b[bit_idx] = if den > 0.0 { bm / den } else { 0.0 };
+                }
+            }
+
+            k += nsym;
+        }
+        chunk_bit_base += chunk_len * bps;
+    }
+}
+
+#[inline]
+fn scale_bmet<T: LlrScalar>(mut v: Vec<f32>, scale: f32) -> Vec<T> {
+    normalize_bmet(&mut v);
+    v.into_iter().map(|x| T::from_f32(x * scale)).collect()
+}
+
+#[inline]
+fn codeword_bit_len<P: Protocol>() -> usize {
+    let bps = P::BITS_PER_SYMBOL as usize;
+    data_chunks::<P>().iter().map(|&(_, l)| l).sum::<usize>() * bps
+}
+
 /// Generic LLR computation accepting any [`Cmplx<S>`] cs storage.
 /// Inner `bmet` arithmetic stays in `f32` (norms / max-min are
 /// awkward to quantise mid-stream) — `S` only changes how we read
@@ -153,103 +246,62 @@ pub fn compute_llr_generic<P: Protocol, S: SpecScalar, T: LlrScalar>(
     cs: &[Cmplx<S>],
     max_nsym: usize,
 ) -> LlrSet<T> {
-    let ntones = P::NTONES as usize;
-    let bps = P::BITS_PER_SYMBOL as usize;
-    let gray_map = P::GRAY_MAP;
-    let chunks = data_chunks::<P>();
-    let codeword_len: usize = chunks.iter().map(|&(_, l)| l).sum::<usize>() * bps;
-
+    let codeword_len = codeword_bit_len::<P>();
     let mut bmeta = vec![0.0f32; codeword_len];
     let mut bmetb = vec![0.0f32; codeword_len];
     let mut bmetc = vec![0.0f32; codeword_len];
     let mut bmetd = vec![0.0f32; codeword_len];
 
     for nsym in 1usize..=max_nsym {
-        // Number of tone-combinations over `nsym` symbols.
-        let nt = ntones.pow(nsym as u32);
-        let ibmax = bps * nsym - 1;
-        let mut s2 = vec![0.0f32; nt];
-
-        // Walk the data symbols chunk by chunk to build the contiguous
-        // 174-bit codeword layout used by the LDPC decoder.
-        let mut chunk_bit_base = 0usize;
-        for &(chunk_start_sym, chunk_len) in &chunks {
-            let mut k = 0usize; // symbol index within this chunk
-            while k + nsym <= chunk_len {
-                let ks = chunk_start_sym + k;
-
-                // Precompute |Σ cs_k[gray[idx_k]]| for each tone-combination.
-                // Each cs entry is read in f32 components — for `S = f32`
-                // the `to_f32` calls compile to no-ops; for `S = Q14i16`
-                // they're a single multiply per read (Q14 → f32).
-                for (i, s2_i) in s2.iter_mut().enumerate() {
-                    let digits = base_digits(i, ntones, nsym);
-                    let mut sum_re = 0.0f32;
-                    let mut sum_im = 0.0f32;
-                    for j in 0..nsym {
-                        let entry = cs[(ks + j) * ntones + gray_map[digits[j]] as usize];
-                        sum_re += entry.re.to_f32();
-                        sum_im += entry.im.to_f32();
-                    }
-                    *s2_i = (sum_re * sum_re + sum_im * sum_im).sqrt();
-                }
-
-                // Map each of the `ibmax+1` bits into the codeword.
-                let i_bit_base = chunk_bit_base + k * bps;
-                for ib in 0..=ibmax {
-                    let bit_idx = i_bit_base + ib;
-                    if bit_idx >= codeword_len {
-                        break;
-                    }
-                    let bit_sel = ibmax - ib;
-                    let max_one = s2
-                        .iter()
-                        .enumerate()
-                        .filter(|&(i, _)| (i >> bit_sel) & 1 == 1)
-                        .map(|(_, &v)| v)
-                        .fold(f32::NEG_INFINITY, f32::max);
-                    let max_zero = s2
-                        .iter()
-                        .enumerate()
-                        .filter(|&(i, _)| (i >> bit_sel) & 1 == 0)
-                        .map(|(_, &v)| v)
-                        .fold(f32::NEG_INFINITY, f32::max);
-                    let bm = max_one - max_zero;
-
-                    match nsym {
-                        1 => {
-                            bmeta[bit_idx] = bm;
-                            let den = max_one.max(max_zero);
-                            bmetd[bit_idx] = if den > 0.0 { bm / den } else { 0.0 };
-                        }
-                        2 => bmetb[bit_idx] = bm,
-                        3 => bmetc[bit_idx] = bm,
-                        _ => unreachable!(),
-                    }
-                }
-
-                k += nsym;
-            }
-            chunk_bit_base += chunk_len * bps;
+        let primary: &mut [f32] = match nsym {
+            1 => &mut bmeta,
+            2 => &mut bmetb,
+            3 => &mut bmetc,
+            _ => unreachable!(),
+        };
+        if nsym == 1 {
+            // Split bmeta/bmetd borrow trick: both come from the same
+            // function-local Vecs but we need disjoint &mut. The
+            // explicit shadow keeps the borrow checker happy.
+            let (bmeta_slice, bmetd_slice) = (&mut bmeta[..], &mut bmetd[..]);
+            fill_bmet_for_nsym::<P, S>(cs, 1, bmeta_slice, Some(bmetd_slice));
+        } else {
+            fill_bmet_for_nsym::<P, S>(cs, nsym, primary, None);
         }
     }
 
-    normalize_bmet(&mut bmeta);
-    normalize_bmet(&mut bmetb);
-    normalize_bmet(&mut bmetc);
-    normalize_bmet(&mut bmetd);
-
     let s = P::LLR_SCALE;
-    fn scale<U: LlrScalar>(v: Vec<f32>, s: f32) -> Vec<U> {
-        v.into_iter().map(|x| U::from_f32(x * s)).collect()
-    }
-
     LlrSet {
-        llra: scale::<T>(bmeta, s),
-        llrb: scale::<T>(bmetb, s),
-        llrc: scale::<T>(bmetc, s),
-        llrd: scale::<T>(bmetd, s),
+        llra: scale_bmet::<T>(bmeta, s),
+        llrb: scale_bmet::<T>(bmetb, s),
+        llrc: scale_bmet::<T>(bmetc, s),
+        llrd: scale_bmet::<T>(bmetd, s),
     }
+}
+
+/// Compute a single LLR variant by `nsym` level. Returns the bmet
+/// vector matching that nsym (llra at 1, llrb at 2, llrc at 3),
+/// normalised + scaled exactly the way [`compute_llr_generic`] would
+/// produce that array on its own. For nsym=1 see
+/// [`compute_llr_partial_d`] when the bit-normalised variant (llrd)
+/// is the one wanted.
+///
+/// Used by the FT8 stage-3 BP staircase to lazy-compute Step-2
+/// variants — Step-1 already did the nsym=1 work, so Step 2 only
+/// pays the (cheap) nsym=2 if variant b is tried, the (expensive)
+/// nsym=3 only if variant c is needed. Empirically variant a from
+/// Step 1 fails identically in Step 2 (same input, same BP), so
+/// this path skips it — see `process_candidates_with` in
+/// `ft8::decode_block`.
+pub fn compute_llr_partial<P: Protocol, S: SpecScalar, T: LlrScalar>(
+    cs: &[Cmplx<S>],
+    nsym: usize,
+) -> Vec<T> {
+    debug_assert!((1..=3).contains(&nsym));
+    let codeword_len = codeword_bit_len::<P>();
+    let mut bmet = vec![0.0f32; codeword_len];
+    fill_bmet_for_nsym::<P, S>(cs, nsym, &mut bmet, None);
+    scale_bmet::<T>(bmet, P::LLR_SCALE)
 }
 
 // ──────────────────────────────────────────────────────────────────────────

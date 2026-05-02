@@ -1723,32 +1723,66 @@ where
             accepted = Some((bp, 0));
         }
 
-        // Step 2: deeper LLR + 4 variants — same generic NMS as
-        // Step 1; OSD (Step 3) needs the f32 LLR set so we keep one
-        // around for that case.
-        let mut llr_full_opt: Option<super::llr::LlrSet<LlrT>> = None;
+        // Step 2: deeper-LLR variants. Lazy + LLR-shared with Step 1.
+        //
+        // **Variant a is skipped** — Step 1 already ran BP on the
+        // identical input (`compute_llr_fast` and `compute_llr`
+        // produce bit-identical `llra`, since nsym=1 work doesn't
+        // depend on `max_nsym`). Re-running it would be guaranteed
+        // failure.
+        //
+        // **Variant d reuses** Step 1's `llr_a_fast.llrd` — same
+        // nsym=1 derivation, costs zero LLR work.
+        //
+        // **Variants b / c are lazy-computed**: only pay the nsym=2
+        // work if d failed, and only pay the heavy nsym=3 work
+        // (~80 % of `compute_llr`) if both d and b also failed.
+        // Order chosen by ascending compute cost — same number of BP
+        // calls as the old variant loop in the worst case, far fewer
+        // in the typical case where any earlier variant decodes.
         if accepted.is_none() && matches!(depth, DecodeDepth::BpAll | DecodeDepth::BpAllOsd) {
-            let llr_full: super::llr::LlrSet<LlrT> = super::llr::compute_llr(&cs);
-            for (llr, pid) in [
-                (&llr_full.llra, 0u8),
-                (&llr_full.llrb, 1),
-                (&llr_full.llrc, 2),
-                (&llr_full.llrd, 3),
-            ] {
-                let bp_step2 = crate::fec::ldpc::bp::bp_decode_nms_with_scratch::<LlrT>(
+            // Variant d: free reuse of Step 1's llrd.
+            let bp_d = crate::fec::ldpc::bp::bp_decode_nms_with_scratch::<LlrT>(
+                &mut bp_scratch,
+                &llr_a_fast.llrd,
+                None,
+                BP_MAX_ITER,
+                Some(check_crc14),
+                NMS_ALPHA,
+            );
+            if let Some(bp) = bp_d {
+                accepted = Some((bp, 3));
+            }
+            // Variant b: lazy nsym=2 only.
+            if accepted.is_none() {
+                let llrb_arr: [LlrT; LDPC_N] = super::llr::compute_llr_partial::<LlrT>(&cs, 2);
+                let bp_b = crate::fec::ldpc::bp::bp_decode_nms_with_scratch::<LlrT>(
                     &mut bp_scratch,
-                    llr,
+                    &llrb_arr,
                     None,
                     BP_MAX_ITER,
                     Some(check_crc14),
                     NMS_ALPHA,
                 );
-                if let Some(bp) = bp_step2 {
-                    accepted = Some((bp, pid));
-                    break;
+                if let Some(bp) = bp_b {
+                    accepted = Some((bp, 1));
                 }
             }
-            llr_full_opt = Some(llr_full);
+            // Variant c: lazy nsym=3 (the expensive one).
+            if accepted.is_none() {
+                let llrc_arr: [LlrT; LDPC_N] = super::llr::compute_llr_partial::<LlrT>(&cs, 3);
+                let bp_c = crate::fec::ldpc::bp::bp_decode_nms_with_scratch::<LlrT>(
+                    &mut bp_scratch,
+                    &llrc_arr,
+                    None,
+                    BP_MAX_ITER,
+                    Some(check_crc14),
+                    NMS_ALPHA,
+                );
+                if let Some(bp) = bp_c {
+                    accepted = Some((bp, 2));
+                }
+            }
         }
 
         // Step 3: OSD fallback (sync_quality gated; only for BpAllOsd).
@@ -1758,7 +1792,6 @@ where
         // extra compute_llr is cheap relative to the OSD work itself.
         if accepted.is_none() && matches!(depth, DecodeDepth::BpAllOsd) && q >= 12 {
             let llr_full_f32: super::llr::LlrSet<f32> = super::llr::compute_llr(&cs);
-            let _ = &llr_full_opt; // suppress unused warning when Step 2 ran
             for (llr, pid) in [
                 (&llr_full_f32.llra, 4u8),
                 (&llr_full_f32.llrb, 5),

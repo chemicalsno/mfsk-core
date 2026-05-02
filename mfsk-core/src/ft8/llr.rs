@@ -92,6 +92,19 @@ pub fn compute_llr_fast<T: LlrScalar>(cs: &[[Cmplx<f32>; 8]; 79]) -> LlrSet<T> {
     }
 }
 
+/// Lazy single-`nsym` LLR — feeds the stage-3 BP staircase one
+/// variant at a time so Step 2 doesn't pay the heavy nsym=3 cost
+/// (~80 % of [`compute_llr`]) unless variants a/d/b all failed.
+/// `nsym = 1` returns llra, `2` → llrb, `3` → llrc. Step 1's
+/// `compute_llr_fast` already provides llra/llrd, so Step 2 in
+/// `decode_block::process_candidates_with` only ever calls this for
+/// `nsym = 2` and `nsym = 3`.
+pub fn compute_llr_partial<T: LlrScalar>(cs: &[[Cmplx<f32>; 8]; 79], nsym: usize) -> [T; LDPC_N] {
+    let flat = flatten_cs(cs);
+    let v = crate::core::llr::compute_llr_partial::<Ft8, f32, T>(&flat, nsym);
+    inflate_llr(v)
+}
+
 /// WSJT-X compatible SNR from 8-tone spectra + decoded 79-tone sequence.
 pub fn compute_snr_db(cs: &[[Cmplx<f32>; 8]; 79], itone: &[u8; 79]) -> f32 {
     let flat = flatten_cs(cs);
