@@ -269,9 +269,13 @@ reference:
      layout: docs/ lives at the repo root, not under the crate). -->
 - **English:** [`docs/LIBRARY.md`](https://github.com/jl1nie/mfsk-core/blob/main/docs/LIBRARY.md)
 - **日本語:** [`docs/LIBRARY.ja.md`](https://github.com/jl1nie/mfsk-core/blob/main/docs/LIBRARY.ja.md)
-- **Embedded targets:** [`docs/EMBEDDED.md`](https://github.com/jl1nie/mfsk-core/blob/main/docs/EMBEDDED.md)
-  — feature-flag map, FFT / dot-product extern contracts, BASIS
-  scratch placement, Q-format reference, Core2 perf ballpark.
+- **Embedded targets:**
+  [English `docs/EMBEDDED.md`](https://github.com/jl1nie/mfsk-core/blob/main/docs/EMBEDDED.md)
+  / [日本語 `docs/EMBEDDED.ja.md`](https://github.com/jl1nie/mfsk-core/blob/main/docs/EMBEDDED.ja.md)
+  — generic-scalar architecture (one codebase for f32 host and
+  fixed-point embedded), feature-flag map, FFT / dot-product extern
+  contracts, BASIS scratch placement, Q-format reference, Core2 perf
+  ballpark + footprint.
 
 ## Status
 

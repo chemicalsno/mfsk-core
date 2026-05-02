@@ -6,6 +6,45 @@
 backends. This document covers what the library asks of an embedded
 caller and what we don't ship.
 
+## Architecture: how f32 and fixed-point share one codebase
+
+The whole DSP / FEC pipeline is parameterised by **scalar traits**, so
+the same source compiles to either a host-friendly f32 path or an
+embedded-friendly integer path **with no duplicated code**:
+
+- [`core::scalar::SpecScalar`] — spectrogram / DFT-output scalar
+  (`f32` on host; `Q14i16` for embedded cs storage).
+- [`core::scalar::LlrScalar`] — LLR scalar with wide-accumulator
+  type (`f32` on host; `Q11i16` with i32 wide for embedded BP).
+- [`core::scalar::Cmplx<S>`] — generic complex over a `SpecScalar`,
+  `repr(C)` layout-compatible with `num_complex::Complex`.
+- `compute_llr_generic<P, S, T>`, `compute_snr_db_generic<P, S>`,
+  `bp_decode_generic_nms<P, T>` — all take the scalar types as
+  generic parameters; one monomorphisation per `(P, S, T)` triple.
+
+The `fixed-point` / `fixed-point-llr` / `fixed-point-cs` Cargo
+features just **swap which scalar types the protocol glue picks**;
+the generic body is unchanged. This means the embedded port shares
+99 % of its code with the host build — bug fixes and optimisations
+land once and apply everywhere.
+
+### What the fixed-point switch is wired up to today
+
+| Component | Generic over | Fixed-point switch wired? |
+|---|---|---|
+| LDPC BP NMS (`fec::ldpc::bp`) | `LlrScalar` | ✅ via `fixed-point-llr` |
+| LLR computation (`core::llr`) | `SpecScalar` × `LlrScalar` | ✅ via `fixed-point-llr` |
+| BP scratch pool (`BpScratch<P, T>`) | `LdpcParams` × `LlrScalar` | ✅ — works for FT8 LDPC(174,91) and FST4/uvpacket LDPC(240,101) |
+| FT8 spectrogram + DFT (`ft8::decode_block`) | `SpecScalar` × `AudioSample` | ✅ via `fixed-point` |
+| **FT4 / WSPR / Q65 / JT9 / JT65** | (host f32 only) | ❌ — these protocols don't go through `decode_block` today |
+
+So: **the trait infrastructure is protocol-agnostic, but the only
+protocol that actually flips into the integer path on the embedded
+build is FT8.** Adding FT4 (next-most-likely candidate, since it
+shares the same Costas/Gray/LDPC pieces) is a port of the
+`decode_block` shape to FT4-specific symbol layout — nothing new
+in the trait layer.
+
 ## What we test
 
 | Target | MCU | Backend | Status |
