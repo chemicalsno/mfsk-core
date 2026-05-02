@@ -203,6 +203,91 @@ enum MfskFt8Status mfsk_ft8_decode_i16_alloc(const int16_t *audio,
  */
  void mfsk_ft8_result_list_free(struct MfskFt8ResultList *list);
 
+/**
+ * Required output length (in samples) for the synth functions.
+ * Equals `NN × 1920 = 151 680` (12.64 s of 12 kHz mono).
+ */
+ uintptr_t mfsk_ft8_synth_output_len(void);
+
+/**
+ * Pack a standard 77-bit FT8 message from three tokens — the
+ * typical CQ shape `mfsk_ft8_pack77("CQ", "JA1ABC", "PM86")`. For
+ * reply / report messages: `mfsk_ft8_pack77("JA1ABC", "W1AW",
+ * "-12")`. Strings must be NUL-terminated UTF-8 (ASCII in
+ * practice).
+ *
+ * Writes 77 bytes (each 0 or 1) to `out_message77`. Returns
+ * `MfskFt8Status::Ok` on success, `BadDepth` is reused as a
+ * generic "bad input" indicator if any string fails to pack
+ * (callsign too long, bad characters, etc).
+ *
+ * # Safety
+ * `call1`, `call2`, `report` must point to valid NUL-terminated
+ * C strings. `out_message77` must point to a writable 77-byte
+ * buffer.
+ */
+
+enum MfskFt8Status mfsk_ft8_pack77(const char *call1,
+                                   const char *call2,
+                                   const char *report,
+                                   uint8_t *out_message77);
+
+/**
+ * Convert a 77-bit FT8 message into the 79-tone Gray-mapped
+ * sequence. Wraps `mfsk_core::ft8::wave_gen::message_to_tones`.
+ * LDPC encode + CRC-14 + Costas insertion all happen inside.
+ *
+ * `message77` must point to 77 valid bytes (each 0 or 1).
+ * `out_itone` receives 79 bytes (each 0..7).
+ *
+ * # Safety
+ * Both pointers must be non-null and writable for their lengths.
+ */
+ enum MfskFt8Status mfsk_ft8_message_to_tones(const uint8_t *message77, uint8_t *out_itone);
+
+/**
+ * Synthesise FT8 i16 PCM (12 kHz mono) from a 79-tone sequence
+ * into a caller-provided buffer. `out` must be at least
+ * [`mfsk_ft8_synth_output_len`] = 151 680 samples; longer is fine
+ * (only the prefix is written). `f0_hz` is the carrier frequency
+ * (typical 1500 Hz). `amplitude_i16` peaks at the given value
+ * (typical 16 384 ≈ i16_max / 2 for ~50 % full scale headroom).
+ *
+ * Output covers 12.64 s of audio (79 symbols × 1920 samples /
+ * 12 kHz). Caller is responsible for slot-aligning this within an
+ * FT8 14-second window if transmitting (typical: prepend 0.5 s of
+ * silence + append 0.86 s of trailing silence to match the
+ * receive-side `TX_START_OFFSET_S`).
+ *
+ * # Safety
+ * `itone` must point to 79 valid bytes (each 0..7). `out` must
+ * point to a writable buffer of at least `out_len` i16 samples.
+ * Returns `ScratchTooSmall` if `out_len < TONES_OUTPUT_LEN`.
+ */
+
+enum MfskFt8Status mfsk_ft8_tones_to_i16(const uint8_t *itone,
+                                         float f0_hz,
+                                         int16_t amplitude_i16,
+                                         int16_t *out,
+                                         uintptr_t out_len);
+
+/**
+ * f32 variant of [`mfsk_ft8_tones_to_i16`]. `amplitude` is unitless
+ * (typical 0.5 for ~−6 dBFS). Same buffer-length rules.
+ *
+ * # Safety
+ * Same as [`mfsk_ft8_tones_to_i16`] — `itone` must point to 79
+ * valid bytes, `out` must point to a writable f32 buffer of at
+ * least `out_len` samples; returns `ScratchTooSmall` if `out_len`
+ * is below `mfsk_ft8_synth_output_len()`.
+ */
+
+enum MfskFt8Status mfsk_ft8_tones_to_f32(const uint8_t *itone,
+                                         float f0_hz,
+                                         float amplitude,
+                                         float *out,
+                                         uintptr_t out_len);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif  // __cplusplus

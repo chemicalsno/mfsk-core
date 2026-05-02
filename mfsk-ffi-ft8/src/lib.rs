@@ -40,13 +40,17 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::ffi::{c_char, c_int};
 
+#[cfg(feature = "host")]
 use mfsk_core::ft8::decode_block::decode_block;
 
 #[cfg(feature = "embedded-fixed-point")]
 use mfsk_core::ft8::decode_block::{BASIS_SCRATCH_LEN, decode_block_into};
 
 use mfsk_core::ft8::decode::{DecodeDepth, DecodeResult};
-use mfsk_core::msg::wsjt77::unpack77;
+use mfsk_core::ft8::wave_gen::{
+    TONES_OUTPUT_LEN, message_to_tones, tones_to_f32_into, tones_to_i16_into,
+};
+use mfsk_core::msg::wsjt77::{pack77, unpack77};
 
 // ── Status codes ────────────────────────────────────────────────────────────
 
@@ -328,6 +332,169 @@ pub unsafe extern "C" fn mfsk_ft8_result_list_free(list: *mut MfskFt8ResultList)
 #[allow(dead_code)]
 fn _silence_unused() {
     let _ = empty_result_list;
+}
+
+// ── TX (encode + synthesise) ────────────────────────────────────────────────
+//
+// Mirror of `mfsk_core::ft8::wave_gen` shape — caller-provided
+// output buffers throughout (no surprise heap-alloc on embedded).
+// The standard FT8 transmit chain is:
+//
+//     mfsk_ft8_pack77   (3 strings → 77-bit message)
+//     mfsk_ft8_message_to_tones (77-bit → 79-tone Gray-mapped sequence)
+//     mfsk_ft8_tones_to_i16    (79-tone → 12 kHz PCM, 151 680 samples)
+//
+// Each step is independently callable — e.g. you can synth from a
+// `[u8; 79]` pre-cooked tone array without ever calling `pack77`,
+// or stop after `message_to_tones` and feed itone to your own GFSK.
+
+/// Required output length (in samples) for the synth functions.
+/// Equals `NN × 1920 = 151 680` (12.64 s of 12 kHz mono).
+#[unsafe(no_mangle)]
+pub extern "C" fn mfsk_ft8_synth_output_len() -> usize {
+    TONES_OUTPUT_LEN
+}
+
+/// Pack a standard 77-bit FT8 message from three tokens — the
+/// typical CQ shape `mfsk_ft8_pack77("CQ", "JA1ABC", "PM86")`. For
+/// reply / report messages: `mfsk_ft8_pack77("JA1ABC", "W1AW",
+/// "-12")`. Strings must be NUL-terminated UTF-8 (ASCII in
+/// practice).
+///
+/// Writes 77 bytes (each 0 or 1) to `out_message77`. Returns
+/// `MfskFt8Status::Ok` on success, `BadDepth` is reused as a
+/// generic "bad input" indicator if any string fails to pack
+/// (callsign too long, bad characters, etc).
+///
+/// # Safety
+/// `call1`, `call2`, `report` must point to valid NUL-terminated
+/// C strings. `out_message77` must point to a writable 77-byte
+/// buffer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mfsk_ft8_pack77(
+    call1: *const c_char,
+    call2: *const c_char,
+    report: *const c_char,
+    out_message77: *mut u8,
+) -> MfskFt8Status {
+    if call1.is_null() || call2.is_null() || report.is_null() || out_message77.is_null() {
+        return MfskFt8Status::NullPointer;
+    }
+    // SAFETY: caller upholds NUL-terminated strings.
+    let s1 = match unsafe { core::ffi::CStr::from_ptr(call1) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return MfskFt8Status::BadDepth,
+    };
+    let s2 = match unsafe { core::ffi::CStr::from_ptr(call2) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return MfskFt8Status::BadDepth,
+    };
+    let s3 = match unsafe { core::ffi::CStr::from_ptr(report) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return MfskFt8Status::BadDepth,
+    };
+    let Some(msg) = pack77(s1, s2, s3) else {
+        return MfskFt8Status::BadDepth;
+    };
+    // SAFETY: caller provided 77-byte writable buffer.
+    let dst = unsafe { core::slice::from_raw_parts_mut(out_message77, 77) };
+    dst.copy_from_slice(&msg);
+    MfskFt8Status::Ok
+}
+
+/// Convert a 77-bit FT8 message into the 79-tone Gray-mapped
+/// sequence. Wraps `mfsk_core::ft8::wave_gen::message_to_tones`.
+/// LDPC encode + CRC-14 + Costas insertion all happen inside.
+///
+/// `message77` must point to 77 valid bytes (each 0 or 1).
+/// `out_itone` receives 79 bytes (each 0..7).
+///
+/// # Safety
+/// Both pointers must be non-null and writable for their lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mfsk_ft8_message_to_tones(
+    message77: *const u8,
+    out_itone: *mut u8,
+) -> MfskFt8Status {
+    if message77.is_null() || out_itone.is_null() {
+        return MfskFt8Status::NullPointer;
+    }
+    let msg_slice = unsafe { core::slice::from_raw_parts(message77, 77) };
+    let mut msg77 = [0u8; 77];
+    msg77.copy_from_slice(msg_slice);
+    let itone = message_to_tones(&msg77);
+    let dst = unsafe { core::slice::from_raw_parts_mut(out_itone, 79) };
+    dst.copy_from_slice(&itone);
+    MfskFt8Status::Ok
+}
+
+/// Synthesise FT8 i16 PCM (12 kHz mono) from a 79-tone sequence
+/// into a caller-provided buffer. `out` must be at least
+/// [`mfsk_ft8_synth_output_len`] = 151 680 samples; longer is fine
+/// (only the prefix is written). `f0_hz` is the carrier frequency
+/// (typical 1500 Hz). `amplitude_i16` peaks at the given value
+/// (typical 16 384 ≈ i16_max / 2 for ~50 % full scale headroom).
+///
+/// Output covers 12.64 s of audio (79 symbols × 1920 samples /
+/// 12 kHz). Caller is responsible for slot-aligning this within an
+/// FT8 14-second window if transmitting (typical: prepend 0.5 s of
+/// silence + append 0.86 s of trailing silence to match the
+/// receive-side `TX_START_OFFSET_S`).
+///
+/// # Safety
+/// `itone` must point to 79 valid bytes (each 0..7). `out` must
+/// point to a writable buffer of at least `out_len` i16 samples.
+/// Returns `ScratchTooSmall` if `out_len < TONES_OUTPUT_LEN`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mfsk_ft8_tones_to_i16(
+    itone: *const u8,
+    f0_hz: f32,
+    amplitude_i16: i16,
+    out: *mut i16,
+    out_len: usize,
+) -> MfskFt8Status {
+    if itone.is_null() || out.is_null() {
+        return MfskFt8Status::NullPointer;
+    }
+    if out_len < TONES_OUTPUT_LEN {
+        return MfskFt8Status::ScratchTooSmall;
+    }
+    let itone_slice = unsafe { core::slice::from_raw_parts(itone, 79) };
+    let mut itone_arr = [0u8; 79];
+    itone_arr.copy_from_slice(itone_slice);
+    let out_slice = unsafe { core::slice::from_raw_parts_mut(out, TONES_OUTPUT_LEN) };
+    tones_to_i16_into(out_slice, &itone_arr, f0_hz, amplitude_i16);
+    MfskFt8Status::Ok
+}
+
+/// f32 variant of [`mfsk_ft8_tones_to_i16`]. `amplitude` is unitless
+/// (typical 0.5 for ~−6 dBFS). Same buffer-length rules.
+///
+/// # Safety
+/// Same as [`mfsk_ft8_tones_to_i16`] — `itone` must point to 79
+/// valid bytes, `out` must point to a writable f32 buffer of at
+/// least `out_len` samples; returns `ScratchTooSmall` if `out_len`
+/// is below `mfsk_ft8_synth_output_len()`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mfsk_ft8_tones_to_f32(
+    itone: *const u8,
+    f0_hz: f32,
+    amplitude: f32,
+    out: *mut f32,
+    out_len: usize,
+) -> MfskFt8Status {
+    if itone.is_null() || out.is_null() {
+        return MfskFt8Status::NullPointer;
+    }
+    if out_len < TONES_OUTPUT_LEN {
+        return MfskFt8Status::ScratchTooSmall;
+    }
+    let itone_slice = unsafe { core::slice::from_raw_parts(itone, 79) };
+    let mut itone_arr = [0u8; 79];
+    itone_arr.copy_from_slice(itone_slice);
+    let out_slice = unsafe { core::slice::from_raw_parts_mut(out, TONES_OUTPUT_LEN) };
+    tones_to_f32_into(out_slice, &itone_arr, f0_hz, amplitude);
+    MfskFt8Status::Ok
 }
 
 // ── Embedded runtime (no_std + staticlib needs these) ──────────────────────

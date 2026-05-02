@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.5.1 — `mfsk-ffi-ft8` adds the FT8 transmit chain
+
+0.5.0 shipped the `mfsk-ffi-ft8` C ABI for the FT8 **decode** slice.
+0.5.1 fills in the matching **transmit / synth chain** so embedded
+C/C++ projects can both decode and generate FT8 from the same
+library. API-additive — the v0.5.0 decode signature is unchanged.
+
+### What's new
+
+- `mfsk_ft8_pack77(call1, call2, report, out_message77[77])` — pack
+  three message tokens (typical CQ, callsign, report-or-grid) into
+  a 77-bit FT8 message via `mfsk_core::msg::wsjt77::pack77`.
+- `mfsk_ft8_message_to_tones(message77[77], out_itone[79])` — LDPC
+  encode + CRC-14 + Costas + Gray-mapping. Wraps
+  `mfsk_core::ft8::wave_gen::message_to_tones`.
+- `mfsk_ft8_tones_to_i16(itone[79], f0_hz, amp_i16, out, out_len)` —
+  GFSK synth into a caller-provided i16 buffer (12 kHz mono,
+  151 680 samples = 12.64 s of audio). No surprise heap-alloc.
+- `mfsk_ft8_tones_to_f32(...)` — same as above, f32 amplitude /
+  PCM.
+- `mfsk_ft8_synth_output_len()` — returns 151 680 (the buffer-size
+  constant, exposed for runtime sizing).
+
+### Workflow fix (also lands in this release)
+
+`release.yml` Xtensa CI builds (`release-ffi-esp32`,
+`release-ffi-esp32s3`) needed `-Z build-std=core,alloc,panic_abort`
++ explicit `cargo +esp` to pick up rust-src — fixed for v0.5.1+.
+The v0.5.0 release's Xtensa binaries were uploaded manually after
+local cross-builds; v0.5.1's should attach automatically.
+
+### Breaking changes
+
+None. Existing `mfsk_ft8_decode_i16` / `mfsk_ft8_decode_i16_alloc` /
+`mfsk_ft8_result_list_free` keep their v0.5.0 signatures.
+
 ## 0.5.0 — End-to-end embedded port (M5Stack Core2 reference)
 
 The 0.4.x line built the embedded baseline (no_std + alloc, pluggable

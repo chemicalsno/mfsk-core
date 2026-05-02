@@ -1,6 +1,6 @@
 [package]
 name        = "mfsk-ffi-ft8"
-version     = "0.5.0"
+version     = "0.5.1"
 edition     = "2024"
 license     = "GPL-3.0-or-later"
 description = "Embedded-friendly C ABI for the FT8 decoder slice of mfsk-core. Pairs with esp-idf / RP2040 / Cortex-M C/C++ projects via a static library + cbindgen-generated header. See `embedded-poc/idf-component/` for the worked esp-idf integration."
@@ -44,16 +44,20 @@ embedded-fixed-point = [
 
 # Provide default `#[panic_handler]` + `#[global_allocator]` inside
 # `mfsk-ffi-ft8` itself, hooked to standard libc `malloc`/`free`/
-# `abort` (esp-idf, newlib, picolibc satisfy this). On by default
-# under `embedded-fixed-point` so the resulting `libmfsk_ft8.a` drops
-# straight into a C ESP-IDF link without the user needing a Rust
-# shim. **Disable** this feature if your build supplies its own Rust
-# panic handler / allocator (e.g. you're stacking another Rust
-# `staticlib` in the same binary).
+# `abort` (esp-idf, newlib, picolibc satisfy this). Enable this
+# alongside `embedded-fixed-point` for **cross-target builds**
+# (xtensa-esp32-espidf, xtensa-esp32s3-espidf, RP2040, Cortex-M)
+# so the resulting `libmfsk_ft8.a` drops straight into a C link
+# without the user needing a Rust shim. **Do not enable on host
+# targets** (linux/macOS/windows): host `cdylib`/`staticlib`
+# always link some unwinding stub that already provides a
+# `panic_impl` lang item, conflicting with the one this feature
+# adds. Disable also when stacking another Rust runtime in the
+# same image.
 embedded-runtime = []
 
 [dependencies]
-mfsk-core = { path = "../mfsk-core", version = "0.5", default-features = false }
+mfsk-core = { path = "../mfsk-core", version = "0.5.1", default-features = false }
 
 [build-dependencies]
 cbindgen = "0.29"

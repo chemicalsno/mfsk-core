@@ -1,6 +1,6 @@
 [package]
 name        = "mfsk-core"
-version     = "0.5.0"
+version     = "0.5.1"
 edition     = "2024"
 license     = "GPL-3.0-or-later"
 description = "Pure-Rust WSJT-family decoders and synthesisers (FT8 FT4 FST4 WSPR JT9 JT65 Q65) behind a zero-cost Protocol trait. no_std + alloc capable with a pluggable FFT backend; ESP32-S3 PoC included."
