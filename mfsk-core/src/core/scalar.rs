@@ -371,6 +371,18 @@ pub fn cmplx_f32_2d_as_complex<const N: usize, const M: usize>(
     unsafe { &*(s as *const [[Cmplx<f32>; N]; M] as *const [[num_complex::Complex<f32>; N]; M]) }
 }
 
+/// Reverse of [`cmplx_f32_2d_as_complex_mut`]: cast a 2D
+/// `&mut [[Complex<f32>; N]; M]` (e.g. a stack-built test fixture)
+/// to `&mut [[Cmplx<f32>; N]; M]` so it can be passed to functions
+/// post-Phase-2 that take the Cmplx-typed argument.
+#[inline]
+pub fn complex_f32_2d_as_cmplx_mut<const N: usize, const M: usize>(
+    s: &mut [[num_complex::Complex<f32>; N]; M],
+) -> &mut [[Cmplx<f32>; N]; M] {
+    // SAFETY: layout-compatible types.
+    unsafe { &mut *(s as *mut [[num_complex::Complex<f32>; N]; M] as *mut [[Cmplx<f32>; N]; M]) }
+}
+
 impl<S: SpecScalar> Cmplx<S> {
     #[inline]
     pub const fn new(re: S, im: S) -> Self {

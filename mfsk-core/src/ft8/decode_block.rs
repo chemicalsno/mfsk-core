@@ -33,6 +33,7 @@ use super::params::{BP_MAX_ITER, COSTAS, COSTAS_POS, LDPC_N, NMAX, NN, NSPS, NTO
 use super::wave_gen::message_to_tones;
 #[cfg(not(feature = "fixed-point"))]
 use crate::core::fft::default_planner;
+use crate::core::scalar::{Cmplx, cmplx_f32_2d_as_complex_mut};
 use crate::core::sync::SyncCandidate;
 use crate::fec::ldpc::bp::check_crc14;
 use crate::fec::ldpc::osd::{osd_decode, osd_decode_deep};
@@ -825,9 +826,9 @@ pub fn symbol_spectra_direct<S: AudioSample>(
     freq_hz: f32,
     dt_sec: f32,
     sym_mask: SymMask,
-) -> Box<[[Complex<f32>; 8]; 79]> {
-    let mut out: Box<[[Complex<f32>; 8]; 79]> =
-        vec![[Complex::new(0.0f32, 0.0); 8]; 79].try_into().unwrap();
+) -> Box<[[Cmplx<f32>; 8]; 79]> {
+    let mut out: Box<[[Cmplx<f32>; 8]; 79]> =
+        vec![[Cmplx::<f32>::default(); 8]; 79].try_into().unwrap();
     fill_symbol_spectra(&mut out, audio, freq_hz, dt_sec, sym_mask);
     out
 }
@@ -879,12 +880,15 @@ fn sym_in_mask(sym: usize, mask: SymMask) -> bool {
 #[doc(hidden)]
 #[cfg(not(feature = "fixed-point"))]
 pub fn fill_symbol_spectra<S: AudioSample>(
-    out: &mut [[Complex<f32>; 8]; 79],
+    out: &mut [[Cmplx<f32>; 8]; 79],
     audio: &[S],
     freq_hz: f32,
     dt_sec: f32,
     mask: SymMask,
 ) {
+    // Reuse the existing `Complex<f32>` rotator inner loops by
+    // viewing the layout-compat Cmplx<f32> storage as Complex<f32>.
+    let out: &mut [[Complex<f32>; 8]; 79] = cmplx_f32_2d_as_complex_mut(out);
     let i0 = ((TX_START_OFFSET_S + dt_sec) * SAMPLE_RATE_HZ).round() as i64;
     let two_pi_over_fs = core::f32::consts::TAU / SAMPLE_RATE_HZ;
 
@@ -950,7 +954,7 @@ pub const BASIS_SCRATCH_LEN: usize = NTONES * NSPS;
 #[doc(hidden)]
 #[cfg(feature = "fixed-point")]
 pub fn fill_symbol_spectra<S: AudioSample>(
-    out: &mut [[Complex<f32>; 8]; 79],
+    out: &mut [[Cmplx<f32>; 8]; 79],
     audio: &[S],
     freq_hz: f32,
     dt_sec: f32,
@@ -997,7 +1001,7 @@ pub fn fill_symbol_spectra<S: AudioSample>(
 #[doc(hidden)]
 #[cfg(feature = "fixed-point")]
 pub fn fill_symbol_spectra_into<S: AudioSample>(
-    out: &mut [[Complex<f32>; 8]; 79],
+    out: &mut [[Cmplx<f32>; 8]; 79],
     audio: &[S],
     freq_hz: f32,
     dt_sec: f32,
@@ -1006,6 +1010,7 @@ pub fn fill_symbol_spectra_into<S: AudioSample>(
     basis_im: &mut [i16],
 ) {
     use crate::core::dotprod::dot_q15_i32;
+    let out: &mut [[Complex<f32>; 8]; 79] = cmplx_f32_2d_as_complex_mut(out);
     debug_assert!(basis_re.len() >= BASIS_SCRATCH_LEN);
     debug_assert!(basis_im.len() >= BASIS_SCRATCH_LEN);
     let i0 = ((TX_START_OFFSET_S + dt_sec) * SAMPLE_RATE_HZ).round() as i64;
@@ -1072,9 +1077,9 @@ pub fn symbol_spectra_direct_into<S: AudioSample>(
     sym_mask: SymMask,
     basis_re: &mut [i16],
     basis_im: &mut [i16],
-) -> Box<[[Complex<f32>; 8]; 79]> {
-    let mut out: Box<[[Complex<f32>; 8]; 79]> =
-        vec![[Complex::new(0.0f32, 0.0); 8]; 79].try_into().unwrap();
+) -> Box<[[Cmplx<f32>; 8]; 79]> {
+    let mut out: Box<[[Cmplx<f32>; 8]; 79]> =
+        vec![[Cmplx::<f32>::default(); 8]; 79].try_into().unwrap();
     fill_symbol_spectra_into(
         &mut out, audio, freq_hz, dt_sec, sym_mask, basis_re, basis_im,
     );
@@ -1162,7 +1167,7 @@ fn pass1_limit() -> usize {
 /// One Pass-2 output: the original candidate, its 79×8 Costas-only
 /// spectrum (filled in stage 3 with the data-symbol DFT), and its
 /// `sync_quality` score for ranking.
-pub type RefinedCandidate = (SyncCandidate, Box<[[Complex<f32>; 8]; 79]>, u32);
+pub type RefinedCandidate = (SyncCandidate, Box<[[Cmplx<f32>; 8]; 79]>, u32);
 
 /// Per-candidate Costas-block-0 DFT + sync_quality_block0 re-rank.
 /// Keeps the top `max_cand` by Pass-2 score; **the cs spectrum is
@@ -1204,15 +1209,15 @@ fn refine_candidates<S: AudioSample>(
 /// PoC's manual Pass 2) can re-rank coarse_sync candidates by this
 /// metric without pulling in the full `decode_block` D-pattern.
 #[doc(hidden)]
-pub fn sync_quality_block0(cs: &[[Complex<f32>; 8]; 79]) -> u32 {
+pub fn sync_quality_block0(cs: &[[Cmplx<f32>; 8]; 79]) -> u32 {
     let mut count = 0u32;
     for (t, &expected) in COSTAS.iter().enumerate() {
         let sym = t; // block 0 starts at symbol 0
         let best = (0..NTONES)
             .max_by(|&a, &b| {
                 cs[sym][a]
-                    .norm()
-                    .partial_cmp(&cs[sym][b].norm())
+                    .norm_sqr_f32()
+                    .partial_cmp(&cs[sym][b].norm_sqr_f32())
                     .unwrap_or(core::cmp::Ordering::Equal)
             })
             .unwrap_or(0);

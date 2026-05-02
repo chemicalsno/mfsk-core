@@ -10,13 +10,18 @@
 use alloc::vec::Vec;
 
 use super::Ft8;
+use crate::core::scalar::{Cmplx, cmplx_f32_2d_as_complex_mut};
 use num_complex::Complex;
 
 pub use crate::core::equalize::EqMode;
 
-/// Apply FT8 local equalisation in place.
+/// Apply FT8 local equalisation in place. cs storage is `Cmplx<f32>`
+/// (post-Phase 2 step 5); we get the existing `Complex<f32>`-based
+/// generic equalize via the layout-compat `cmplx_f32_2d_as_complex_mut`
+/// adapter so the inner algorithm stays untouched.
 #[inline]
-pub fn equalize_local(cs: &mut [[Complex<f32>; 8]; 79]) {
+pub fn equalize_local(cs: &mut [[Cmplx<f32>; 8]; 79]) {
+    let cs: &mut [[Complex<f32>; 8]; 79] = cmplx_f32_2d_as_complex_mut(cs);
     // Flatten → generic apply → inflate back.
     let mut flat: Vec<Complex<f32>> = cs.iter().flatten().copied().collect();
     crate::core::equalize::equalize_local::<Ft8>(&mut flat);
@@ -49,7 +54,7 @@ mod tests {
             }
         }
         let orig = cs;
-        equalize_local(&mut cs);
+        equalize_local(crate::core::scalar::complex_f32_2d_as_cmplx_mut(&mut cs));
         for sym in 0..79 {
             for t in 0..8 {
                 let ratio = cs[sym][t].norm() / orig[sym][t].norm().max(1e-10);
@@ -80,7 +85,7 @@ mod tests {
                 / 8.0;
             v.sqrt() / mean_before
         };
-        equalize_local(&mut cs);
+        equalize_local(crate::core::scalar::complex_f32_2d_as_cmplx_mut(&mut cs));
         let mags_after: Vec<f32> = (0..8).map(|t| cs[40][t].norm()).collect();
         let mean_after = mags_after.iter().sum::<f32>() / 8.0;
         let cv_after = {
@@ -104,7 +109,7 @@ mod tests {
                 cs[sym][t] = Complex::new(mag * phases[t].cos(), mag * phases[t].sin());
             }
         }
-        equalize_local(&mut cs);
+        equalize_local(crate::core::scalar::complex_f32_2d_as_cmplx_mut(&mut cs));
         let ref_phase = cs[40][0].arg();
         for t in 1..7 {
             let phase_diff = (cs[40][t].arg() - ref_phase).abs();

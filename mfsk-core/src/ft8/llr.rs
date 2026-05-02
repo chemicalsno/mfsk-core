@@ -13,7 +13,7 @@ use super::Ft8;
 use num_complex::Complex;
 
 use super::params::{LDPC_N, LLR_SCALE};
-use crate::core::scalar::{Cmplx, LlrScalar, complex_slice_as_cmplx_f32};
+use crate::core::scalar::{Cmplx, LlrScalar};
 
 pub use crate::core::llr::LlrSet as GenericLlrSet;
 
@@ -30,10 +30,10 @@ pub struct LlrSet<T: LlrScalar = f32> {
 }
 
 #[inline]
-fn flatten_cs(cs: &[[Complex<f32>; 8]; 79]) -> Vec<Cmplx<f32>> {
+fn flatten_cs(cs: &[[Cmplx<f32>; 8]; 79]) -> Vec<Cmplx<f32>> {
     let mut out: Vec<Cmplx<f32>> = Vec::with_capacity(79 * 8);
     for sym in cs.iter() {
-        out.extend_from_slice(complex_slice_as_cmplx_f32(sym));
+        out.extend_from_slice(sym);
     }
     out
 }
@@ -47,13 +47,14 @@ fn inflate_llr<T: LlrScalar>(v: Vec<T>) -> [T; LDPC_N] {
 }
 
 /// Compute 8-tone complex spectra for all 79 FT8 symbols.
-pub fn symbol_spectra(cd0: &[Complex<f32>], i_start: usize) -> Box<[[Complex<f32>; 8]; 79]> {
+pub fn symbol_spectra(cd0: &[Complex<f32>], i_start: usize) -> Box<[[Cmplx<f32>; 8]; 79]> {
     let flat = crate::core::llr::symbol_spectra::<Ft8>(cd0, i_start);
-    let mut out: Box<[[Complex<f32>; 8]; 79]> =
-        vec![[Complex::new(0.0, 0.0); 8]; 79].try_into().unwrap();
+    let mut out: Box<[[Cmplx<f32>; 8]; 79]> =
+        vec![[Cmplx::<f32>::default(); 8]; 79].try_into().unwrap();
     for (k, row) in out.iter_mut().enumerate() {
         for t in 0..8 {
-            row[t] = flat[k * 8 + t];
+            let c = flat[k * 8 + t];
+            row[t] = Cmplx { re: c.re, im: c.im };
         }
     }
     out
@@ -64,7 +65,7 @@ pub fn symbol_spectra(cd0: &[Complex<f32>], i_start: usize) -> Box<[[Complex<f32
 /// cs storage stays `Complex<f32>`-typed for source compat; the
 /// internal `compute_llr_generic` consumes a layout-cast
 /// `&[Cmplx<f32>]` view via `flatten_cs`.
-pub fn compute_llr<T: LlrScalar>(cs: &[[Complex<f32>; 8]; 79]) -> LlrSet<T> {
+pub fn compute_llr<T: LlrScalar>(cs: &[[Cmplx<f32>; 8]; 79]) -> LlrSet<T> {
     let flat = flatten_cs(cs);
     let g = crate::core::llr::compute_llr_generic::<Ft8, f32, T>(&flat, 3);
     // Sanity check scale consistency at build time.
@@ -80,7 +81,7 @@ pub fn compute_llr<T: LlrScalar>(cs: &[[Complex<f32>; 8]; 79]) -> LlrSet<T> {
 /// LLRs for the BP-only path: skips nsym=2 and nsym=3 (~5× faster
 /// than [`compute_llr`]). `llrb` / `llrc` come back zero — only
 /// `llra` and `llrd` are valid.
-pub fn compute_llr_fast<T: LlrScalar>(cs: &[[Complex<f32>; 8]; 79]) -> LlrSet<T> {
+pub fn compute_llr_fast<T: LlrScalar>(cs: &[[Cmplx<f32>; 8]; 79]) -> LlrSet<T> {
     let flat = flatten_cs(cs);
     let g = crate::core::llr::compute_llr_generic::<Ft8, f32, T>(&flat, 1);
     LlrSet {
@@ -92,13 +93,13 @@ pub fn compute_llr_fast<T: LlrScalar>(cs: &[[Complex<f32>; 8]; 79]) -> LlrSet<T>
 }
 
 /// WSJT-X compatible SNR from 8-tone spectra + decoded 79-tone sequence.
-pub fn compute_snr_db(cs: &[[Complex<f32>; 8]; 79], itone: &[u8; 79]) -> f32 {
+pub fn compute_snr_db(cs: &[[Cmplx<f32>; 8]; 79], itone: &[u8; 79]) -> f32 {
     let flat = flatten_cs(cs);
     crate::core::llr::compute_snr_db_generic::<Ft8, f32>(&flat, itone)
 }
 
 /// Hard-decision sync quality (0..21). FT8 threshold ≤ 6 → bail out.
-pub fn sync_quality(cs: &[[Complex<f32>; 8]; 79]) -> u32 {
+pub fn sync_quality(cs: &[[Cmplx<f32>; 8]; 79]) -> u32 {
     let flat = flatten_cs(cs);
     crate::core::llr::sync_quality_generic::<Ft8, f32>(&flat)
 }
@@ -109,8 +110,8 @@ mod tests {
 
     #[test]
     fn zero_spectra_zero_llr() {
-        let cs: Box<[[Complex<f32>; 8]; 79]> =
-            vec![[Complex::new(0.0f32, 0.0); 8]; 79].try_into().unwrap();
+        let cs: Box<[[Cmplx<f32>; 8]; 79]> =
+            vec![[Cmplx::<f32>::default(); 8]; 79].try_into().unwrap();
         let llr_set: LlrSet = compute_llr(&cs);
         let any_large = llr_set.llra.iter().any(|&x| x.abs() > 1.0);
         assert!(!any_large, "zero input should not produce large LLRs");
@@ -118,8 +119,8 @@ mod tests {
 
     #[test]
     fn llr_length_is_174() {
-        let cs: Box<[[Complex<f32>; 8]; 79]> =
-            vec![[Complex::new(0.0f32, 0.0); 8]; 79].try_into().unwrap();
+        let cs: Box<[[Cmplx<f32>; 8]; 79]> =
+            vec![[Cmplx::<f32>::default(); 8]; 79].try_into().unwrap();
         let llr_set: LlrSet = compute_llr(&cs);
         assert_eq!(llr_set.llra.len(), 174);
         assert_eq!(llr_set.llrd.len(), 174);
@@ -128,14 +129,14 @@ mod tests {
     #[test]
     fn sync_quality_costas_perfect() {
         use super::super::params::COSTAS;
-        let mut cs = vec![[Complex::new(0.0f32, 0.0); 8]; 79];
+        let mut cs = vec![[Cmplx::<f32>::default(); 8]; 79];
         for &sym_offset in &[0usize, 36, 72] {
             for t in 0..7 {
                 let sym = sym_offset + t;
-                cs[sym][COSTAS[t]] = Complex::new(1.0, 0.0);
+                cs[sym][COSTAS[t]] = Cmplx { re: 1.0, im: 0.0 };
             }
         }
-        let cs_box: Box<[[Complex<f32>; 8]; 79]> = cs.try_into().unwrap();
+        let cs_box: Box<[[Cmplx<f32>; 8]; 79]> = cs.try_into().unwrap();
         assert_eq!(sync_quality(&cs_box), 21);
     }
 }

@@ -393,7 +393,7 @@ fn process_candidate(
         }
     };
 
-    let try_decode = |cs: &[[num_complex::Complex<f32>; 8]; 79],
+    let try_decode = |cs: &[[crate::core::scalar::Cmplx<f32>; 8]; 79],
                       use_ap: bool|
      -> Option<DecodeResult> {
         let llr_set = compute_llr(cs);

@@ -279,7 +279,7 @@ fn decode_one(slot: &[i16], max_cand: usize, dt_grid: u8, df_grid: u8, q_thresh:
     for cand in &cands {
         // Pick the best (df, dt) by sync_quality on Costas-only DFT.
         let mut best: Option<(
-            alloc::boxed::Box<[[num_complex::Complex<f32>; 8]; 79]>,
+            alloc::boxed::Box<[[mfsk_core::core::scalar::Cmplx<f32>; 8]; 79]>,
             f32,
             f32,
             u32,
