@@ -316,12 +316,26 @@ impl SpecScalar for Q14i16 {
 /// 1) this type is defined but call sites still use `Complex<f32>`.
 ///
 /// Field order matches `num_complex::Complex` so a `Cmplx<f32>` is
-/// layout-compatible with `Complex<f32>` (`#[repr(C)]` on both).
+/// layout-compatible with `Complex<f32>` (`#[repr(C)]` on both) —
+/// the conversion helpers in this module turn that into a zero-cost
+/// view rather than a copy.
 #[repr(C)]
 #[derive(Copy, Clone, Default, Debug, PartialEq, Eq)]
 pub struct Cmplx<S: SpecScalar> {
     pub re: S,
     pub im: S,
+}
+
+/// Reinterpret `&[Complex<f32>]` as `&[Cmplx<f32>]` without copying.
+///
+/// Both types are `#[repr(C)]` with two consecutive `f32` fields in
+/// the same order, so a slice of one points at the same bytes as a
+/// slice of the other. The unit test `cmplx_layout_compat_with_num_complex`
+/// in this module confirms `size_of` and `align_of` agree.
+#[inline]
+pub fn complex_slice_as_cmplx_f32(s: &[num_complex::Complex<f32>]) -> &[Cmplx<f32>] {
+    // SAFETY: layout-compatible types per the comment above.
+    unsafe { core::slice::from_raw_parts(s.as_ptr() as *const Cmplx<f32>, s.len()) }
 }
 
 impl<S: SpecScalar> Cmplx<S> {

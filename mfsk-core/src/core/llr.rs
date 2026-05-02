@@ -15,7 +15,7 @@ use num_traits::Float;
 
 use super::Protocol;
 use crate::core::fft::default_planner;
-use crate::core::scalar::LlrScalar;
+use crate::core::scalar::{Cmplx, LlrScalar, SpecScalar, complex_slice_as_cmplx_f32};
 
 // ──────────────────────────────────────────────────────────────────────────
 // LLR bundle
@@ -252,6 +252,14 @@ fn compute_llr_capped<P: Protocol, T: LlrScalar>(
 /// SNR_dB = `10·log10(sig/noi − 1) − 27` clamped to −24 dB floor (WSJT-X
 /// convention, applied per-tone bandwidth → 2500 Hz reference).
 pub fn compute_snr_db<P: Protocol>(cs: &[Complex<f32>], itone: &[u8]) -> f32 {
+    compute_snr_db_generic::<P, f32>(complex_slice_as_cmplx_f32(cs), itone)
+}
+
+/// Same as [`compute_snr_db`] but generic over the [`SpecScalar`]
+/// type. The signal/noise sums use `S::Wide` accumulator and convert
+/// to f32 at the boundary, so a `Cmplx<Q14i16>` cs gives a sane SNR
+/// without intermediate f32 quantisation.
+pub fn compute_snr_db_generic<P: Protocol, S: SpecScalar>(cs: &[Cmplx<S>], itone: &[u8]) -> f32 {
     let ntones = P::NTONES as usize;
     let n_sym = P::N_SYMBOLS as usize;
     let mut xsig = 0.0f32;
@@ -259,8 +267,8 @@ pub fn compute_snr_db<P: Protocol>(cs: &[Complex<f32>], itone: &[u8]) -> f32 {
     let offset = ntones / 2;
     for k in 0..n_sym.min(itone.len()) {
         let t = itone[k] as usize % ntones;
-        xsig += cs[k * ntones + t].norm_sqr();
-        xnoi += cs[k * ntones + (t + offset) % ntones].norm_sqr();
+        xsig += cs[k * ntones + t].norm_sqr_f32();
+        xnoi += cs[k * ntones + (t + offset) % ntones].norm_sqr_f32();
     }
     if xnoi < f32::EPSILON {
         return -24.0;
@@ -276,6 +284,17 @@ pub fn compute_snr_db<P: Protocol>(cs: &[Complex<f32>], itone: &[u8]) -> f32 {
 /// matches the protocol's Costas pattern. Range is 0..N_SYNC; callers
 /// typically threshold on this.
 pub fn sync_quality<P: Protocol>(cs: &[Complex<f32>]) -> u32 {
+    sync_quality_generic::<P, f32>(complex_slice_as_cmplx_f32(cs))
+}
+
+/// Generic version of [`sync_quality`]. Accepts any [`Cmplx<S>`]
+/// slice; the per-tone "is this the dominant magnitude?" comparison
+/// uses `S::Wide` (i32 for Q14i16) so no f32 round-trip is needed
+/// on the embedded fixed-point path.
+pub fn sync_quality_generic<P: Protocol, S: SpecScalar>(cs: &[Cmplx<S>]) -> u32
+where
+    S::Wide: PartialOrd,
+{
     let ntones = P::NTONES as usize;
     let mut count = 0u32;
     for block in P::SYNC_MODE.blocks() {
@@ -284,10 +303,9 @@ pub fn sync_quality<P: Protocol>(cs: &[Complex<f32>]) -> u32 {
             let sym = start + t;
             let best = (0..ntones)
                 .max_by(|&a, &b| {
-                    cs[sym * ntones + a]
-                        .norm()
-                        .partial_cmp(&cs[sym * ntones + b].norm())
-                        .unwrap()
+                    let na = cs[sym * ntones + a].norm_sqr_wide();
+                    let nb = cs[sym * ntones + b].norm_sqr_wide();
+                    na.partial_cmp(&nb).unwrap()
                 })
                 .unwrap_or(0);
             if best == expected as usize {
