@@ -61,10 +61,23 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         # Mirrors ci.yml's publish-dry-run: --features full so the
         # in-package verification compile exercises every protocol.
-        # `mfsk-ffi-ft8` stays workspace-only (publish = false in its
-        # Cargo.toml) — its consumers download the prebuilt .a from
-        # the GitHub release attached below, not via crates.io.
         run: cargo publish -p mfsk-core --features full
+
+      # crates.io needs a moment to index the new mfsk-core version
+      # before mfsk-ffi-ft8's `version = "0.5.x"` dep resolves on
+      # the verification compile. ~45 s is conservative.
+      - name: Wait for crates.io index
+        run: sleep 45
+
+      - name: Publish mfsk-ffi-ft8 to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        # Default features (host) — pulls rustfft so the in-package
+        # verification compile exercises the actual host link path
+        # users get with `cargo add mfsk-ffi-ft8`. The prebuilt
+        # binaries attached below cover users who don't want to
+        # cross-compile.
+        run: cargo publish -p mfsk-ffi-ft8
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
