@@ -52,10 +52,31 @@ in the trait layer.
 | **M5Stack Core2** | **ESP32-D0WD-V3** (Xtensa LX6, dual-core 240 MHz, single-issue f32 FPU, 16 MB flash, ~4 MB PSRAM) — confirmed by `espflash board-info`: `Chip type: esp32 (revision v3.1)` / `Features: WiFi, BT, Dual Core, 240MHz`. **Not** an ESP32-S2 (LX7, single-core, no BT) or S3. | esp-dsp ASM (`dsps_dotprod_s16_ae32`, `dsps_fft2r_*`) | Reference real-audio bench. See benchmark + footprint sections below. |
 | ESP32-S3 (DevKitC) | Xtensa LX7 + PIE SIMD | esp-dsp ASM | Earlier reference; same `fft-extern` contract. |
 
-The `fft-extern` + `dotprod-extern` contracts are designed to be
-target-portable (RP2040, RP2350-Hazard3, Cortex-M0/M3, etc.) but those
-ports are not exercised in our CI. `embedded-poc/m5stack-core2/` is
-the worked example to copy from.
+### Other targets — what's verified vs aspirational
+
+The `fft-extern` + `dotprod-extern` contracts are *designed* to be
+target-portable, and `mfsk-ffi-ft8` cross-builds cleanly to several
+non-Xtensa MCUs:
+
+| Target | `cargo build` clean | FFT/dotprod shim shipped | Hardware-tested |
+|---|---|---|---|
+| `xtensa-esp32-espidf` | ✅ | ✅ esp-dsp (Core2) | ✅ qso1/2/3 sweep |
+| `xtensa-esp32s3-espidf` | ✅ | ✅ esp-dsp (S3 PoC) | ✅ earlier reference |
+| `thumbv8m.main-none-eabihf` (RP2350 Cortex-M33) | ✅ | ❌ candidates: CMSIS-DSP via pico-sdk-rs | ❌ |
+| `riscv32imac-unknown-none-elf` (RP2350 Hazard3) | ✅ | ❌ no DSP library; `microfft` for FFT, scalar Rust for dot product | ❌ |
+| `thumbv7em-none-eabihf` (Cortex-M4F / M7) | not tried | ❌ candidates: CMSIS-DSP `arm_*_q15` | ❌ |
+| `thumbv6m-none-eabi` (Cortex-M0+ / RP2040) | not tried | ❌ scalar Rust only (no DSP unit) | ❌ |
+
+**ESP32 / ESP32-S3** (Xtensa LX6 / LX7) are the only targets we
+exercise end-to-end with real audio. For everything else, the
+library *can* build (try
+`cargo build -p mfsk-ffi-ft8 --release --no-default-features
+--features embedded-fixed-point,embedded-runtime --target <T>`),
+but you'll need to supply the two extern Rust symbols yourself.
+Concrete RP2040 / RP2350 / Cortex-M shims are tracked as future
+work.
+
+`embedded-poc/m5stack-core2/` is the worked example to copy from.
 
 ## Cargo features for embedded use
 

@@ -50,10 +50,28 @@ trait 層に新規追加は不要です。
 | **M5Stack Core2** | **ESP32-D0WD-V3** (Xtensa LX6, dual-core 240 MHz, 単発 f32 FPU, 16 MB flash, 約 4 MB PSRAM) — `espflash board-info` で確認: `Chip type: esp32 (revision v3.1)` / `Features: WiFi, BT, Dual Core, 240MHz`。**ESP32-S2 ではない** (S2 は LX7 single-core で BT 無し) し S3 でもない | esp-dsp ASM (`dsps_dotprod_s16_ae32`, `dsps_fft2r_*`) | リファレンス実音声ベンチ。下のベンチ + フットプリント節参照 |
 | ESP32-S3 (DevKitC) | Xtensa LX7 + PIE SIMD | esp-dsp ASM | 旧リファレンス。同じ `fft-extern` 契約 |
 
-`fft-extern` + `dotprod-extern` 契約は他ターゲット (RP2040,
-RP2350-Hazard3, Cortex-M0/M3 など) にもポータブルな設計ですが、
-CI では検証していません。`embedded-poc/m5stack-core2/` が
-コピー元の見本です。
+### 他ターゲット — 検証状況 vs 構想
+
+`fft-extern` + `dotprod-extern` 契約は他ターゲットへの portable な
+**設計**で、`mfsk-ffi-ft8` は非 Xtensa MCU 向けにも clean に cross-build します:
+
+| ターゲット | `cargo build` 通る | FFT/dotprod shim 提供 | 実機検証 |
+|---|---|---|---|
+| `xtensa-esp32-espidf` | ✅ | ✅ esp-dsp (Core2) | ✅ qso1/2/3 sweep |
+| `xtensa-esp32s3-espidf` | ✅ | ✅ esp-dsp (S3 PoC) | ✅ 旧リファレンス |
+| `thumbv8m.main-none-eabihf` (RP2350 Cortex-M33) | ✅ | ❌ 候補: pico-sdk-rs 経由で CMSIS-DSP | ❌ |
+| `riscv32imac-unknown-none-elf` (RP2350 Hazard3) | ✅ | ❌ DSP ライブラリ無し。FFT は `microfft`、dot は scalar Rust | ❌ |
+| `thumbv7em-none-eabihf` (Cortex-M4F / M7) | 未試行 | ❌ 候補: CMSIS-DSP の `arm_*_q15` | ❌ |
+| `thumbv6m-none-eabi` (Cortex-M0+ / RP2040) | 未試行 | ❌ scalar Rust のみ (DSP ユニット無し) | ❌ |
+
+**実機 end-to-end 動作確認は ESP32 / ESP32-S3 (Xtensa LX6 / LX7) のみ**。
+他ターゲットは cross-build できる (試: `cargo build -p mfsk-ffi-ft8
+--release --no-default-features --features embedded-fixed-point,
+embedded-runtime --target <T>`) が、2 つの extern Rust シンボルを
+ユーザ側で用意する必要あり。RP2040 / RP2350 / Cortex-M 用の具体的
+shim は将来の作業です。
+
+`embedded-poc/m5stack-core2/` が コピー元の見本です。
 
 ## 組み込み用 Cargo feature
 
