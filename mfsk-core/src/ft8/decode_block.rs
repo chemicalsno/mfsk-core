@@ -517,48 +517,116 @@ pub fn coarse_sync(
         (0..spec.n_time).filter(|&m| mark[m]).collect()
     };
 
-    // Pre-compute Σ_k (spec[lo,m] + spec[lo+1,m]) for every (fi, m
-    // ∈ needed_m). 16 reads per (fi, m) cell; allsum vector still
-    // shaped n_freq × n_time so the score loop can index by m_u
-    // without remapping.
+    // Pre-compute Σ_k (spec[lo,m] + spec[lo+1,m]) for every
+    // (fi, m ∈ needed_m).
+    //
+    // **Sliding-window optimisation**: at NFFT_SPEC=4096, tone_step_bins
+    // ≈ 2.13 → tone_bin_lo = [0, 2, 4, 6, 8, 10, 12, 14], i.e. the 8
+    // tones plus the multi-bin neighbour cover the **16 contiguous
+    // bins** `[i_carrier, i_carrier + 15]`. So allsum reduces to a
+    // 16-bin sum that slides by one bin as fi advances:
+    //   `allsum[fi+1, m] = allsum[fi, m] − spec[i_carrier, m] + spec[i_carrier + 16, m]`
+    // — 2 reads/op per (fi, m) update vs the full 16. ~8× fewer spec
+    // reads in the precompute, big PSRAM-bandwidth win on Core2.
+    //
+    // The contiguous layout holds when tone_step_bins > 2 floors to
+    // even integer steps of 2; verify and fall back to the generic
+    // sum if a future NFFT_SPEC breaks the assumption.
+    let win = 2 * NTONES; // 16 contiguous bins
+    let contiguous = (0..NTONES).all(|k| tone_bin_lo[k] == 2 * k);
     let mut allsum = vec![0.0f32; n_freq * spec.n_time];
-    for (fi, i_carrier) in (ia..=ib).enumerate() {
-        let row_off = fi * spec.n_time;
+    if contiguous {
+        // Initial column (fi=0): full 16-bin sum.
+        let row0 = 0;
         for &m in &needed_m {
             let mut s = 0.0f32;
-            for k in 0..NTONES {
-                let lo = (i_carrier + tone_bin_lo[k]).min(nh1 - 1);
-                let hi = (lo + 1).min(nh1 - 1);
-                s += spec.power(lo, m) + spec.power(hi, m);
+            for j in 0..win {
+                let bin = (ia + j).min(nh1 - 1);
+                s += spec.power(bin, m);
             }
-            allsum[row_off + m] = s;
+            allsum[row0 * spec.n_time + m] = s;
+        }
+        // Slide for fi=1..n_freq.
+        for fi in 1..n_freq {
+            let drop_bin = ia + fi - 1;
+            let add_bin = (ia + fi + win - 1).min(nh1 - 1);
+            let prev_off = (fi - 1) * spec.n_time;
+            let curr_off = fi * spec.n_time;
+            for &m in &needed_m {
+                allsum[curr_off + m] =
+                    allsum[prev_off + m] - spec.power(drop_bin, m) + spec.power(add_bin, m);
+            }
+        }
+    } else {
+        // Generic fallback: 16 reads per (fi, m).
+        for (fi, i_carrier) in (ia..=ib).enumerate() {
+            let row_off = fi * spec.n_time;
+            for &m in &needed_m {
+                let mut s = 0.0f32;
+                for k in 0..NTONES {
+                    let lo = (i_carrier + tone_bin_lo[k]).min(nh1 - 1);
+                    let hi = (lo + 1).min(nh1 - 1);
+                    s += spec.power(lo, m) + spec.power(hi, m);
+                }
+                allsum[row_off + m] = s;
+            }
         }
     }
     #[cfg(feature = "std")]
     let t_allsum = std::time::Instant::now();
 
     // Three identical Costas arrays at symbol positions 0, 36, 72.
-    // Note: block 0's lowest m is `jstrt + (-jz) < 0` for the
-    // standard slot, so the `m < 0` guard is load-bearing — only
-    // the upper bound can be elided.
+    //
+    // **Bounds-check hoist**. For the standard FT8 slot:
+    //   block 0: m = lag + jstrt + NSSY*n   ∈ [-7..31] over (lag, n)
+    //   block 1: m = lag + jstrt + 144 + NSSY*n  ∈ [65..103]
+    //   block 2: m = lag + jstrt + 288 + NSSY*n  ∈ [137..175]
+    //
+    // Only block 0 can dip below 0 (and only at large negative lag).
+    // Compute the smallest valid `n` per lag once, then iterate
+    // n_start..NTONES_C without per-iter checks. Blocks 1 and 2 are
+    // always fully in range. Sanity-check the upper bound at function
+    // entry so the unchecked-as-usize is safe.
+    debug_assert!(
+        m_base[2][COSTAS.len() - 1] + jz < spec.n_time as i32,
+        "n_time too small for SYNC_LAG_S/jstrt"
+    );
     let n_time = spec.n_time;
-    let n_time_i = n_time as i32;
+    // Per-fi: tbin_lo[n] = i_carrier + costas_off[n]. Hoist out of
+    // the lag loop — saves an addition per inner iteration.
+    let mut tbin_lo_arr = [0usize; COSTAS.len()];
     for (fi, i_carrier) in (ia..=ib).enumerate() {
+        for n in 0..COSTAS.len() {
+            tbin_lo_arr[n] = i_carrier + costas_off[n];
+        }
         let allsum_row = &allsum[fi * n_time..(fi + 1) * n_time];
         for lag in -jz..=jz {
             let mut t_blocks = [0.0f32; 3];
             let mut t0_blocks = [0.0f32; 3];
 
-            for bk in 0..COSTAS_POS.len() {
+            // Block 0: smallest valid n where m_base[0][n] + lag >= 0.
+            // m_base[0][n] = jstrt + NSSY*n. Solve for n:
+            //   jstrt + NSSY*n + lag >= 0 ⇒ n >= ceil((-jstrt - lag) / NSSY)
+            let bk0_n_start = {
+                let needed = -jstrt - lag;
+                if needed <= 0 {
+                    0usize
+                } else {
+                    ((needed + NSSY - 1) / NSSY).min(COSTAS.len() as i32) as usize
+                }
+            };
+            for n in bk0_n_start..COSTAS.len() {
+                let m_u = (m_base[0][n] + lag) as usize;
+                let tbin_lo = tbin_lo_arr[n];
+                t_blocks[0] += spec.power(tbin_lo, m_u) + spec.power(tbin_lo + 1, m_u);
+                t0_blocks[0] += allsum_row[m_u];
+            }
+            // Blocks 1, 2: always fully in range — no per-iter check.
+            for bk in 1..COSTAS_POS.len() {
                 for n in 0..COSTAS.len() {
-                    let m = m_base[bk][n] + lag;
-                    if m < 0 || m >= n_time_i {
-                        continue;
-                    }
-                    let m_u = m as usize;
-                    let tbin_lo = i_carrier + costas_off[n];
-                    let tbin_hi = tbin_lo + 1;
-                    t_blocks[bk] += spec.power(tbin_lo, m_u) + spec.power(tbin_hi, m_u);
+                    let m_u = (m_base[bk][n] + lag) as usize;
+                    let tbin_lo = tbin_lo_arr[n];
+                    t_blocks[bk] += spec.power(tbin_lo, m_u) + spec.power(tbin_lo + 1, m_u);
                     t0_blocks[bk] += allsum_row[m_u];
                 }
             }
