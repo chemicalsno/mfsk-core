@@ -246,16 +246,27 @@ pub struct Spectrogram {
     data: Vec<SpecCell>,
 }
 
+/// coarse_sync inner-loop accumulator. Phase 3 of the integer-pure
+/// embedded port: under `fixed-point` the allsum / t_blocks / t0_blocks
+/// chain stays in `i32` (sums of u16 power cells, max ~2^25 ≪ i31), and
+/// only the final score division converts to f32. Under host f32 the
+/// alias collapses to f32 so the path stays bit-identical.
+#[cfg(feature = "fixed-point")]
+type CoarseAcc = i32;
+#[cfg(not(feature = "fixed-point"))]
+type CoarseAcc = f32;
+
 impl Spectrogram {
+    /// Power-cell read in `CoarseAcc` (i32 under fixed-point, f32 otherwise).
+    /// Used by `coarse_sync` to keep the precompute + score loop integer-pure
+    /// on the embedded path — no per-cell u16→f32 promotion in the hot loop.
+    /// Under host f32 the cast collapses to a no-op.
     #[inline]
-    fn power(&self, freq_bin: usize, time_idx: usize) -> f32 {
+    fn power_acc(&self, freq_bin: usize, time_idx: usize) -> CoarseAcc {
         debug_assert!(freq_bin < self.n_freq);
         debug_assert!(time_idx < self.n_time);
-        // `as f32` is a real promotion under `fixed-point` (SpecCell=u16)
-        // and a no-op when SpecCell=f32 — write it once, let the compiler
-        // pick the right branch.
         #[allow(clippy::unnecessary_cast)]
-        let v = self.data[time_idx * self.n_freq + freq_bin] as f32;
+        let v = self.data[time_idx * self.n_freq + freq_bin] as CoarseAcc;
         v
     }
 }
@@ -558,15 +569,15 @@ pub fn coarse_sync(
     // sum if a future NFFT_SPEC breaks the assumption.
     let win = 2 * NTONES; // 16 contiguous bins
     let contiguous = (0..NTONES).all(|k| tone_bin_lo[k] == 2 * k);
-    let mut allsum = vec![0.0f32; n_freq * spec.n_time];
+    let mut allsum: Vec<CoarseAcc> = vec![CoarseAcc::default(); n_freq * spec.n_time];
     if contiguous {
         // Initial column (fi=0): full 16-bin sum.
         let row0 = 0;
         for &m in &needed_m {
-            let mut s = 0.0f32;
+            let mut s: CoarseAcc = CoarseAcc::default();
             for j in 0..win {
                 let bin = (ia + j).min(nh1 - 1);
-                s += spec.power(bin, m);
+                s += spec.power_acc(bin, m);
             }
             allsum[row0 * spec.n_time + m] = s;
         }
@@ -578,7 +589,7 @@ pub fn coarse_sync(
             let curr_off = fi * spec.n_time;
             for &m in &needed_m {
                 allsum[curr_off + m] =
-                    allsum[prev_off + m] - spec.power(drop_bin, m) + spec.power(add_bin, m);
+                    allsum[prev_off + m] - spec.power_acc(drop_bin, m) + spec.power_acc(add_bin, m);
             }
         }
     } else {
@@ -586,11 +597,11 @@ pub fn coarse_sync(
         for (fi, i_carrier) in (ia..=ib).enumerate() {
             let row_off = fi * spec.n_time;
             for &m in &needed_m {
-                let mut s = 0.0f32;
+                let mut s: CoarseAcc = CoarseAcc::default();
                 for k in 0..NTONES {
                     let lo = (i_carrier + tone_bin_lo[k]).min(nh1 - 1);
                     let hi = (lo + 1).min(nh1 - 1);
-                    s += spec.power(lo, m) + spec.power(hi, m);
+                    s += spec.power_acc(lo, m) + spec.power_acc(hi, m);
                 }
                 allsum[row_off + m] = s;
             }
@@ -625,8 +636,8 @@ pub fn coarse_sync(
         }
         let allsum_row = &allsum[fi * n_time..(fi + 1) * n_time];
         for lag in -jz..=jz {
-            let mut t_blocks = [0.0f32; 3];
-            let mut t0_blocks = [0.0f32; 3];
+            let mut t_blocks: [CoarseAcc; 3] = [CoarseAcc::default(); 3];
+            let mut t0_blocks: [CoarseAcc; 3] = [CoarseAcc::default(); 3];
 
             // Block 0: smallest valid n where m_base[0][n] + lag >= 0.
             // m_base[0][n] = jstrt + NSSY*n. Solve for n:
@@ -642,7 +653,7 @@ pub fn coarse_sync(
             for n in bk0_n_start..COSTAS.len() {
                 let m_u = (m_base[0][n] + lag) as usize;
                 let tbin_lo = tbin_lo_arr[n];
-                t_blocks[0] += spec.power(tbin_lo, m_u) + spec.power(tbin_lo + 1, m_u);
+                t_blocks[0] += spec.power_acc(tbin_lo, m_u) + spec.power_acc(tbin_lo + 1, m_u);
                 t0_blocks[0] += allsum_row[m_u];
             }
             // Blocks 1, 2: always fully in range — no per-iter check.
@@ -650,7 +661,7 @@ pub fn coarse_sync(
                 for n in 0..COSTAS.len() {
                     let m_u = (m_base[bk][n] + lag) as usize;
                     let tbin_lo = tbin_lo_arr[n];
-                    t_blocks[bk] += spec.power(tbin_lo, m_u) + spec.power(tbin_lo + 1, m_u);
+                    t_blocks[bk] += spec.power_acc(tbin_lo, m_u) + spec.power_acc(tbin_lo + 1, m_u);
                     t0_blocks[bk] += allsum_row[m_u];
                 }
             }
@@ -660,16 +671,28 @@ pub fn coarse_sync(
             // when phantom carriers happen to land where 7 of 8 tone
             // bins quantise to 0; `t0_ref → 0` would otherwise inflate
             // ratio scores by 100-1000× over real signals.
-            let t_all: f32 = t_blocks.iter().sum();
-            let t0_all: f32 = t0_blocks.iter().sum();
-            let t0_ref = (t0_all - t_all) / (NTONES as f32 - 1.0);
-            let sync_all = t_all / (t0_ref + ratio_eps);
+            //
+            // Phase 3: t/t0 sums stay in CoarseAcc; convert to f32 only
+            // at the score-division boundary so sync2d / red / base
+            // (downstream sort + percentile) remain f32.
+            let t_all: CoarseAcc = t_blocks[0] + t_blocks[1] + t_blocks[2];
+            let t0_all: CoarseAcc = t0_blocks[0] + t0_blocks[1] + t0_blocks[2];
+            // `as f32` is a real promotion under fixed-point (CoarseAcc=i32)
+            // and a no-op when CoarseAcc=f32 — silence the host clippy.
+            #[allow(clippy::unnecessary_cast)]
+            let t_all_f = t_all as f32;
+            #[allow(clippy::unnecessary_cast)]
+            let t0_all_f = t0_all as f32;
+            let t0_ref = (t0_all_f - t_all_f) / (NTONES as f32 - 1.0);
+            let sync_all = t_all_f / (t0_ref + ratio_eps);
 
             // Trailing-2-blocks score (drop block 0 — late-start tolerance).
-            let t_tail = t_blocks[1] + t_blocks[2];
-            let t0_tail = t0_blocks[1] + t0_blocks[2];
-            let t0_tail_ref = (t0_tail - t_tail) / (NTONES as f32 - 1.0);
-            let sync_tail = t_tail / (t0_tail_ref + ratio_eps);
+            #[allow(clippy::unnecessary_cast)]
+            let t_tail_f = (t_blocks[1] + t_blocks[2]) as f32;
+            #[allow(clippy::unnecessary_cast)]
+            let t0_tail_f = (t0_blocks[1] + t0_blocks[2]) as f32;
+            let t0_tail_ref = (t0_tail_f - t_tail_f) / (NTONES as f32 - 1.0);
+            let sync_tail = t_tail_f / (t0_tail_ref + ratio_eps);
 
             sync2d[idx(fi, lag)] = sync_all.max(sync_tail);
         }
