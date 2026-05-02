@@ -338,6 +338,39 @@ pub fn complex_slice_as_cmplx_f32(s: &[num_complex::Complex<f32>]) -> &[Cmplx<f3
     unsafe { core::slice::from_raw_parts(s.as_ptr() as *const Cmplx<f32>, s.len()) }
 }
 
+/// Mutable counterpart of [`complex_slice_as_cmplx_f32`]. Used at the
+/// fill_symbol_spectra boundary so the existing rustfft / esp-dsp
+/// inner loops keep writing through `Complex<f32>` while the cs
+/// storage owned by callers is `Cmplx<f32>`.
+#[inline]
+pub fn cmplx_f32_slice_as_complex_mut(s: &mut [Cmplx<f32>]) -> &mut [num_complex::Complex<f32>] {
+    // SAFETY: layout-compatible types.
+    unsafe {
+        core::slice::from_raw_parts_mut(s.as_mut_ptr() as *mut num_complex::Complex<f32>, s.len())
+    }
+}
+
+/// Reinterpret a `&mut [[Cmplx<f32>; N]; M]` as `&mut [[Complex<f32>;
+/// N]; M]`. Used inside fill_symbol_spectra to keep the existing
+/// `Complex<f32>` rotator inner loops while callers hold cs in
+/// `Cmplx<f32>` storage.
+#[inline]
+pub fn cmplx_f32_2d_as_complex_mut<const N: usize, const M: usize>(
+    s: &mut [[Cmplx<f32>; N]; M],
+) -> &mut [[num_complex::Complex<f32>; N]; M] {
+    // SAFETY: layout-compatible types nested into fixed-size arrays.
+    unsafe { &mut *(s as *mut [[Cmplx<f32>; N]; M] as *mut [[num_complex::Complex<f32>; N]; M]) }
+}
+
+/// Const-context variant of [`cmplx_f32_2d_as_complex_mut`].
+#[inline]
+pub fn cmplx_f32_2d_as_complex<const N: usize, const M: usize>(
+    s: &[[Cmplx<f32>; N]; M],
+) -> &[[num_complex::Complex<f32>; N]; M] {
+    // SAFETY: layout-compatible types.
+    unsafe { &*(s as *const [[Cmplx<f32>; N]; M] as *const [[num_complex::Complex<f32>; N]; M]) }
+}
+
 impl<S: SpecScalar> Cmplx<S> {
     #[inline]
     pub const fn new(re: S, im: S) -> Self {

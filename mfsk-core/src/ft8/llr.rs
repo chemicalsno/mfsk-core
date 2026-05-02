@@ -13,7 +13,7 @@ use super::Ft8;
 use num_complex::Complex;
 
 use super::params::{LDPC_N, LLR_SCALE};
-use crate::core::scalar::LlrScalar;
+use crate::core::scalar::{Cmplx, LlrScalar, complex_slice_as_cmplx_f32};
 
 pub use crate::core::llr::LlrSet as GenericLlrSet;
 
@@ -30,10 +30,10 @@ pub struct LlrSet<T: LlrScalar = f32> {
 }
 
 #[inline]
-fn flatten_cs(cs: &[[Complex<f32>; 8]; 79]) -> Vec<Complex<f32>> {
-    let mut out = Vec::with_capacity(79 * 8);
+fn flatten_cs(cs: &[[Complex<f32>; 8]; 79]) -> Vec<Cmplx<f32>> {
+    let mut out: Vec<Cmplx<f32>> = Vec::with_capacity(79 * 8);
     for sym in cs.iter() {
-        out.extend_from_slice(sym);
+        out.extend_from_slice(complex_slice_as_cmplx_f32(sym));
     }
     out
 }
@@ -59,12 +59,14 @@ pub fn symbol_spectra(cd0: &[Complex<f32>], i_start: usize) -> Box<[[Complex<f32
     out
 }
 
-/// Compute soft LLRs from complex symbol spectra. Generic wrapper —
-/// `compute_llr<f32>` for the host path, `compute_llr<Q11i16>` for the
-/// integer NMS BP path under `fixed-point-llr`.
+/// Compute soft LLRs from complex symbol spectra. Generic over the
+/// LLR scalar `T` (`f32` host path, `Q11i16` under `fixed-point-llr`).
+/// cs storage stays `Complex<f32>`-typed for source compat; the
+/// internal `compute_llr_generic` consumes a layout-cast
+/// `&[Cmplx<f32>]` view via `flatten_cs`.
 pub fn compute_llr<T: LlrScalar>(cs: &[[Complex<f32>; 8]; 79]) -> LlrSet<T> {
     let flat = flatten_cs(cs);
-    let g = crate::core::llr::compute_llr::<Ft8, T>(&flat);
+    let g = crate::core::llr::compute_llr_generic::<Ft8, f32, T>(&flat, 3);
     // Sanity check scale consistency at build time.
     debug_assert!((crate::core::llr::LLR_SCALE - LLR_SCALE).abs() < 1e-6);
     LlrSet {
@@ -80,7 +82,7 @@ pub fn compute_llr<T: LlrScalar>(cs: &[[Complex<f32>; 8]; 79]) -> LlrSet<T> {
 /// `llra` and `llrd` are valid.
 pub fn compute_llr_fast<T: LlrScalar>(cs: &[[Complex<f32>; 8]; 79]) -> LlrSet<T> {
     let flat = flatten_cs(cs);
-    let g = crate::core::llr::compute_llr_fast::<Ft8, T>(&flat);
+    let g = crate::core::llr::compute_llr_generic::<Ft8, f32, T>(&flat, 1);
     LlrSet {
         llra: inflate_llr(g.llra),
         llrb: inflate_llr(g.llrb),
@@ -92,13 +94,13 @@ pub fn compute_llr_fast<T: LlrScalar>(cs: &[[Complex<f32>; 8]; 79]) -> LlrSet<T>
 /// WSJT-X compatible SNR from 8-tone spectra + decoded 79-tone sequence.
 pub fn compute_snr_db(cs: &[[Complex<f32>; 8]; 79], itone: &[u8; 79]) -> f32 {
     let flat = flatten_cs(cs);
-    crate::core::llr::compute_snr_db::<Ft8>(&flat, itone)
+    crate::core::llr::compute_snr_db_generic::<Ft8, f32>(&flat, itone)
 }
 
 /// Hard-decision sync quality (0..21). FT8 threshold ≤ 6 → bail out.
 pub fn sync_quality(cs: &[[Complex<f32>; 8]; 79]) -> u32 {
     let flat = flatten_cs(cs);
-    crate::core::llr::sync_quality::<Ft8>(&flat)
+    crate::core::llr::sync_quality_generic::<Ft8, f32>(&flat)
 }
 
 #[cfg(test)]
