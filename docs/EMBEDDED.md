@@ -315,6 +315,92 @@ allocator: `heap_caps_malloc(15360 * sizeof(int16_t),
 MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)`. Keep the buffers around
 across decode calls — they don't need to be reset between slots.
 
+### Streaming capture: I2S / USB Audio → 12 kHz ring
+
+`mfsk_ft8_decode_i16` takes one 15-second 12 kHz slot at a time. Real
+receivers don't have that — they get small DMA chunks at whatever
+rate the codec runs (typically 16 / 24 / 48 kHz from I2S or USB
+Audio Class 1/2). The `mfsk_ft8_stream_*` family bridges the two
+sides without each consumer reinventing it:
+
+```c
+typedef struct MfskFt8Stream MfskFt8Stream;
+
+// Construct: arbitrary src rate + ring capacity in 12 kHz samples.
+// Pass 180000 for the standard 15 s slot.
+MfskFt8Stream *mfsk_ft8_stream_new(uint32_t src_rate_hz, size_t cap);
+void           mfsk_ft8_stream_free(MfskFt8Stream *);
+
+// Push DMA chunk. Resamples to 12 kHz internally and appends to the
+// ring (oldest samples overwritten when full — rolling-window model).
+MfskFt8Status mfsk_ft8_stream_push_i16(MfskFt8Stream *,
+                                       const int16_t *samples, size_t n);
+
+// Snapshot: copy the most recent `cap` 12 kHz samples into `out`.
+// Does not modify the ring — call _drain() after a successful decode
+// to free room for new audio.
+size_t mfsk_ft8_stream_buffered_samples(const MfskFt8Stream *);
+size_t mfsk_ft8_stream_peek_latest(const MfskFt8Stream *,
+                                   int16_t *out, size_t cap);
+void   mfsk_ft8_stream_drain(MfskFt8Stream *, size_t n);
+void   mfsk_ft8_stream_clear(MfskFt8Stream *);
+```
+
+Internals: a Q32 fixed-point linear resampler with carry-over state
+(no chunk-boundary glitches) plus a fixed-cap i16 ring. Pure scalar
+arithmetic — no FFT, no DSP backend. Available in both `host` and
+`embedded-fixed-point` builds.
+
+**Typical RTOS wiring** (capture and decode on different tasks):
+
+```c
+// One-time setup
+static MfskFt8Stream *g_stream;
+static int16_t g_slot[180000];          // 360 KB; OK in PSRAM
+static int16_t g_basis_re[15360];       // MUST be in internal DRAM
+static int16_t g_basis_im[15360];
+
+void rx_init(void) {
+    g_stream = mfsk_ft8_stream_new(/*src*/16000, /*cap*/180000);
+}
+
+// Capture task: I2S DMA callback
+void on_i2s_chunk(const int16_t *samples, size_t n) {
+    mfsk_ft8_stream_push_i16(g_stream, samples, n);
+}
+
+// Decode task: fires every 15 s on UTC slot boundary
+void on_slot_boundary(void) {
+    if (mfsk_ft8_stream_buffered_samples(g_stream) < 168000) return;
+    mfsk_ft8_stream_peek_latest(g_stream, g_slot, 180000);
+
+    MfskFt8ResultList results = {0};
+    mfsk_ft8_decode_i16(g_slot, 180000,
+                        200.0f, 3000.0f, 1.0f, 30,
+                        MFSK_FT8_DEPTH_BP_ALL,
+                        g_basis_re, g_basis_im, &results);
+    // ... use results, then ...
+    mfsk_ft8_result_list_free(&results);
+    mfsk_ft8_stream_drain(g_stream, 180000);  // make room for next slot
+}
+```
+
+**Slot-boundary alignment.** UTC alignment to within ±2 s is
+sufficient — `decode_block`'s coarse-sync stage absorbs that much
+drift internally via the Costas-array search. NTP is the easiest
+source on Wi-Fi-enabled boards; GPS PPS works for offline / mobile
+operation; for stand-alone benches, freerunning at exactly 15 s
+intervals starting from any reference moment also decodes fine
+provided the timer is stable to better than ~50 ppm over an hour.
+
+**Resampler quality.** Linear interpolation — chosen for arithmetic
+simplicity (i64 multiply / shift, fits comfortably on FPU-less MCUs
+and tracks ASM throughput on LX6/LX7). For typical 16 → 12 kHz or
+48 → 12 kHz ratios on real audio passbands (200–3000 Hz) the
+introduced distortion is ~–55 dBc, well below the FT8 LDPC's
+operating SNR. If you need transparent fidelity for downstream uses
+beyond FT8, replace this stage with a polyphase FIR before the ring.
+
 ### Build flags
 
 #### Host (`libmfsk_ft8.so` / `libmfsk_ft8.a` for desktop testing)

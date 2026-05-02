@@ -497,6 +497,270 @@ pub unsafe extern "C" fn mfsk_ft8_tones_to_f32(
     MfskFt8Status::Ok
 }
 
+// ── Streaming wrapper: I2S / USB-Audio chunk capture → 12 kHz ring ─────────
+//
+// Real-time receivers feed audio in small DMA chunks at whatever
+// rate their codec runs (typically 16/24/48 kHz from I2S, 48 kHz
+// from USB Audio Class). The decoder, on the other hand, operates
+// on a 15-second 12 kHz slot. Bridging those two sides used to be
+// every consumer's homework — `MfskFt8Stream` packages the standard
+// pieces:
+//
+//  1. A streaming linear resampler from `src_rate_hz` to 12 kHz that
+//     carries interpolation state across calls (no chunk-boundary
+//     glitches).
+//  2. A fixed-cap ring buffer at 12 kHz (oldest samples overwritten
+//     when full — a "rolling N-second window" model that matches
+//     the slot-based decoder's needs).
+//
+// Decoding itself is *not* bundled. The capture and decode tasks
+// typically run on separate cores / RTOS tasks; the caller takes a
+// snapshot via `_peek_latest` into their own scratch and hands that
+// to `mfsk_ft8_decode_i16`. After decoding the slot they `_drain`
+// the consumed prefix to make room for new audio.
+//
+// The wrapper is available under both `host` and `embedded-fixed-point`
+// — the streaming primitives are pure-arithmetic, no FFT / no DSP
+// backend, so they don't need a target-specific kernel.
+
+use mfsk_core::core::dsp::resample::LinearResamplerI16To12k;
+
+/// Opaque handle returned by [`mfsk_ft8_stream_new`].
+///
+/// Owns one resampler + one 12 kHz ring buffer. Single-threaded —
+/// callers that capture and decode on different tasks should put the
+/// stream on the capture side and copy out via `_peek_latest` for the
+/// decoder.
+pub struct MfskFt8Stream {
+    /// `None` when `src_rate == 12_000` (resampler bypassed).
+    resampler: Option<LinearResamplerI16To12k>,
+    /// 12 kHz sample ring. Length is the configured capacity.
+    ring: Box<[i16]>,
+    /// Index of the oldest sample currently in the ring.
+    /// `(head + len) % capacity` is the next write slot.
+    head: usize,
+    /// Number of valid samples in the ring (≤ `capacity`).
+    len: usize,
+}
+
+/// Append `src` to the ring at 12 kHz; overwrite oldest if full.
+/// Free function (rather than a method on `MfskFt8Stream`) so the
+/// caller can hold a `&mut` borrow on `resampler` simultaneously.
+fn ring_push(ring: &mut [i16], head: &mut usize, len: &mut usize, src: &[i16]) {
+    let cap = ring.len();
+    for &s in src {
+        let write_idx = (*head + *len) % cap;
+        ring[write_idx] = s;
+        if *len == cap {
+            *head = (*head + 1) % cap;
+        } else {
+            *len += 1;
+        }
+    }
+}
+
+/// Allocate a new streaming wrapper.
+///
+/// `src_rate_hz`: the rate at which the caller will push samples
+/// (typically 16000 / 24000 / 48000). Resampled internally to 12 kHz.
+/// Must be > 0; pass `12000` to bypass the resampler.
+///
+/// `capacity_samples`: 12 kHz ring-buffer capacity. Pass `180_000`
+/// for the standard 15 s FT8 slot. Smaller values save memory at the
+/// cost of less history; larger values let the decoder lag without
+/// overwriting. Must be ≥ 168_000 (the `decode_block` minimum) for
+/// the typical "snapshot the latest 15 s and decode" pattern.
+///
+/// Returns `NULL` on `src_rate_hz == 0`, `capacity_samples == 0`, or
+/// allocation failure.
+///
+/// # Safety
+/// Free with [`mfsk_ft8_stream_free`].
+#[unsafe(no_mangle)]
+pub extern "C" fn mfsk_ft8_stream_new(
+    src_rate_hz: u32,
+    capacity_samples: usize,
+) -> *mut MfskFt8Stream {
+    if src_rate_hz == 0 || capacity_samples == 0 {
+        return core::ptr::null_mut();
+    }
+    let resampler = if src_rate_hz == 12_000 {
+        None
+    } else {
+        Some(LinearResamplerI16To12k::new(src_rate_hz))
+    };
+    let ring: Vec<i16> = alloc::vec![0i16; capacity_samples];
+    let stream = Box::new(MfskFt8Stream {
+        resampler,
+        ring: ring.into_boxed_slice(),
+        head: 0,
+        len: 0,
+    });
+    Box::into_raw(stream)
+}
+
+/// Free a stream allocated by [`mfsk_ft8_stream_new`]. Pointer must
+/// not be used afterwards. `NULL` is safe (no-op).
+///
+/// # Safety
+/// `stream` must be a pointer previously returned by
+/// [`mfsk_ft8_stream_new`] and not yet freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mfsk_ft8_stream_free(stream: *mut MfskFt8Stream) {
+    if !stream.is_null() {
+        drop(unsafe { Box::from_raw(stream) });
+    }
+}
+
+/// Push `n` source-rate i16 samples into the stream. Resamples to
+/// 12 kHz internally and appends to the ring (oldest samples
+/// overwritten if the ring is full).
+///
+/// Returns [`MfskFt8Status::Ok`] on success, [`MfskFt8Status::NullPointer`]
+/// if `stream` or `samples` is null (or `n == 0` with non-null
+/// samples is allowed and is a no-op).
+///
+/// # Safety
+/// `samples` must point to `n` valid `i16` values; `stream` must be a
+/// live handle from [`mfsk_ft8_stream_new`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mfsk_ft8_stream_push_i16(
+    stream: *mut MfskFt8Stream,
+    samples: *const i16,
+    n: usize,
+) -> MfskFt8Status {
+    if stream.is_null() {
+        return MfskFt8Status::NullPointer;
+    }
+    if n == 0 {
+        return MfskFt8Status::Ok;
+    }
+    if samples.is_null() {
+        return MfskFt8Status::NullPointer;
+    }
+    let stream = unsafe { &mut *stream };
+    let src = unsafe { core::slice::from_raw_parts(samples, n) };
+
+    // Destructure so the resampler and ring borrows don't overlap.
+    let MfskFt8Stream {
+        resampler,
+        ring,
+        head,
+        len,
+    } = stream;
+
+    match resampler.as_mut() {
+        // 12 kHz pass-through: append directly.
+        None => ring_push(ring, head, len, src),
+        // Resample chunk-wise into a small stack scratch so we never
+        // need a heap alloc proportional to `n`.
+        Some(r) => {
+            let mut scratch = [0i16; 256];
+            let mut src_pos = 0;
+            while src_pos < src.len() {
+                let (consumed, produced) = r.process(&src[src_pos..], &mut scratch);
+                if consumed == 0 && produced == 0 {
+                    break;
+                }
+                ring_push(ring, head, len, &scratch[..produced]);
+                src_pos += consumed;
+            }
+        }
+    }
+    MfskFt8Status::Ok
+}
+
+/// Number of 12 kHz samples currently buffered.
+///
+/// # Safety
+/// `stream` must be a live handle from [`mfsk_ft8_stream_new`].
+/// Returns 0 if `stream` is null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mfsk_ft8_stream_buffered_samples(stream: *const MfskFt8Stream) -> usize {
+    if stream.is_null() {
+        return 0;
+    }
+    unsafe { (*stream).len }
+}
+
+/// Copy the most recent `cap` 12 kHz samples (in chronological order)
+/// into `out`. Returns the number actually written —
+/// `min(cap, buffered_samples)`. Does not modify the ring.
+///
+/// Pass `cap = 180000` and `out`-buffer of the same size to grab a
+/// standard 15 s FT8 slot for `mfsk_ft8_decode_i16`.
+///
+/// # Safety
+/// `stream` must be a live handle; `out` must point to `cap` writable
+/// `i16`s. Returns 0 if either is null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mfsk_ft8_stream_peek_latest(
+    stream: *const MfskFt8Stream,
+    out: *mut i16,
+    cap: usize,
+) -> usize {
+    if stream.is_null() || out.is_null() || cap == 0 {
+        return 0;
+    }
+    let s = unsafe { &*stream };
+    let n = cap.min(s.len);
+    if n == 0 {
+        return 0;
+    }
+    // The most recent `n` samples end at logical index `s.len - 1`,
+    // i.e. ring index `(s.head + s.len - 1) % capacity`. Their start
+    // is at logical index `s.len - n` → ring index
+    // `(s.head + s.len - n) % capacity`.
+    let cap_ring = s.ring.len();
+    let start = (s.head + s.len - n) % cap_ring;
+    let dst = unsafe { core::slice::from_raw_parts_mut(out, n) };
+    if start + n <= cap_ring {
+        dst.copy_from_slice(&s.ring[start..start + n]);
+    } else {
+        let first = cap_ring - start;
+        dst[..first].copy_from_slice(&s.ring[start..]);
+        dst[first..].copy_from_slice(&s.ring[..n - first]);
+    }
+    n
+}
+
+/// Drop the oldest `n` 12 kHz samples (advance the ring tail).
+/// Use after a successful decode to free room for the next slot's
+/// fresh audio. Clamped to `buffered_samples`.
+///
+/// # Safety
+/// `stream` must be a live handle. `NULL` is a no-op.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mfsk_ft8_stream_drain(stream: *mut MfskFt8Stream, n: usize) {
+    if stream.is_null() {
+        return;
+    }
+    let s = unsafe { &mut *stream };
+    let drop_n = n.min(s.len);
+    let cap = s.ring.len();
+    s.head = (s.head + drop_n) % cap;
+    s.len -= drop_n;
+}
+
+/// Discard everything in the ring buffer and reset the resampler
+/// state. Use on tuning changes / band switches.
+///
+/// # Safety
+/// `stream` must be a live handle. `NULL` is a no-op.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mfsk_ft8_stream_clear(stream: *mut MfskFt8Stream) {
+    if stream.is_null() {
+        return;
+    }
+    let s = unsafe { &mut *stream };
+    s.head = 0;
+    s.len = 0;
+    if let Some(r) = s.resampler.as_ref() {
+        // Recreate to reset phase / primed.
+        s.resampler = Some(LinearResamplerI16To12k::new(r.src_rate()));
+    }
+}
+
 // ── Embedded runtime (no_std + staticlib needs these) ──────────────────────
 //
 // `cdylib`/`staticlib` Rust artifacts under `no_std` require a

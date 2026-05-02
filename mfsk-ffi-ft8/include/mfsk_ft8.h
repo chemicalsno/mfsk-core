@@ -56,6 +56,16 @@ typedef enum MfskFt8Depth {
 } MfskFt8Depth;
 
 /**
+ * Opaque handle returned by [`mfsk_ft8_stream_new`].
+ *
+ * Owns one resampler + one 12 kHz ring buffer. Single-threaded —
+ * callers that capture and decode on different tasks should put the
+ * stream on the capture side and copy out via `_peek_latest` for the
+ * decoder.
+ */
+typedef struct MfskFt8Stream MfskFt8Stream;
+
+/**
  * One decoded FT8 message.
  *
  * `text` is a C string of at most 39 visible UTF-8 characters plus
@@ -287,6 +297,100 @@ enum MfskFt8Status mfsk_ft8_tones_to_f32(const uint8_t *itone,
                                          float amplitude,
                                          float *out,
                                          uintptr_t out_len);
+
+/**
+ * Allocate a new streaming wrapper.
+ *
+ * `src_rate_hz`: the rate at which the caller will push samples
+ * (typically 16000 / 24000 / 48000). Resampled internally to 12 kHz.
+ * Must be > 0; pass `12000` to bypass the resampler.
+ *
+ * `capacity_samples`: 12 kHz ring-buffer capacity. Pass `180_000`
+ * for the standard 15 s FT8 slot. Smaller values save memory at the
+ * cost of less history; larger values let the decoder lag without
+ * overwriting. Must be ≥ 168_000 (the `decode_block` minimum) for
+ * the typical "snapshot the latest 15 s and decode" pattern.
+ *
+ * Returns `NULL` on `src_rate_hz == 0`, `capacity_samples == 0`, or
+ * allocation failure.
+ *
+ * # Safety
+ * Free with [`mfsk_ft8_stream_free`].
+ */
+ struct MfskFt8Stream *mfsk_ft8_stream_new(uint32_t src_rate_hz, uintptr_t capacity_samples);
+
+/**
+ * Free a stream allocated by [`mfsk_ft8_stream_new`]. Pointer must
+ * not be used afterwards. `NULL` is safe (no-op).
+ *
+ * # Safety
+ * `stream` must be a pointer previously returned by
+ * [`mfsk_ft8_stream_new`] and not yet freed.
+ */
+ void mfsk_ft8_stream_free(struct MfskFt8Stream *stream);
+
+/**
+ * Push `n` source-rate i16 samples into the stream. Resamples to
+ * 12 kHz internally and appends to the ring (oldest samples
+ * overwritten if the ring is full).
+ *
+ * Returns [`MfskFt8Status::Ok`] on success, [`MfskFt8Status::NullPointer`]
+ * if `stream` or `samples` is null (or `n == 0` with non-null
+ * samples is allowed and is a no-op).
+ *
+ * # Safety
+ * `samples` must point to `n` valid `i16` values; `stream` must be a
+ * live handle from [`mfsk_ft8_stream_new`].
+ */
+
+enum MfskFt8Status mfsk_ft8_stream_push_i16(struct MfskFt8Stream *stream,
+                                            const int16_t *samples,
+                                            uintptr_t n);
+
+/**
+ * Number of 12 kHz samples currently buffered.
+ *
+ * # Safety
+ * `stream` must be a live handle from [`mfsk_ft8_stream_new`].
+ * Returns 0 if `stream` is null.
+ */
+ uintptr_t mfsk_ft8_stream_buffered_samples(const struct MfskFt8Stream *stream);
+
+/**
+ * Copy the most recent `cap` 12 kHz samples (in chronological order)
+ * into `out`. Returns the number actually written —
+ * `min(cap, buffered_samples)`. Does not modify the ring.
+ *
+ * Pass `cap = 180000` and `out`-buffer of the same size to grab a
+ * standard 15 s FT8 slot for `mfsk_ft8_decode_i16`.
+ *
+ * # Safety
+ * `stream` must be a live handle; `out` must point to `cap` writable
+ * `i16`s. Returns 0 if either is null.
+ */
+
+uintptr_t mfsk_ft8_stream_peek_latest(const struct MfskFt8Stream *stream,
+                                      int16_t *out,
+                                      uintptr_t cap);
+
+/**
+ * Drop the oldest `n` 12 kHz samples (advance the ring tail).
+ * Use after a successful decode to free room for the next slot's
+ * fresh audio. Clamped to `buffered_samples`.
+ *
+ * # Safety
+ * `stream` must be a live handle. `NULL` is a no-op.
+ */
+ void mfsk_ft8_stream_drain(struct MfskFt8Stream *stream, uintptr_t n);
+
+/**
+ * Discard everything in the ring buffer and reset the resampler
+ * state. Use on tuning changes / band switches.
+ *
+ * # Safety
+ * `stream` must be a live handle. `NULL` is a no-op.
+ */
+ void mfsk_ft8_stream_clear(struct MfskFt8Stream *stream);
 
 #ifdef __cplusplus
 }  // extern "C"
