@@ -542,6 +542,51 @@ Raw monitor logs:
 (`stage3_bp_pool`, `stage3_syncblocks12`, `stage3_lazy_llr`,
 `two_for_one`, `phase3_coarse_i32`).
 
+### Dual-core + Phase E (0.5.3)
+
+With the full A-through-E pipeline parallelism (FFT prewarm; per-core
+BASIS scratch; Pass 2 / Stage 3 / Stage 2 each split across PRO_CPU
+and APP_CPU; incremental stage 1 hidden under capture), the same
+three recordings drop into the **sub-2 s** range on the same Core2
+LX6 hardware. End-to-end via the `rx-wavsim` streaming bench, which
+pumps the baked WAVs into the `mfsk_ft8_stream_*` ring at real-time
+pace and decodes one slot per WAV-completion notify:
+
+| WAV | results | stage 1 (take) | stage 2 | pass 2 | stage 3 | **total** |
+|---|---|---|---|---|---|---|
+| qso1 (mid-band, 3 stations) | 3/3 ✓ | 0.05 s | 0.68 s | 0.18 s | 0.92 s | **1.83 s** |
+| qso2 (mid-band, 5 stations) | 5/5 ✓ | 0.05 s | 0.68 s | 0.18 s | 0.54 s | **1.45 s** |
+| qso3 (busy band, 7 stations) | 7/7 ✓ | 0.05 s | 0.65 s | 0.18 s | 1.10 s | **1.98 s** |
+
+Recall: 15/15 ground-truth callsigns across all three WAVs, including
+weak signals down to -18.2 dB (`N1PJT`) on qso3 and -17.9 / -18.0 dB
+(`OH3NIV`, `LZ1JZ`) on qso2. Phantom-free.
+
+- **Stage 1** is now `take_spec()` returning the spectrogram that
+  `stage1_inc.rs`'s APP_CPU worker has been building incrementally
+  during the slot's 15 s capture window. Per-pair FFTs (~5 ms each)
+  fire as audio chunks arrive; ~1.0 s of cumulative compute is
+  distributed across the 15 s window (~6 % CPU utilisation),
+  leaving stage 1 effectively zero-cost in the post-slot decode
+  budget.
+- **Stage 2** halves across PRO_CPU and APP_CPU via
+  `coarse_sync_split` (worker handles upper-half carriers ≥ 1 550 Hz,
+  main runs the lower half; results merged by `score` descending and
+  truncated to PASS1_LIMIT). Modest gain (-9 % vs single core)
+  because `coarse_sync` is dominated by setup / sort / dedupe.
+- **Pass 2** (sync_quality_block0 re-rank) and **Stage 3** (refine +
+  BP staircase) likewise split per-candidate across cores. Each core
+  uses its own 60 KB Q15 BASIS scratch in internal DRAM so the esp-dsp
+  asm dot product runs at 1 cycle/sample on both halves.
+
+Raw log: `embedded-poc/m5stack-core2/logs/rx_wavsim_phaseE_2026-05-03.log`.
+
+The compute bench (`main.rs` sweep, no streaming overlap) at the same
+point in history produces the dual-core-only numbers (qso3 3.22 s);
+log: `dual_core_phase_abcd_2026-05-03.log`. The 1.24 s gap between
+that and the streaming `rx-wavsim` total is exactly what Phase E hides
+under capture.
+
 ## Binary footprint (Core2 reference, `xtensa-esp32-elf-size -A`)
 
 | Region | Size | Contents |

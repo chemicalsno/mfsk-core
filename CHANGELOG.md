@@ -1,5 +1,134 @@
 # Changelog
 
+## 0.5.3 — embedded perf: dual-core decode + Phase E (Core2 LX6 sub-2 s)
+
+API-additive patch. The headline is on the embedded side: with full
+phase-A-through-E pipeline parallelism, the M5Stack Core2 (ESP32-LX6,
+240 MHz dual-core) decodes a busy-band 15 s FT8 slot in **1.98 s
+wall-clock** with all 7 ground-truth callsigns recovered and zero
+phantoms — the previous baseline (single-core, PASS1=100, max_cand=30,
+no overlap) was 8.85 s for the same recording.
+
+The library-side surface change is small (one constructor + one type
+alias on a `#[doc(hidden)]` struct) and exists to make the embedded
+PoC plumbing possible from outside the crate. No host-path behaviour
+changes.
+
+### Library (mfsk-core)
+
+- `Spectrogram::from_parts(n_freq, n_time, data)` — public constructor
+  for the FT8 spectrogram, layout-checked against the column-major
+  `data[time * n_freq + freq]` invariant. Lets embedded callers
+  hand-build a spectrogram (e.g. computed incrementally during slot
+  capture) and feed it straight into `coarse_sync` etc.
+- `pub type SpecCell` — re-export of the cell type (`u16` under
+  `fixed-point`, `f32` otherwise). Used together with `from_parts` so
+  the bin doesn't have to depend on the feature-gated alias.
+
+`Spectrogram` itself is still `#[doc(hidden)]` — the public surface
+here is "construct + read", not "depend on layout long-term".
+
+### Embedded (`embedded-poc/m5stack-core2`)
+
+End-to-end performance journey for one busy-band FT8 slot (qso3,
+WSJT-X 210703 sample, 13 ground-truth signals -8 to -18 dB):
+
+  | Stage              | qso3 wall-clock |
+  | ------------------ | --------------- |
+  | 0.5.2 baseline     | 8.85 s          |
+  | + Phase 0/1        | 5.24 s          |
+  | + Phase A/B/C      | 3.30 s          |
+  | + Phase D          | 3.22 s          |
+  | + Phase E (final)  | **1.98 s**      |
+
+Recall preserved at every step (3+5+7 truth across qso1/2/3 = 15/15).
+
+- **Phase A** — `esp_dsp_fft::prewarm()`. Force the f32+i16 twiddle
+  tables to init at boot so concurrent first-call init from main and
+  worker tasks can't race in `dsps_fft2r_init_*`.
+- **Phase B** — `dual_core.rs` adds a persistent FreeRTOS worker
+  pinned to APP_CPU and a second 60 KB Q15 BASIS scratch (`.bss`,
+  internal DRAM). 120 KB total scratch out of ~300 KB internal DRAM.
+- **Phase C** — Pass 2 (`refine_candidates_into`) and Stage 3
+  (`process_candidates_into`) candidate lists halve across PRO_CPU /
+  APP_CPU; results merged + globally re-sorted by `q_block0` (Pass 2)
+  / concatenated (Stage 3).
+- **Phase D** — `coarse_sync_split` partitions the carrier-bin range
+  in two; each half scores independently, merge by
+  `SyncCandidate.score` descending. Modest gain (-9 % stage 2) because
+  `coarse_sync` is dominated by setup / sort / dedupe.
+- **Phase E** — `stage1_inc.rs`. Per-chunk worker on APP_CPU
+  (priority 3 — preempted by both the dual-core worker during decode
+  and `wav_sim` during push, runs in the slack). Mirrors the audio
+  buffer in PSRAM, locks auto-gain shift after the first 1 s, then
+  advances the 92-pair FFT loop as each pair's 2 880-sample window
+  becomes available. By the time the slot-end notify fires, all 92
+  pairs are done and `take_spec()` returns a `Spectrogram` that the
+  decode loop uses straight away — stage 1 disappears from the
+  decode latency budget. Total stage-1 compute over a slot (~1.0 s)
+  is hidden under capture (~6 % of the 15 s window).
+
+Memory configuration (Core2-specific, in `sdkconfig.defaults`):
+
+- `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096` (was 16384) so the
+  per-candidate 5 KB cs `Box` from `refine_candidates_with`'s
+  `BinaryHeap` lands in PSRAM. With dual-core both halves hold
+  ~75 KB simultaneously; at the previous threshold these stayed in
+  internal DRAM and corrupted tlsf at the Pass 2 → Stage 3
+  transition.
+
+### New embedded binary: `rx-wavsim`
+
+`embedded-poc/m5stack-core2/src/bin/rx_wavsim.rs` — streaming RX
+bench that pumps the baked QSO WAVs into the `mfsk_ft8_stream_*` ring
+at real-time pace (1 200-sample chunks every 100 ms, slot-boundary
+notify on WAV completion) and runs the dual-core + Phase E decode
+pipeline once per simulated slot. Validates the streaming + decode
+path end-to-end without I2S PDM mic hardware.
+
+Two new bin-side modules:
+
+- `wav_sim.rs` — WAV-fed simulated capture task (substitute for I2S
+  DMA capture). Pinned to PRO_CPU at priority 4; pushes 1 200-sample
+  chunks through `mfsk_ft8_stream_push_i16`, signals decode via task
+  notification on WAV completion, fans each chunk out to a per-chunk
+  hook (used by `stage1_inc`).
+- `stage1_inc.rs` — Phase E incremental stage-1 worker. Mirrors the
+  audio buffer in PSRAM, computes per-pair FFTs as audio windows
+  fill, exposes the prebuilt spectrogram via `take_spec()`.
+
+End-to-end on Core2, 4-cycle run (qso1→2→3→1):
+
+  qso1     1.83 s   3/3 ✓
+  qso2     1.45 s   5/5 ✓ (incl. -17.9 dB OH3NIV, -18 dB LZ1JZ)
+  qso3     1.98 s   7/7 ✓ (busy band, incl. -18.2 dB N1PJT)
+
+Build: `cargo build --release --bin rx-wavsim`. Same `+esp` toolchain
++ `espflash` flow as the other binaries in the crate.
+
+### Production firmware lessons surfaced by `rx-wavsim`
+
+The simulated streaming bench reproduced five categories of bug that
+real I2S DMA firmware would hit:
+
+1. FIFO ring boundary — `STREAM_CAP == SLOT_LEN` evicts the leading
+   samples, producing an 8.4 ms phase shift that drops weak-signal
+   recall on busy bands (qso3 7→2). Cap `wav_sim`'s push at
+   `SLOT_SAMPLES` to keep `slot[0..180_000]` aligned.
+2. Capture-task priority inversion — wav_sim above main task means
+   notify doesn't preempt, ring gets polluted with next WAV's prefix
+   before decode peeks. Fixed by `vTaskPrioritySet(NULL, 6)` on main
+   (wav_sim 4, dual_core worker 5).
+3. Dual-core blocking → low-priority capture grabs idle PRO_CPU during
+   decode's stage 2/3 worker waits.
+4. `tlsf_malloc` heap corruption on dual-core transition — see
+   `SPIRAM_MALLOC_ALWAYSINTERNAL` note above.
+5. Worker stack underestimate — Stage 3 stacks ~5 KB of `LlrSet`
+   intermediates, blew through 8 KB. Bumped to 16 KB.
+
+These all manifest the same way on real I2S — sim catches them
+deterministically, hours/days off the real-hardware bring-up budget.
+
 ## 0.5.2 — streaming capture API + metadata rebalance
 
 API-additive minor over 0.5.1. Two threads:

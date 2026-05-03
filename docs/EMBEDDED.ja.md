@@ -436,6 +436,47 @@ allocator と PSRAM cache の warm-up。
 (`stage3_bp_pool`, `stage3_syncblocks12`, `stage3_lazy_llr`,
 `two_for_one`, `phase3_coarse_i32`)。
 
+### Dual-core + Phase E (0.5.3)
+
+A 〜 E まで完全に積んだ pipeline 並列化 (FFT prewarm; per-core BASIS
+scratch; Pass 2 / Stage 3 / Stage 2 を PRO_CPU と APP_CPU で半分割;
+incremental stage 1 を capture window に隠蔽) で、同じ 3 録音が
+Core2 LX6 上で **sub-2 s** 帯に落ちます。`rx-wavsim` streaming bench
+(baked WAV を `mfsk_ft8_stream_*` ring に real-time pace で push、
+WAV 完了 notify で 1 slot decode) end-to-end の数値:
+
+| WAV | 結果 | stage 1 (take) | stage 2 | pass 2 | stage 3 | **合計** |
+|---|---|---|---|---|---|---|
+| qso1 (mid-band, 3 局) | 3/3 ✓ | 0.05 s | 0.68 s | 0.18 s | 0.92 s | **1.83 s** |
+| qso2 (mid-band, 5 局) | 5/5 ✓ | 0.05 s | 0.68 s | 0.18 s | 0.54 s | **1.45 s** |
+| qso3 (busy band, 7 局) | 7/7 ✓ | 0.05 s | 0.65 s | 0.18 s | 1.10 s | **1.98 s** |
+
+Recall: 3 WAV 通算 15/15 ground-truth callsign 全て decode、qso3 の
+-18.2 dB `N1PJT` や qso2 の -17.9 / -18.0 dB (`OH3NIV`, `LZ1JZ`) も
+含む。phantom 無し。
+
+- **Stage 1** は `take_spec()` が返すだけ。実体は `stage1_inc.rs` の
+  APP_CPU worker が slot capture (15 s) の間に増分計算済み。
+  Per-pair FFT (~5 ms each) は audio chunk 到着のたびに発火、累計
+  ~1.0 s 分の compute が 15 s window に分散 (~6 % CPU 利用)。decode
+  latency budget からは実質ゼロコスト。
+- **Stage 2** は `coarse_sync_split` で carrier bin range を半分割
+  (worker が 1 550 Hz 以上、main が 下半。`score` 降順マージ→
+  PASS1_LIMIT 切り詰め)。`coarse_sync` は setup / sort / dedupe が
+  支配的なので gain は控えめ (-9 % 単独)。
+- **Pass 2** (sync_quality_block0 re-rank) と **Stage 3** (refine
+  + BP staircase) も per-cand で半分割。各 core が専用 60 KB の
+  Q15 BASIS scratch (内部 DRAM 常駐) を持つため、esp-dsp asm dot
+  product が両 core で 1 cycle/sample で走る。
+
+生ログ: `embedded-poc/m5stack-core2/logs/rx_wavsim_phaseE_2026-05-03.log`。
+
+Compute bench (`main.rs` sweep、streaming overlap 無し) の同時期
+スナップショットは dual-core only の数値 (qso3 3.22 s) を出します;
+log: `dual_core_phase_abcd_2026-05-03.log`。この 3.22 s と streaming
+版 1.98 s の 1.24 s 差が、まさに Phase E が capture window 下に
+隠した stage 1 の wall-clock です。
+
 ## バイナリフットプリント (Core2 リファレンス, ELF)
 
 `xtensa-esp32-elf-size -A` 計測:
