@@ -22,6 +22,16 @@ name = "rx-skeleton"
 path = "src/bin/rx_skeleton.rs"
 harness = false
 
+# WAV-fed streaming RX bench. Validates the stream wrapper +
+# dual-core decode pipeline end-to-end without needing a real I2S
+# PDM mic — the `wav_sim` task pumps baked QSO WAVs into the ring
+# buffer at 1× real time. Build:
+#   cargo build --release --bin rx-wavsim
+[[bin]]
+name = "rx-wavsim"
+path = "src/bin/rx_wavsim.rs"
+harness = false
+
 [profile.release]
 # `opt-level = 1` mirrors the ESP32-S3 PoC: same Xtensa-Rust LLVM
 # regression at opt-level "s"/"z" with f32-select patterns. The
