@@ -91,6 +91,19 @@ enum Job {
         max_cand: usize,
         out: *mut Option<Vec<SyncCandidate>>,
     },
+    /// Phase-E2: coarse_sync with caller-supplied allsum slice. The
+    /// pointer is borrowed for the duration of the call (main blocks on
+    /// the worker before the allsum Vec is dropped).
+    CoarseSyncWithAllsum {
+        spec: *const Spectrogram,
+        freq_min: f32,
+        freq_max: f32,
+        sync_min: f32,
+        max_cand: usize,
+        allsum_ptr: *const f32,
+        allsum_len: usize,
+        out: *mut Option<Vec<SyncCandidate>>,
+    },
 }
 
 /// SAFETY: pointers / `Vec`s are written by main and read by worker
@@ -160,6 +173,25 @@ extern "C" fn worker_main(_arg: *mut core::ffi::c_void) {
                 // heap and blocks on us before dropping it.
                 let spec_ref = unsafe { &*spec };
                 let result = coarse_sync(spec_ref, freq_min, freq_max, sync_min, max_cand);
+                unsafe {
+                    *out = Some(result);
+                }
+            }
+            Some(Job::CoarseSyncWithAllsum {
+                spec,
+                freq_min,
+                freq_max,
+                sync_min,
+                max_cand,
+                allsum_ptr,
+                allsum_len,
+                out,
+            }) => {
+                let spec_ref = unsafe { &*spec };
+                let allsum = unsafe { core::slice::from_raw_parts(allsum_ptr, allsum_len) };
+                let result = mfsk_core::ft8::decode_block::coarse_sync_with_allsum(
+                    spec_ref, freq_min, freq_max, sync_min, max_cand, allsum,
+                );
                 unsafe {
                     *out = Some(result);
                 }
@@ -276,6 +308,70 @@ pub fn coarse_sync_split(
     }
 
     let mut local = coarse_sync(spec, freq_min, mid, sync_min, max_cand);
+
+    unsafe {
+        let _ = ulTaskGenericNotifyTake(0, PD_TRUE, u32::MAX);
+    }
+
+    let worker = worker_out.expect("worker did not write result");
+    local.extend(worker);
+    local.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(core::cmp::Ordering::Equal)
+    });
+    local.truncate(max_cand);
+    local
+}
+
+/// Phase-E2: like [`coarse_sync_split`] but consumes per-half
+/// pre-built allsums (built incrementally by `stage1_inc` —
+/// independently per half so f32 sliding-window drift doesn't
+/// accumulate across the band). `allsum_head` must match
+/// `mfsk_core::ft8::decode_block::precompute_coarse_allsum(spec,
+/// freq_min, mid)` and `allsum_tail` must match the same for
+/// `(spec, mid, freq_max)`.
+pub fn coarse_sync_split_with_allsum(
+    spec: &Spectrogram,
+    freq_min: f32,
+    freq_max: f32,
+    sync_min: f32,
+    max_cand: usize,
+    allsum_head: &[f32],
+    allsum_tail: &[f32],
+) -> Vec<SyncCandidate> {
+    use mfsk_core::ft8::decode_block::coarse_sync_with_allsum;
+    let mid = 0.5 * (freq_min + freq_max);
+
+    // **KNOWN ISSUE — race / sharing problem with worker dispatch.**
+    // When this path runs concurrently with main's head coarse_sync,
+    // worker's tail coarse_sync returns wrong candidates on busy
+    // bands (qso3: 0/7 vs 7/7 sequential). xthal_dcache_region_*
+    // writeback/invalidate did not help. rx_wavsim consumes Phase E2
+    // via sequential per-half on main today; this dispatch entry
+    // point is kept for follow-up investigation.
+    let mut worker_out: Option<Vec<SyncCandidate>> = None;
+    unsafe {
+        *JOB_SLOT.inner.get() = Some(Job::CoarseSyncWithAllsum {
+            spec: spec as *const _,
+            freq_min: mid,
+            freq_max,
+            sync_min,
+            max_cand,
+            allsum_ptr: allsum_tail.as_ptr(),
+            allsum_len: allsum_tail.len(),
+            out: &raw mut worker_out,
+        });
+        xTaskGenericNotify(
+            WORKER_TASK,
+            0,
+            0,
+            eNotifyAction_eIncrement,
+            core::ptr::null_mut(),
+        );
+    }
+
+    let mut local = coarse_sync_with_allsum(spec, freq_min, mid, sync_min, max_cand, allsum_head);
 
     unsafe {
         let _ = ulTaskGenericNotifyTake(0, PD_TRUE, u32::MAX);

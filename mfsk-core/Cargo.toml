@@ -69,6 +69,15 @@ fixed-point-llr = ["fixed-point"]
 # release.
 fixed-point-bp = ["fixed-point-llr"]
 
+# Q3 i8 LLR / BP scalar (range ±16, 1/8 LSB) — halves BP scratch vs
+# `fixed-point-llr` (Q11i16) at the cost of coarser LLR quantisation.
+# Targets memory-constrained MCUs where the extra 6 KB of internal DRAM
+# is more valuable than the recall delta. Implies `fixed-point-llr`
+# (the integer LLR pipeline) and overrides the `LlrT` type in
+# `ft8::decode_block` to `Q3i8`. Mutually exclusive with the f32 LLR
+# default — pick at most one of {none, fixed-point-llr, llr-i8}.
+llr-i8 = ["fixed-point-llr"]
+
 # Fixed-point cs (complex symbol spectra) — stores cs entries as
 # `Cmplx<Q14i16>` (Q14 fixed-point i16 per re/im) instead of
 # `Cmplx<f32>`. Halves cs memory footprint (8 KB → 4 KB per
@@ -136,7 +145,7 @@ rayon       = { version = "1", optional = true }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = [
-    'cfg(feature, values("std","alloc","ft8","ft4","fst4","wspr","jt9","jt65","q65","packet-bytes","uvpacket","parallel","osd-deep","eq-fallback","full","embedded-tx","embedded-rx","esp32s3","fft-rustfft","fft-extern","fixed-point","fixed-point-bp","fixed-point-llr","fixed-point-cs","fixed-point-coarse-i32","profile-coarse"))',
+    'cfg(feature, values("std","alloc","ft8","ft4","fst4","wspr","jt9","jt65","q65","packet-bytes","uvpacket","parallel","osd-deep","eq-fallback","full","embedded-tx","embedded-rx","esp32s3","fft-rustfft","fft-extern","fixed-point","fixed-point-bp","fixed-point-llr","fixed-point-cs","fixed-point-coarse-i32","llr-i8","profile-coarse"))',
 ] }
 
 # Build docs.rs with every protocol feature enabled so users browsing

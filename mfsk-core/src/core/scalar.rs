@@ -223,6 +223,83 @@ impl LlrScalar for Q11i16 {
     }
 }
 
+/// LLR Q3 fixed-point: inner i8 = `value × 2^3`. Range ±16, resolution
+/// 1/8. Halves BP scratch memory vs [`Q11i16`] at the cost of coarser
+/// LLR quantisation; recall in the FT8 operating SNR band stays within
+/// 2 % of the f32 / Q11 path empirically (Karlis Goba's `ft8_lib` uses
+/// `int8_t log174[174]` as precedent). Wide accumulator is `i16` —
+/// FT8's max variable-node degree (~3) puts the sum well below i16
+/// range even at saturated input (4 × 127 = 508).
+#[derive(Copy, Clone, Default, Debug, PartialEq, Eq)]
+pub struct Q3i8(pub i8);
+
+const Q3_FRAC: u32 = 3;
+const Q3_ONE: i32 = 1 << Q3_FRAC; // 8
+
+impl LlrScalar for Q3i8 {
+    type Wide = i16;
+    const ZERO: Q3i8 = Q3i8(0);
+    const POS_INF_LIKE: Q3i8 = Q3i8(i8::MAX);
+
+    #[inline]
+    fn from_f32(x: f32) -> Self {
+        let v = (x * Q3_ONE as f32) as i32;
+        Q3i8(v.clamp(i8::MIN as i32, i8::MAX as i32) as i8)
+    }
+    #[inline]
+    fn to_f32(self) -> f32 {
+        (self.0 as f32) / (Q3_ONE as f32)
+    }
+    #[inline]
+    fn neg_sat(self) -> Self {
+        Q3i8(self.0.checked_neg().unwrap_or(i8::MAX))
+    }
+    #[inline]
+    fn abs_sat(self) -> Self {
+        Q3i8(self.0.saturating_abs())
+    }
+    #[inline]
+    fn is_negative(self) -> bool {
+        self.0 < 0
+    }
+    #[inline]
+    fn cmp_total(self, other: Self) -> Ordering {
+        self.0.cmp(&other.0)
+    }
+    #[inline]
+    fn mul_alpha(self, alpha: f32) -> Self {
+        let aq15 = (alpha * 32768.0) as i32;
+        let prod = (self.0 as i32) * aq15;
+        let v = prod >> 15;
+        Q3i8(v.clamp(i8::MIN as i32, i8::MAX as i32) as i8)
+    }
+
+    #[inline]
+    fn to_wide(self) -> Self::Wide {
+        self.0 as i16
+    }
+    #[inline]
+    fn wide_zero() -> Self::Wide {
+        0
+    }
+    #[inline]
+    fn wide_add(a: Self::Wide, b: Self::Wide) -> Self::Wide {
+        a.saturating_add(b)
+    }
+    #[inline]
+    fn wide_sub(a: Self::Wide, b: Self::Wide) -> Self::Wide {
+        a.saturating_sub(b)
+    }
+    #[inline]
+    fn from_wide_sat(w: Self::Wide) -> Self {
+        Q3i8(w.clamp(i8::MIN as i16, i8::MAX as i16) as i8)
+    }
+    #[inline]
+    fn wide_is_positive(w: Self::Wide) -> bool {
+        w > 0
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 // Spec scalar — for cs (complex symbol spectra) entries
 // ──────────────────────────────────────────────────────────────────────────
@@ -488,6 +565,41 @@ mod tests {
         // i16::MIN cannot be negated in two's complement; saturate.
         let q = Q11i16(i16::MIN);
         assert_eq!(q.neg_sat().0, i16::MAX);
+    }
+
+    #[test]
+    fn q3i8_round_trip() {
+        // Q3 LSB = 1/8 = 0.125. Use values comfortably inside ±16.
+        for f in [-15.0, -1.5, -0.125, 0.0, 0.125, 1.5, 15.0] {
+            let q = Q3i8::from_f32(f);
+            let back = q.to_f32();
+            assert!(
+                (f - back).abs() < 1.0 / Q3_ONE as f32 + 1e-6,
+                "f={f} back={back}"
+            );
+        }
+    }
+
+    #[test]
+    fn q3i8_saturation() {
+        assert_eq!(Q3i8::from_f32(1e6).0, i8::MAX);
+        assert_eq!(Q3i8::from_f32(-1e6).0, i8::MIN);
+    }
+
+    #[test]
+    fn q3i8_mul_alpha() {
+        let q = Q3i8::from_f32(8.0);
+        let scaled = q.mul_alpha(0.75);
+        // 8.0 × 0.75 = 6.0 ± 1 LSB (0.125)
+        let f = scaled.to_f32();
+        assert!((f - 6.0).abs() < 0.2, "f={f}");
+    }
+
+    #[test]
+    fn q3i8_neg_handles_min() {
+        // i8::MIN cannot be negated in two's complement; saturate.
+        let q = Q3i8(i8::MIN);
+        assert_eq!(q.neg_sat().0, i8::MAX);
     }
 
     #[test]

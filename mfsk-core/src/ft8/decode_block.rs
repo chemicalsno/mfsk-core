@@ -558,6 +558,176 @@ pub fn coarse_sync(
     sync_min: f32,
     max_cand: usize,
 ) -> Vec<SyncCandidate> {
+    coarse_sync_inner(spec, freq_min, freq_max, sync_min, max_cand, None)
+}
+
+/// Phase-E2 entry point — like [`coarse_sync`] but consumes a
+/// caller-built allsum table instead of recomputing it. Saves the
+/// 280-300 ms allsum precompute on Core2 by hiding it under the
+/// 15 s capture window in the embedded port (`stage1_inc` builds
+/// the allsum incrementally as new spectrogram rows arrive).
+///
+/// `allsum` must match exactly what
+/// [`precompute_coarse_allsum`] produces for the same `spec`,
+/// `freq_min`, `freq_max` triple — same layout
+/// (`data[fi * spec.n_time + m]`), same length
+/// ([`coarse_allsum_len`]).
+///
+/// **Pub for benchmarking + the embedded port only — do not depend
+/// on it from host code.**
+#[doc(hidden)]
+pub fn coarse_sync_with_allsum(
+    spec: &Spectrogram,
+    freq_min: f32,
+    freq_max: f32,
+    sync_min: f32,
+    max_cand: usize,
+    allsum: &[CoarseAcc],
+) -> Vec<SyncCandidate> {
+    coarse_sync_inner(spec, freq_min, freq_max, sync_min, max_cand, Some(allsum))
+}
+
+/// Length of the allsum buffer that [`coarse_sync_with_allsum`]
+/// expects for the given `spec` + `freq_min..=freq_max` band.
+/// Returns 0 when the band has no candidates (then
+/// `coarse_sync_with_allsum` would return an empty vec immediately
+/// regardless of `allsum`).
+pub fn coarse_allsum_len(
+    spec_n_freq: usize,
+    spec_n_time: usize,
+    freq_min: f32,
+    freq_max: f32,
+) -> usize {
+    let df = SAMPLE_RATE_HZ / NFFT_SPEC as f32;
+    let tone_step_bins = TONE_SPACING_HZ / df;
+    let ia = (freq_min / df).round() as usize;
+    let max_tone_off = ((NTONES - 1) as f32 * tone_step_bins).ceil() as usize + 1;
+    let ib_unbounded = (freq_max / df).round() as usize;
+    let ib = ib_unbounded.min(spec_n_freq.saturating_sub(max_tone_off));
+    if ib < ia {
+        return 0;
+    }
+    let n_freq = ib - ia + 1;
+    n_freq * spec_n_time
+}
+
+/// One-shot allsum builder. The embedded port can build the allsum
+/// incrementally instead and pass it to [`coarse_sync_with_allsum`];
+/// host callers use this. Layout matches [`coarse_sync_with_allsum`]'s
+/// expected input.
+pub fn precompute_coarse_allsum(
+    spec: &Spectrogram,
+    freq_min: f32,
+    freq_max: f32,
+) -> Vec<CoarseAcc> {
+    let mut buf =
+        vec![CoarseAcc::default(); coarse_allsum_len(spec.n_freq, spec.n_time, freq_min, freq_max)];
+    if !buf.is_empty() {
+        precompute_coarse_allsum_into(spec, freq_min, freq_max, &mut buf);
+    }
+    buf
+}
+
+/// In-place variant of [`precompute_coarse_allsum`]. `dst` must have
+/// length [`coarse_allsum_len`]. No-op if the band is empty.
+pub fn precompute_coarse_allsum_into(
+    spec: &Spectrogram,
+    freq_min: f32,
+    freq_max: f32,
+    dst: &mut [CoarseAcc],
+) {
+    let df = SAMPLE_RATE_HZ / NFFT_SPEC as f32;
+    let tone_step_bins = TONE_SPACING_HZ / df;
+    let ia = (freq_min / df).round() as usize;
+    let max_tone_off = ((NTONES - 1) as f32 * tone_step_bins).ceil() as usize + 1;
+    let nh1 = spec.n_freq;
+    let ib_unbounded = (freq_max / df).round() as usize;
+    let ib = ib_unbounded.min(nh1.saturating_sub(max_tone_off));
+    if ib < ia {
+        return;
+    }
+    let n_freq = ib - ia + 1;
+    debug_assert_eq!(
+        dst.len(),
+        n_freq * spec.n_time,
+        "allsum buffer length mismatch"
+    );
+    fill_coarse_allsum(spec, ia, ib, n_freq, dst);
+}
+
+/// Build the 16-bin sliding-window allsum for the carrier-bin range
+/// `[ia..=ib]` into the caller buffer `dst` (length
+/// `n_freq * spec.n_time`, layout `dst[fi * n_time + m]`).
+///
+/// Mirrors the inline precompute inside [`coarse_sync_inner`] —
+/// kept as a separate helper so the embedded port can replicate it
+/// row-by-row in [`stage1_inc`] without depending on private
+/// internals. Computes for **every m**, not just `needed_m`, so
+/// callers can populate cells incrementally with single-row updates
+/// in any order.
+fn fill_coarse_allsum(
+    spec: &Spectrogram,
+    ia: usize,
+    ib: usize,
+    n_freq: usize,
+    dst: &mut [CoarseAcc],
+) {
+    let nh1 = spec.n_freq;
+    // tone_bin_lo = [0,2,4,6,...,14] for the standard FT8/NFFT_SPEC
+    // configuration. Verify and fall back to the generic gather if
+    // a future protocol setting breaks the assumption.
+    let df = SAMPLE_RATE_HZ / NFFT_SPEC as f32;
+    let tone_step_bins = TONE_SPACING_HZ / df;
+    let mut tone_bin_lo = [0usize; NTONES];
+    for k in 0..NTONES {
+        tone_bin_lo[k] = (k as f32 * tone_step_bins).floor() as usize;
+    }
+    let win = 2 * NTONES;
+    let contiguous = (0..NTONES).all(|k| tone_bin_lo[k] == 2 * k);
+    if contiguous {
+        let row0 = 0;
+        for m in 0..spec.n_time {
+            let mut s: CoarseAcc = CoarseAcc::default();
+            for j in 0..win {
+                let bin = (ia + j).min(nh1 - 1);
+                s += spec.power_acc(bin, m);
+            }
+            dst[row0 * spec.n_time + m] = s;
+        }
+        for fi in 1..n_freq {
+            let drop_bin = ia + fi - 1;
+            let add_bin = (ia + fi + win - 1).min(nh1 - 1);
+            let prev_off = (fi - 1) * spec.n_time;
+            let curr_off = fi * spec.n_time;
+            for m in 0..spec.n_time {
+                dst[curr_off + m] =
+                    dst[prev_off + m] - spec.power_acc(drop_bin, m) + spec.power_acc(add_bin, m);
+            }
+        }
+    } else {
+        for (fi, i_carrier) in (ia..=ib).enumerate() {
+            let row_off = fi * spec.n_time;
+            for m in 0..spec.n_time {
+                let mut s: CoarseAcc = CoarseAcc::default();
+                for k in 0..NTONES {
+                    let lo = (i_carrier + tone_bin_lo[k]).min(nh1 - 1);
+                    let hi = (lo + 1).min(nh1 - 1);
+                    s += spec.power_acc(lo, m) + spec.power_acc(hi, m);
+                }
+                dst[row_off + m] = s;
+            }
+        }
+    }
+}
+
+fn coarse_sync_inner(
+    spec: &Spectrogram,
+    freq_min: f32,
+    freq_max: f32,
+    sync_min: f32,
+    max_cand: usize,
+    external_allsum: Option<&[CoarseAcc]>,
+) -> Vec<SyncCandidate> {
     let df = SAMPLE_RATE_HZ / NFFT_SPEC as f32;
     let tstep = NSTEP as f32 / SAMPLE_RATE_HZ;
     let jstrt = (TX_START_OFFSET_S / tstep).round() as i32;
@@ -662,44 +832,61 @@ pub fn coarse_sync(
     // sum if a future NFFT_SPEC breaks the assumption.
     let win = 2 * NTONES; // 16 contiguous bins
     let contiguous = (0..NTONES).all(|k| tone_bin_lo[k] == 2 * k);
-    let mut allsum: Vec<CoarseAcc> = vec![CoarseAcc::default(); n_freq * spec.n_time];
-    if contiguous {
-        // Initial column (fi=0): full 16-bin sum.
-        let row0 = 0;
-        for &m in &needed_m {
-            let mut s: CoarseAcc = CoarseAcc::default();
-            for j in 0..win {
-                let bin = (ia + j).min(nh1 - 1);
-                s += spec.power_acc(bin, m);
-            }
-            allsum[row0 * spec.n_time + m] = s;
-        }
-        // Slide for fi=1..n_freq.
-        for fi in 1..n_freq {
-            let drop_bin = ia + fi - 1;
-            let add_bin = (ia + fi + win - 1).min(nh1 - 1);
-            let prev_off = (fi - 1) * spec.n_time;
-            let curr_off = fi * spec.n_time;
-            for &m in &needed_m {
-                allsum[curr_off + m] =
-                    allsum[prev_off + m] - spec.power_acc(drop_bin, m) + spec.power_acc(add_bin, m);
-            }
-        }
+    // Phase-E2: caller can pass a pre-built allsum (built incrementally
+    // during slot capture by stage1_inc). When provided, skip the
+    // precompute entirely. Otherwise build it inline as before.
+    let owned_allsum: Vec<CoarseAcc>;
+    let allsum: &[CoarseAcc] = if let Some(ext) = external_allsum {
+        debug_assert_eq!(
+            ext.len(),
+            n_freq * spec.n_time,
+            "external allsum length mismatch (expected n_freq * spec.n_time)"
+        );
+        ext
     } else {
-        // Generic fallback: 16 reads per (fi, m).
-        for (fi, i_carrier) in (ia..=ib).enumerate() {
-            let row_off = fi * spec.n_time;
-            for &m in &needed_m {
-                let mut s: CoarseAcc = CoarseAcc::default();
-                for k in 0..NTONES {
-                    let lo = (i_carrier + tone_bin_lo[k]).min(nh1 - 1);
-                    let hi = (lo + 1).min(nh1 - 1);
-                    s += spec.power_acc(lo, m) + spec.power_acc(hi, m);
+        owned_allsum = {
+            let mut buf = vec![CoarseAcc::default(); n_freq * spec.n_time];
+            if contiguous {
+                let row0 = 0;
+                for &m in &needed_m {
+                    let mut s: CoarseAcc = CoarseAcc::default();
+                    for j in 0..win {
+                        let bin = (ia + j).min(nh1 - 1);
+                        s += spec.power_acc(bin, m);
+                    }
+                    buf[row0 * spec.n_time + m] = s;
                 }
-                allsum[row_off + m] = s;
+                for fi in 1..n_freq {
+                    let drop_bin = ia + fi - 1;
+                    let add_bin = (ia + fi + win - 1).min(nh1 - 1);
+                    let prev_off = (fi - 1) * spec.n_time;
+                    let curr_off = fi * spec.n_time;
+                    for &m in &needed_m {
+                        buf[curr_off + m] = buf[prev_off + m] - spec.power_acc(drop_bin, m)
+                            + spec.power_acc(add_bin, m);
+                    }
+                }
+            } else {
+                for (fi, i_carrier) in (ia..=ib).enumerate() {
+                    let row_off = fi * spec.n_time;
+                    for &m in &needed_m {
+                        let mut s: CoarseAcc = CoarseAcc::default();
+                        for k in 0..NTONES {
+                            let lo = (i_carrier + tone_bin_lo[k]).min(nh1 - 1);
+                            let hi = (lo + 1).min(nh1 - 1);
+                            s += spec.power_acc(lo, m) + spec.power_acc(hi, m);
+                        }
+                        buf[row_off + m] = s;
+                    }
+                }
             }
-        }
-    }
+            buf
+        };
+        &owned_allsum
+    };
+    // Suppress unused-variable warnings for the contiguous/win locals
+    // when the external path is taken.
+    let _ = (contiguous, win);
     #[cfg(feature = "std")]
     let t_allsum = std::time::Instant::now();
 
@@ -1622,7 +1809,9 @@ where
 /// MCUs / architectural consistency); `f32` otherwise (host / FPU
 /// targets where soft-emu cost is irrelevant). Both routes go
 /// through the same generic NMS implementation in `fec::ldpc::bp`.
-#[cfg(feature = "fixed-point-llr")]
+#[cfg(feature = "llr-i8")]
+type LlrT = crate::core::scalar::Q3i8;
+#[cfg(all(feature = "fixed-point-llr", not(feature = "llr-i8")))]
 type LlrT = crate::core::scalar::Q11i16;
 #[cfg(not(feature = "fixed-point-llr"))]
 type LlrT = f32;
@@ -1907,6 +2096,263 @@ mod tests {
         slot.iter()
             .map(|&s| (s * 25_000.0).clamp(-32_768.0, 32_767.0) as i16)
             .collect()
+    }
+
+    /// Reproduce the dual_core::coarse_sync_split_with_allsum
+    /// pattern on host: build a full-band allsum, slice it for the
+    /// head [100, mid] and tail [mid, freq_max] sub-bands, run
+    /// coarse_sync_with_allsum on each, compare against running
+    /// coarse_sync on each sub-band without allsum. Synthesises 5
+    /// signals across the band so both halves have real candidates
+    /// (mirrors the qso3 busy-band failure case).
+    /// Verify that filling the allsum **column-by-column** (mirroring
+    /// what `embedded-poc/m5stack-core2::stage1_inc::update_one_half`
+    /// does as new spectrogram rows arrive) produces the same buffer
+    /// as the one-shot `precompute_coarse_allsum`.
+    /// **Test mirrors only the FT8 contiguous (16-bin) path.**
+    #[test]
+    fn fill_coarse_allsum_column_by_column_matches_oneshot() {
+        let msg = pack_cq();
+        let audio = synth_clean(&msg, 1500.0);
+        let spec = compute_spectrogram(&audio, 3_000.0);
+        let (fmin, fmax) = (1550.0_f32, 3000.0_f32);
+        let oneshot = precompute_coarse_allsum(&spec, fmin, fmax);
+
+        let df = SAMPLE_RATE_HZ / NFFT_SPEC as f32;
+        let tone_step_bins = TONE_SPACING_HZ / df;
+        let ia = (fmin / df).round() as usize;
+        let max_tone_off = ((NTONES - 1) as f32 * tone_step_bins).ceil() as usize + 1;
+        let nh1 = spec.n_freq;
+        let ib_unbounded = (fmax / df).round() as usize;
+        let ib = ib_unbounded.min(nh1.saturating_sub(max_tone_off));
+        let n_freq = ib - ia + 1;
+        let win = 2 * NTONES;
+        let n_time = spec.n_time;
+
+        // Column-by-column: simulate incremental fill, walking m
+        // outer, fi inner with sliding window. This is exactly what
+        // stage1_inc::update_one_half does per pair.
+        let mut col: Vec<f32> = vec![0.0; n_freq * n_time];
+        for m in 0..n_time {
+            let mut s = 0.0_f32;
+            for j in 0..win {
+                let bin = (ia + j).min(nh1 - 1);
+                s += spec.power_acc(bin, m);
+            }
+            col[m] = s;
+            for fi in 1..n_freq {
+                let drop_bin = ia + fi - 1;
+                let add_bin = (ia + fi + win - 1).min(nh1 - 1);
+                s = s - spec.power_acc(drop_bin, m) + spec.power_acc(add_bin, m);
+                col[fi * n_time + m] = s;
+            }
+        }
+
+        for fi in 0..n_freq {
+            for m in 0..n_time {
+                let a = oneshot[fi * n_time + m];
+                let b = col[fi * n_time + m];
+                assert!(
+                    (a - b).abs() < 1e-3,
+                    "fi={fi} m={m}: oneshot={a} col-by-col={b}"
+                );
+            }
+        }
+    }
+
+    /// Same as `coarse_sync_with_allsum_matches_internal` but for a
+    /// non-default sub-band (tail of [1550, 3000]) — isolates whether
+    /// the coarse_sync_with_allsum path itself works for arbitrary
+    /// freq ranges, independent of slicing logic.
+    #[test]
+    fn coarse_sync_with_allsum_tail_band_only() {
+        let msg = pack_cq();
+        let audio = synth_clean(&msg, 2000.0); // signal in tail band
+        let spec = compute_spectrogram(&audio, 3_000.0);
+        let (fmin, fmax, smin, ncand) = (1550.0_f32, 3000.0_f32, 1.0_f32, 30usize);
+
+        let a = coarse_sync(&spec, fmin, fmax, smin, ncand);
+        let allsum = precompute_coarse_allsum(&spec, fmin, fmax);
+        let b = coarse_sync_with_allsum(&spec, fmin, fmax, smin, ncand, &allsum);
+
+        assert_eq!(
+            a.len(),
+            b.len(),
+            "tail band candidate count A={} B={}",
+            a.len(),
+            b.len()
+        );
+        for (ai, bi) in a.iter().zip(b.iter()) {
+            assert!(
+                (ai.freq_hz - bi.freq_hz).abs() < 1e-3 && (ai.score - bi.score).abs() < 1e-4,
+                "tail-band mismatch: A={ai:?} B={bi:?}"
+            );
+        }
+    }
+
+    /// Reproduce the dual_core::coarse_sync_split_with_allsum
+    /// pattern using per-half allsums (the API supports any sub-band
+    /// directly). Synthesises 5 signals across the band so both
+    /// halves have real candidates (mirrors qso3 busy band).
+    /// **Per-half precompute avoids sliding-window f32 drift across
+    /// the full band that breaks slice-based approaches.**
+    #[test]
+    fn coarse_sync_split_with_allsum_per_half_busy_band() {
+        let msg = pack_cq();
+        let freqs = [400.0_f32, 1100.0, 1700.0, 2200.0, 2700.0];
+        let mut mix = vec![0.0f32; NMAX];
+        for (i, &f) in freqs.iter().enumerate() {
+            let itone = message_to_tones(&msg);
+            let pcm = tones_to_f32(&itone, f, 0.5);
+            let start = (TX_START_OFFSET_S * SAMPLE_RATE_HZ) as usize + i * 100;
+            let n = pcm.len().min(NMAX - start);
+            for k in 0..n {
+                mix[start + k] += pcm[k];
+            }
+        }
+        let audio: Vec<i16> = mix
+            .iter()
+            .map(|&s| (s * 5_000.0).clamp(-32_768.0, 32_767.0) as i16)
+            .collect();
+        let spec = compute_spectrogram(&audio, 3_000.0);
+        let (fmin, fmax, smin, ncand) = (100.0_f32, 3_000.0_f32, 1.0_f32, 30usize);
+        let mid = 0.5 * (fmin + fmax);
+
+        // Path A: baseline coarse_sync per half.
+        let head_a = coarse_sync(&spec, fmin, mid, smin, ncand);
+        let tail_a = coarse_sync(&spec, mid, fmax, smin, ncand);
+
+        // Path B: per-half precompute_coarse_allsum.
+        let allsum_head = precompute_coarse_allsum(&spec, fmin, mid);
+        let allsum_tail = precompute_coarse_allsum(&spec, mid, fmax);
+        let head_b = coarse_sync_with_allsum(&spec, fmin, mid, smin, ncand, &allsum_head);
+        let tail_b = coarse_sync_with_allsum(&spec, mid, fmax, smin, ncand, &allsum_tail);
+
+        assert_eq!(head_a.len(), head_b.len());
+        assert_eq!(tail_a.len(), tail_b.len());
+        for (a, b) in head_a.iter().zip(head_b.iter()) {
+            assert!(
+                (a.freq_hz - b.freq_hz).abs() < 1e-3 && (a.score - b.score).abs() < 1e-4,
+                "head per-half mismatch: A={a:?} B={b:?}"
+            );
+        }
+        for (a, b) in tail_a.iter().zip(tail_b.iter()) {
+            assert!(
+                (a.freq_hz - b.freq_hz).abs() < 1e-3 && (a.score - b.score).abs() < 1e-4,
+                "tail per-half mismatch: A={a:?} B={b:?}"
+            );
+        }
+    }
+
+    /// **Documents a known limitation, not a regression**: building a
+    /// full-band allsum and slicing it for sub-band consumption
+    /// drifts in f32 over hundreds of sliding-window steps, breaking
+    /// score-loop ordering on busy bands. The embedded port uses
+    /// per-half precompute (`coarse_sync_split_with_allsum_per_half_busy_band`
+    /// is the supported path) so this test is `#[ignore]`.
+    #[test]
+    #[ignore = "documents f32 sliding-window drift; per-half precompute is the supported pattern"]
+    fn coarse_sync_split_with_allsum_busy_band() {
+        let msg = pack_cq();
+        // 5 signals across [100, 3000] Hz band — 2 in head [100, 1550]
+        // and 3 in tail [1550, 3000].
+        let freqs = [400.0_f32, 1100.0, 1700.0, 2200.0, 2700.0];
+        let mut mix = vec![0.0f32; NMAX];
+        for (i, &f) in freqs.iter().enumerate() {
+            let itone = message_to_tones(&msg);
+            let pcm = tones_to_f32(&itone, f, 0.5);
+            let start = (TX_START_OFFSET_S * SAMPLE_RATE_HZ) as usize + i * 100;
+            let n = pcm.len().min(NMAX - start);
+            for k in 0..n {
+                mix[start + k] += pcm[k];
+            }
+        }
+        let audio: Vec<i16> = mix
+            .iter()
+            .map(|&s| (s * 5_000.0).clamp(-32_768.0, 32_767.0) as i16)
+            .collect();
+        let spec = compute_spectrogram(&audio, 3_000.0);
+
+        let (fmin, fmax, smin, ncand) = (100.0_f32, 3_000.0_f32, 1.0_f32, 30usize);
+        let mid = 0.5 * (fmin + fmax);
+        let df = SAMPLE_RATE_HZ / NFFT_SPEC as f32;
+
+        // Path A: baseline — coarse_sync per half.
+        let head_a = coarse_sync(&spec, fmin, mid, smin, ncand);
+        let tail_a = coarse_sync(&spec, mid, fmax, smin, ncand);
+
+        // Path B: precompute full-band allsum, slice, run coarse_sync_with_allsum.
+        let allsum_full = precompute_coarse_allsum(&spec, fmin, fmax);
+        let allsum_ia = (fmin / df).round() as usize;
+        let head_len = coarse_allsum_len(spec.n_freq, spec.n_time, fmin, mid);
+        let tail_len = coarse_allsum_len(spec.n_freq, spec.n_time, mid, fmax);
+        let ia_head = (fmin / df).round() as usize;
+        let ia_tail = (mid / df).round() as usize;
+        let head_off = (ia_head - allsum_ia) * spec.n_time;
+        let tail_off = (ia_tail - allsum_ia) * spec.n_time;
+        let head_slice = &allsum_full[head_off..head_off + head_len];
+        let tail_slice = &allsum_full[tail_off..tail_off + tail_len];
+        let head_b = coarse_sync_with_allsum(&spec, fmin, mid, smin, ncand, head_slice);
+        let tail_b = coarse_sync_with_allsum(&spec, mid, fmax, smin, ncand, tail_slice);
+
+        assert_eq!(
+            head_a.len(),
+            head_b.len(),
+            "head candidate count differs: A={} B={}",
+            head_a.len(),
+            head_b.len()
+        );
+        assert_eq!(
+            tail_a.len(),
+            tail_b.len(),
+            "tail candidate count differs: A={} B={}",
+            tail_a.len(),
+            tail_b.len()
+        );
+        for (a, b) in head_a.iter().zip(head_b.iter()) {
+            assert!(
+                (a.freq_hz - b.freq_hz).abs() < 1e-3
+                    && (a.dt_sec - b.dt_sec).abs() < 1e-6
+                    && (a.score - b.score).abs() < 1e-4,
+                "head mismatch: A={a:?} B={b:?}"
+            );
+        }
+        for (a, b) in tail_a.iter().zip(tail_b.iter()) {
+            assert!(
+                (a.freq_hz - b.freq_hz).abs() < 1e-3
+                    && (a.dt_sec - b.dt_sec).abs() < 1e-6
+                    && (a.score - b.score).abs() < 1e-4,
+                "tail mismatch: A={a:?} B={b:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn coarse_sync_with_allsum_matches_internal() {
+        // Phase-E2 sister API equivalence: compute the same allsum that
+        // the internal precompute would produce, feed it via
+        // `coarse_sync_with_allsum`, and verify identical candidate output.
+        let msg = pack_cq();
+        let audio = synth_clean(&msg, 1500.0);
+        let spec = compute_spectrogram(&audio, 3_000.0);
+        let (fmin, fmax, smin, ncand) = (100.0_f32, 3000.0_f32, 1.0_f32, 30usize);
+        let internal = coarse_sync(&spec, fmin, fmax, smin, ncand);
+        let allsum = precompute_coarse_allsum(&spec, fmin, fmax);
+        assert_eq!(
+            allsum.len(),
+            coarse_allsum_len(spec.n_freq, spec.n_time, fmin, fmax),
+            "allsum length must match coarse_allsum_len"
+        );
+        let external = coarse_sync_with_allsum(&spec, fmin, fmax, smin, ncand, &allsum);
+        assert_eq!(internal.len(), external.len(), "candidate count differs");
+        for (a, b) in internal.iter().zip(external.iter()) {
+            assert!(
+                (a.freq_hz - b.freq_hz).abs() < 1e-3
+                    && (a.dt_sec - b.dt_sec).abs() < 1e-6
+                    && (a.score - b.score).abs() < 1e-4,
+                "candidate mismatch: internal={a:?} external={b:?}"
+            );
+        }
     }
 
     #[test]

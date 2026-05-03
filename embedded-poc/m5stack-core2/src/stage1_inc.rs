@@ -70,11 +70,53 @@ fn n_freq_for(max_freq_hz: f32) -> usize {
     (((band_top_hz / df).ceil() as usize) + 1).min(NFFT_SPEC / 2)
 }
 
+// ── Phase-E2: incremental allsum ─────────────────────────────────────────────
+// Mirrors the 16-bin sliding-window allsum that mfsk-core's
+// `coarse_sync_inner` builds at the top of stage 2. By accumulating it
+// here as new spec rows arrive (≈ 2 columns per FFT pair), we hide the
+// 280-300 ms allsum precompute under the 15 s capture window.
+
+/// coarse_sync band for the rx_wavsim pipeline. Matches the
+/// `dual_core::coarse_sync_split(spec, 100.0, 3_000.0, ...)` call.
+/// **Per-half precompute** to avoid f32 sliding-window drift across
+/// the full band (~1k slide steps would drift by signal-scale at
+/// busy bands; per-half from-scratch fi=0 init keeps drift bounded).
+const ALLSUM_FREQ_MIN: f32 = 100.0;
+const ALLSUM_FREQ_MAX: f32 = 3_000.0;
+const ALLSUM_FREQ_MID: f32 = 0.5 * (ALLSUM_FREQ_MIN + ALLSUM_FREQ_MAX);
+const ALLSUM_WIN: usize = 2 * NTONES; // 16 contiguous bins (FT8 NFFT_SPEC=4096)
+
+/// Per-half carrier-bin range. Mirrors the formulas in mfsk-core's
+/// `coarse_allsum_len` for `(freq_min..freq_max)`.
+fn band_for(freq_min: f32, freq_max: f32, spec_n_freq: usize) -> (usize, usize, usize) {
+    let df = SAMPLE_RATE_HZ / NFFT_SPEC as f32;
+    let tone_step_bins = TONE_SPACING_HZ / df;
+    let ia = (freq_min / df).round() as usize;
+    let max_tone_off = ((NTONES - 1) as f32 * tone_step_bins).ceil() as usize + 1;
+    let ib_unbounded = (freq_max / df).round() as usize;
+    let ib = ib_unbounded.min(spec_n_freq.saturating_sub(max_tone_off));
+    (ia, ib, ib - ia + 1)
+}
+
 // State -----------------------------------------------------------------------
 
 struct Inner {
     audio: Vec<i16>,           // 180 000 i16, PSRAM. Index = sample idx.
     spec: Vec<u16>,            // n_freq × n_time, PSRAM. Throwaway.
+    /// Per-half allsums for the head [100, 1550] Hz and tail
+    /// [1550, 3000] Hz sub-bands, built incrementally during capture.
+    /// Each layout: `allsum[fi * N_TIME + m]`. Phase-E2 hands these
+    /// to mfsk-core's `coarse_sync_with_allsum` at slot end so
+    /// stage 2 skips its own precompute. **Per-half** (not full
+    /// band sliced) so f32 sliding-window drift stays bounded — see
+    /// `mfsk_core::ft8::decode_block::coarse_sync_split_with_allsum_busy_band`
+    /// for the documented full-band-slice failure mode.
+    allsum_head: Vec<f32>,
+    allsum_tail: Vec<f32>,
+    allsum_head_ia: usize,
+    allsum_head_n_freq: usize,
+    allsum_tail_ia: usize,
+    allsum_tail_n_freq: usize,
     hann: [i16; NSPS],         // 3.7 KB stack-init then moved here
     fft_planner: Box<dyn FftPlanner16>,
     fft: Box<dyn Fft16>,
@@ -116,6 +158,12 @@ pub fn init() {
     let audio: Vec<i16> = vec![0i16; NMAX];
     let spec: Vec<u16> = vec![0u16; n_freq * N_TIME];
     let fft_buf: Vec<Complex<i16>> = vec![Complex::new(0i16, 0i16); NFFT_SPEC];
+    let (allsum_head_ia, _, allsum_head_n_freq) =
+        band_for(ALLSUM_FREQ_MIN, ALLSUM_FREQ_MID, n_freq);
+    let (allsum_tail_ia, _, allsum_tail_n_freq) =
+        band_for(ALLSUM_FREQ_MID, ALLSUM_FREQ_MAX, n_freq);
+    let allsum_head: Vec<f32> = vec![0f32; allsum_head_n_freq * N_TIME];
+    let allsum_tail: Vec<f32> = vec![0f32; allsum_tail_n_freq * N_TIME];
 
     // Hann window (q15). Replicates `hann_window_q15` in mfsk-core
     // (raised-cosine, 0…NSPS-1). Uses `f32::cos` from std (esp-idf-svc
@@ -133,6 +181,12 @@ pub fn init() {
     let inner = Inner {
         audio,
         spec,
+        allsum_head,
+        allsum_tail,
+        allsum_head_ia,
+        allsum_head_n_freq,
+        allsum_tail_ia,
+        allsum_tail_n_freq,
         hann,
         fft_planner,
         fft,
@@ -247,6 +301,49 @@ pub fn take_spec() -> Option<mfsk_core::ft8::decode_block::Spectrogram> {
     }
 }
 
+/// Phase-E2: take both the incremental spec **and** the per-half
+/// pre-built allsums for [100, 1550] (head) and [1550, 3000] (tail).
+/// Returns `None` if not all pairs are done; otherwise returns
+/// `(spec, allsum_head, allsum_tail)`. Each allsum has layout
+/// `data[fi * N_TIME + m]` matching what
+/// `mfsk_core::ft8::decode_block::precompute_coarse_allsum` produces
+/// for its half's freq range — pass directly to
+/// `dual_core::coarse_sync_split_with_allsum`.
+pub fn take_spec_and_allsum() -> Option<(
+    mfsk_core::ft8::decode_block::Spectrogram,
+    Vec<f32>, // head
+    Vec<f32>, // tail
+)> {
+    let pairs = PAIR_DONE.load(Ordering::Acquire);
+    if pairs < N_PAIRS {
+        return None;
+    }
+    unsafe {
+        let inner = STATE.as_mut().expect("stage1_inc not init'd");
+        let n_freq = inner.n_freq;
+        let head_n = inner.allsum_head_n_freq;
+        let tail_n = inner.allsum_tail_n_freq;
+        // Fresh buffers for the *next* slot. Zero-init for safety —
+        // tried `Vec::with_capacity` + `set_len` (uninit) to skip the
+        // ~100 ms PSRAM zero write but observed sporadic 0-result
+        // failures on a re-loop slot. Keeping zero-init costs ~100
+        // ms but is reliable (~50 ms net Phase-E2 saving over
+        // baseline; the larger win is in row-major Spectrogram which
+        // is independent).
+        let mut fresh_spec: Vec<u16> = vec![0u16; n_freq * N_TIME];
+        let mut fresh_head: Vec<f32> = vec![0f32; head_n * N_TIME];
+        let mut fresh_tail: Vec<f32> = vec![0f32; tail_n * N_TIME];
+        core::mem::swap(&mut inner.spec, &mut fresh_spec);
+        core::mem::swap(&mut inner.allsum_head, &mut fresh_head);
+        core::mem::swap(&mut inner.allsum_tail, &mut fresh_tail);
+        Some((
+            mfsk_core::ft8::decode_block::Spectrogram::from_parts(n_freq, N_TIME, fresh_spec),
+            fresh_head,
+            fresh_tail,
+        ))
+    }
+}
+
 extern "C" fn worker_main(_arg: *mut c_void) {
     log::info!("stage1_inc: worker entered");
     loop {
@@ -340,5 +437,67 @@ fn compute_pair_into(inner: &mut Inner, j_a: usize, j_b: usize) {
         let mag2_b = ((b_re * b_re + b_im * b_im) as u32) >> FP_SPEC_SHIFT;
         inner.spec[row_a + k] = mag2_a as u16;
         inner.spec[row_b + k] = mag2_b as u16;
+    }
+
+    // Phase-E2: now that spec rows m=j_a and m=j_b are filled, update
+    // the corresponding allsum columns for both halves. Sliding
+    // window across fi at fixed m within each half (each half does
+    // its own from-scratch fi=0 init so f32 drift across the band
+    // doesn't accumulate).
+    update_allsum_columns_for_m(inner, j_a);
+    update_allsum_columns_for_m(inner, j_b);
+}
+
+/// Update allsum cells at column `m` for both halves (head + tail).
+#[inline]
+fn update_allsum_columns_for_m(inner: &mut Inner, m: usize) {
+    if m >= N_TIME {
+        return;
+    }
+    update_one_half(
+        m,
+        inner.allsum_head_ia,
+        inner.allsum_head_n_freq,
+        inner.n_freq,
+        &inner.spec,
+        &mut inner.allsum_head,
+    );
+    update_one_half(
+        m,
+        inner.allsum_tail_ia,
+        inner.allsum_tail_n_freq,
+        inner.n_freq,
+        &inner.spec,
+        &mut inner.allsum_tail,
+    );
+}
+
+/// 16-bin sliding-window sum at fixed `m`, fi=0..n_freq, into
+/// `dst[fi * N_TIME + m]`. Mirrors mfsk-core `fill_coarse_allsum`
+/// for one column.
+#[inline]
+fn update_one_half(
+    m: usize,
+    ia: usize,
+    n_freq: usize,
+    spec_n_freq: usize,
+    spec: &[u16],
+    dst: &mut [f32],
+) {
+    let win = ALLSUM_WIN;
+    let mut s: f32 = 0.0;
+    let row_base = m * spec_n_freq;
+    for j in 0..win {
+        let bin = (ia + j).min(spec_n_freq - 1);
+        s += spec[row_base + bin] as f32;
+    }
+    dst[m] = s;
+    for fi in 1..n_freq {
+        let drop_bin = ia + fi - 1;
+        let add_bin = (ia + fi + win - 1).min(spec_n_freq - 1);
+        let drop_v = spec[row_base + drop_bin] as f32;
+        let add_v = spec[row_base + add_bin] as f32;
+        s = s - drop_v + add_v;
+        dst[fi * N_TIME + m] = s;
     }
 }

@@ -142,10 +142,13 @@ fn decode_one_slot(stream: *mut MfskFt8Stream) {
     // 92 pairs during slot capture, take its prebuilt Spectrogram and
     // skip stage 1 entirely — the FFT cost was hidden under capture.
     let t0 = now_us();
-    let (spec, stage1_path) = if let Some(s) = stage1_inc::take_spec() {
-        (s, "incremental")
-    } else {
-        (compute_spectrogram(&slot[..], 3_000.0), "fallback")
+    // Phase-E2: prefer incremental spec + per-half allsums prebuilt
+    // by stage1_inc during the 15 s capture window (saves the
+    // 280-300 ms allsum precompute from stage 2). Falls back to
+    // legacy spec-only + internal precompute if pairs not all ready.
+    let (spec, allsum_pair_opt, stage1_path) = match stage1_inc::take_spec_and_allsum() {
+        Some((s, head, tail)) => (s, Some((head, tail)), "incremental"),
+        None => (compute_spectrogram(&slot[..], 3_000.0), None, "fallback"),
     };
     let t1 = now_us();
     log::info!(
@@ -157,7 +160,33 @@ fn decode_one_slot(stream: *mut MfskFt8Stream) {
     );
 
     let t2 = now_us();
-    let pass1 = dual_core::coarse_sync_split(&spec, 100.0, 3_000.0, 1.0, PASS1_LIMIT);
+    // **Sequential per-half on main**, not dual_core dispatch — the
+    // worker-side coarse_sync_with_allsum produces wrong candidates
+    // when the allsum lives in main's PSRAM-backed Vec (root cause
+    // not yet identified — cache writeback/invalidate via
+    // xthal_dcache_* didn't help; suspected PSRAM-cache cross-core
+    // sharing semantics on LX6). Sequential is verified correct on
+    // all 3 WAVs and still saves ~140 ms vs baseline because the
+    // allsum precompute is fully hidden under capture.
+    let pass1 = match &allsum_pair_opt {
+        Some((head, tail)) => {
+            let mut p = mfsk_core::ft8::decode_block::coarse_sync_with_allsum(
+                &spec, 100.0, 1550.0, 1.0, PASS1_LIMIT, head,
+            );
+            let t = mfsk_core::ft8::decode_block::coarse_sync_with_allsum(
+                &spec, 1550.0, 3_000.0, 1.0, PASS1_LIMIT, tail,
+            );
+            p.extend(t);
+            p.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(core::cmp::Ordering::Equal)
+            });
+            p.truncate(PASS1_LIMIT);
+            p
+        }
+        None => dual_core::coarse_sync_split(&spec, 100.0, 3_000.0, 1.0, PASS1_LIMIT),
+    };
     let t3 = now_us();
     log::info!(
         "  stage 2 (sync): {:>7} us  ({} cand)",
