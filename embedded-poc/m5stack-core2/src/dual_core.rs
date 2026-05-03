@@ -343,13 +343,22 @@ pub fn coarse_sync_split_with_allsum(
     use mfsk_core::ft8::decode_block::coarse_sync_with_allsum;
     let mid = 0.5 * (freq_min + freq_max);
 
-    // **KNOWN ISSUE — race / sharing problem with worker dispatch.**
-    // When this path runs concurrently with main's head coarse_sync,
-    // worker's tail coarse_sync returns wrong candidates on busy
-    // bands (qso3: 0/7 vs 7/7 sequential). xthal_dcache_region_*
-    // writeback/invalidate did not help. rx_wavsim consumes Phase E2
-    // via sequential per-half on main today; this dispatch entry
-    // point is kept for follow-up investigation.
+    // **KNOWN ISSUE — CPU contention with stage1_inc on core 1.**
+    // Diagnosis (2026-05-03): the dispatch path runs the worker on
+    // core 1 (priority 5), preempting `stage1_inc` (also core 1,
+    // priority 3) for the duration of the worker's coarse_sync.
+    // With Phase E2 in flight, `stage1_inc` needs core 1 cycles each
+    // `push_chunk` notification to advance pairs as audio arrives.
+    // Starved, it falls behind the slot's audio playback; the audio
+    // ring buffer wraps and late pair m positions (m ≈ 174-175,
+    // touched by Costas block 2) compute spec from corrupted /
+    // shifted audio, breaking the score loop on busy bands. xthal
+    // dcache writeback/invalidate calls had no effect (this isn't a
+    // cache coherence problem). rx_wavsim therefore consumes Phase
+    // E2 via sequential per-half on main today; the dispatch entry
+    // point is preserved for revisiting after stage1_inc CPU
+    // budgeting is addressed (e.g. raise stage1_inc priority above
+    // the dual_core worker, or move stage1_inc to a dedicated core).
     let mut worker_out: Option<Vec<SyncCandidate>> = None;
     unsafe {
         *JOB_SLOT.inner.get() = Some(Job::CoarseSyncWithAllsum {

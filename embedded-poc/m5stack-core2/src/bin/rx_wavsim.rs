@@ -161,13 +161,13 @@ fn decode_one_slot(stream: *mut MfskFt8Stream) {
 
     let t2 = now_us();
     // **Sequential per-half on main**, not dual_core dispatch — the
-    // worker-side coarse_sync_with_allsum produces wrong candidates
-    // when the allsum lives in main's PSRAM-backed Vec (root cause
-    // not yet identified — cache writeback/invalidate via
-    // xthal_dcache_* didn't help; suspected PSRAM-cache cross-core
-    // sharing semantics on LX6). Sequential is verified correct on
-    // all 3 WAVs and still saves ~140 ms vs baseline because the
-    // allsum precompute is fully hidden under capture.
+    // dispatch path runs the dual_core worker on core 1 (priority 5),
+    // which preempts stage1_inc (also core 1, priority 3). Starved
+    // stage1_inc misses push_chunk advance_pairs cycles, the audio
+    // buffer wraps with stale data from the previous slot, and late
+    // pairs (m≈174-175) compute spec/allsum from corrupted audio →
+    // qso3 0/7 on the incremental path. Sequential keeps stage 2
+    // entirely on core 0 so core 1 is free for stage1_inc.
     let pass1 = match &allsum_pair_opt {
         Some((head, tail)) => {
             let mut p = mfsk_core::ft8::decode_block::coarse_sync_with_allsum(
