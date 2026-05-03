@@ -30,7 +30,16 @@ CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_QUAD=y
 CONFIG_SPIRAM_USE_MALLOC=y
 # Honor PSRAM-allocated buffers from `Box<[T]>` / `Vec<T>` automatically.
-CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
+# Lowered 16384 → 4096 for dual-core decode (`dual_core.rs`): both
+# `pass2_split` halves hold ≤ 15 cs Box of 5 KB each in
+# `refine_candidates_with`'s BinaryHeap simultaneously. With
+# 16384 these 5 KB allocations stayed in internal DRAM (60 KB peak
+# per half × 2 cores = 120 KB), exhausting the ~111 KB free
+# contiguous DRAM and corrupting tlsf — Guru Meditation
+# LoadProhibited at the Pass 2 → Stage 3 transition. At 4096 the
+# cs Boxes route to PSRAM; they're only read once when packing
+# RefinedCandidate so the bandwidth hit is negligible.
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
 
 # ── Task watchdog ────────────────────────────────────────────────────
 # decode_block is a long-running compute kernel that doesn't yield —

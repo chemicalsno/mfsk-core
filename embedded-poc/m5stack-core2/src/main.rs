@@ -33,6 +33,7 @@
 // links against under `fft-extern`. `pub use` keeps the linker from
 // stripping the factory as dead code.
 pub mod esp_dsp_fft;
+mod dual_core;
 
 use mfsk_core::fec::ldpc::bp::{bp_decode_kind, check_crc14, BpKind};
 use mfsk_core::fec::ldpc::osd::{osd_decode, osd_decode_deep};
@@ -143,6 +144,20 @@ fn main() {
         mfsk_core::ft8::decode_block::NFFT_SPEC,
     );
     log::info!("baked WAVs: {}", QSO_WAVS.len());
+
+    // Pre-warm esp-dsp FFT twiddle tables (f32 + i16) at NFFT_SPEC up
+    // front. mfsk-core builds a fresh `EspDspPlanner` per decode_block
+    // call via `default_planner()`; without pre-warm each call would
+    // re-call `dsps_fft2r_init_*` (idempotent at runtime, but a race
+    // hazard once we move to dual-core workers). After this point the
+    // global twiddle tables are read-only.
+    esp_dsp_fft::prewarm(mfsk_core::ft8::decode_block::NFFT_SPEC);
+    log::info!("FFT twiddle tables pre-warmed");
+
+    // Spawn the persistent dual-core worker (pinned to APP_CPU).
+    // Pass 2 / Stage 3 candidate halves are dispatched via FreeRTOS
+    // task notifications; see `dual_core.rs`.
+    dual_core::init();
 
     // max_cand sweep — host PASS1×max_cand sweep at PASS1=75 showed
     // identical 15/22 truth recall for max_cand ∈ {15, 20, 30}; only
@@ -291,8 +306,6 @@ fn ffi_smoke_one(slot: &[i16]) {
 /// across all DFTs — without that, esp-dsp's asm dot product
 /// fall back on PSRAM-resident basis (5-10× slower per access).
 fn decode_one(slot: &[i16], max_cand: usize, _dt_grid: u8, _df_grid: u8, _q_thresh: u32) {
-    use mfsk_core::ft8::decode_block::{process_candidates_into, refine_candidates_into};
-
     // Stage 1: spectrogram.
     let t0 = now_us();
     let spec = compute_spectrogram(slot, 3_000.0);
@@ -304,9 +317,11 @@ fn decode_one(slot: &[i16], max_cand: usize, _dt_grid: u8, _df_grid: u8, _q_thre
         spec.n_freq,
     );
 
-    // Stage 2: Costas correlation. Pass 1 — wide net at PASS1_LIMIT.
+    // Stage 2: Costas correlation, split across both cores by freq
+    // half (worker handles upper half ≥ 1550 Hz, main handles lower).
+    // See `dual_core::coarse_sync_split`.
     let t2 = now_us();
-    let pass1 = coarse_sync(&spec, 100.0, 3_000.0, 1.0, PASS1_LIMIT);
+    let pass1 = dual_core::coarse_sync_split(&spec, 100.0, 3_000.0, 1.0, PASS1_LIMIT);
     let t3 = now_us();
     log::info!(
         "  stage 2 (sync):       {:>8} us  ({} cand)",
@@ -315,13 +330,17 @@ fn decode_one(slot: &[i16], max_cand: usize, _dt_grid: u8, _df_grid: u8, _q_thre
     );
     drop(spec);
 
-    // Pass 2 — re-rank by sync_quality_block0 (manually-staged
-    // mfsk-core entry point with our `.bss` basis scratch).
+    // Pass 2 — re-rank by sync_quality_block0, split across cores.
+    // Main runs the first half locally with BASIS_RE/IM (PRO_CPU),
+    // worker runs the second half with its own BASIS scratch on
+    // APP_CPU. Results are merged + globally sorted by q_block0 and
+    // truncated to `max_cand`.
     let t_pass2 = now_us();
-    // SAFETY: single-threaded main task; BASIS_RE / BASIS_IM are only
-    // accessed here and inside process_candidates_into below.
+    // SAFETY: BASIS_RE / BASIS_IM are only accessed by the main task
+    // (PRO_CPU); the worker uses its own scratch.
+    #[allow(static_mut_refs)]
     let pass2 = unsafe {
-        refine_candidates_into(slot, pass1, max_cand, &mut BASIS_RE, &mut BASIS_IM)
+        dual_core::pass2_split(slot, pass1, max_cand, &mut BASIS_RE, &mut BASIS_IM)
     };
     let t_pass2_end = now_us();
     log::info!(
@@ -340,8 +359,9 @@ fn decode_one(slot: &[i16], max_cand: usize, _dt_grid: u8, _df_grid: u8, _q_thre
         mfsk_core::ft8::decode::DecodeDepth::BpAll
     };
     let t4 = now_us();
+    #[allow(static_mut_refs)]
     let results = unsafe {
-        process_candidates_into(slot, pass2, depth, &mut BASIS_RE, &mut BASIS_IM)
+        dual_core::stage3_split(slot, pass2, depth, &mut BASIS_RE, &mut BASIS_IM)
     };
     let t5 = now_us();
     log::info!(

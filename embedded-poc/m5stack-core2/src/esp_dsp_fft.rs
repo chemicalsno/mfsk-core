@@ -35,6 +35,27 @@ pub extern "Rust" fn mfsk_core_make_default_fft_planner() -> Box<dyn FftPlanner>
     Box::new(EspDspPlanner::new())
 }
 
+/// Initialise both twiddle tables (f32 + i16) for the given size up
+/// front. Call once from `main()` before spawning any task. After this
+/// the global tables are read-only and concurrent FFT calls from
+/// pinned-to-core workers cannot race in `dsps_fft2r_init_*`.
+///
+/// `len` must be a power of two; pass the largest size the pipeline
+/// will use (NFFT_SPEC = 4096 for FT8 decode_block).
+pub fn prewarm(len: usize) {
+    assert!(len.is_power_of_two(), "prewarm len must be power of two");
+    unsafe {
+        assert_eq!(
+            dsps_fft2r_init_fc32(core::ptr::null_mut(), len as i32),
+            ESP_OK
+        );
+        assert_eq!(
+            dsps_fft2r_init_sc16(core::ptr::null_mut(), len as i32),
+            ESP_OK
+        );
+    }
+}
+
 /// i16 sibling factory for the `fixed-point` build path. Wraps
 /// `dsps_fft2r_sc16_ae32_` from the same managed component.
 #[unsafe(no_mangle)]

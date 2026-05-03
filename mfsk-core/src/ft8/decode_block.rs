@@ -203,9 +203,9 @@ fn q_thresh() -> u32 {
 /// either case so downstream code (coarse_sync score division,
 /// allsum) stays uniform. **Halves PSRAM bandwidth in stage 2.**
 #[cfg(not(feature = "fixed-point"))]
-type SpecCell = f32;
+pub type SpecCell = f32;
 #[cfg(feature = "fixed-point")]
-type SpecCell = u16;
+pub type SpecCell = u16;
 
 /// Right-shift applied to `(re² + im²)` before storing as u16.
 ///
@@ -243,7 +243,29 @@ pub struct Spectrogram {
     /// ESP32's small PSRAM cache. Column-major keeps the working
     /// set of one time slice (`n_freq × 4 ≈ 4 KB`) in cache for
     /// the duration of all `(fi, lag)` cells touching it.
-    data: Vec<SpecCell>,
+    pub data: Vec<SpecCell>,
+}
+
+impl Spectrogram {
+    /// Build a `Spectrogram` from caller-provided parts. Used by the
+    /// embedded Phase-E PoC to plumb an incrementally-computed
+    /// spectrogram into the decode pipeline (bin builds the buffer
+    /// during slot capture, then constructs a `Spectrogram` to feed
+    /// `coarse_sync` directly, skipping `compute_spectrogram`).
+    /// Layout must match `compute_spectrogram`: column-major,
+    /// `data[time * n_freq + freq]`, length `n_time * n_freq`.
+    pub fn from_parts(n_freq: usize, n_time: usize, data: Vec<SpecCell>) -> Self {
+        assert_eq!(
+            data.len(),
+            n_freq * n_time,
+            "Spectrogram::from_parts: data length must be n_freq * n_time"
+        );
+        Self {
+            n_freq,
+            n_time,
+            data,
+        }
+    }
 }
 
 /// coarse_sync inner-loop accumulator. Phase 3 of the integer-pure
