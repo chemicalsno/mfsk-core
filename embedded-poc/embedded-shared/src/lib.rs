@@ -8,5 +8,6 @@ extern crate alloc;
 pub mod dual_core;
 pub mod esp_dsp_fft;
 pub mod internal_pool;
+pub mod pipeline;
 pub mod stage1_inc;
 pub mod wav_sim;
