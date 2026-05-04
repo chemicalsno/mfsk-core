@@ -34,16 +34,22 @@ pub enum ChunkMsg {
     },
 }
 
-/// Completed-slot bundle from stage1_inc to main.
-///
-/// Contains everything `decode_one_slot` needs to drive stage 2 / pass 2
-/// / stage 3. Owned by exactly one task at a time — main drops the Box
-/// when the slot's decode is done, freeing all the buffers.
-pub struct Slot {
-    pub audio: Vec<i16>,
+/// Spectrogram + per-half allsums, sent by stage1_inc as soon as the
+/// last FFT pair (pair 92) finalizes — typically ~200 ms before SlotEnd.
+/// Lets main start stage 2 (`coarse_sync_with_allsum`) during the tail
+/// of audio capture, so that by the time `Slot` arrives main only has
+/// pass 2 + stage 3 left.
+pub struct SpecBundle {
     pub spec: mfsk_core::ft8::decode_block::Spectrogram,
     pub allsum_head: Vec<f32>,
     pub allsum_tail: Vec<f32>,
+    pub wav_idx: usize,
+}
+
+/// Audio + slot metadata, sent by stage1_inc at SlotEnd. Pairs with the
+/// `SpecBundle` for the same `wav_idx` to drive pass 2 / stage 3.
+pub struct Slot {
+    pub audio: Vec<i16>,
     pub wav_idx: usize,
     pub inc_total_us: i64,
 }
@@ -56,6 +62,11 @@ pub fn create_chunk_queue(depth: u32) -> QueueHandle_t {
 /// Create a depth-N FreeRTOS queue carrying `*mut Slot` pointers.
 pub fn create_slot_queue(depth: u32) -> QueueHandle_t {
     create_ptr_queue::<Slot>(depth)
+}
+
+/// Create a depth-N FreeRTOS queue carrying `*mut SpecBundle` pointers.
+pub fn create_spec_queue(depth: u32) -> QueueHandle_t {
+    create_ptr_queue::<SpecBundle>(depth)
 }
 
 fn create_ptr_queue<T>(depth: u32) -> QueueHandle_t {

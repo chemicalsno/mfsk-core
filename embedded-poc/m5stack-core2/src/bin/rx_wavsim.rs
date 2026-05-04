@@ -53,42 +53,48 @@ fn main() {
     dual_core::init();
     let chunk_q = pipeline::create_chunk_queue(4);
     let slot_q = pipeline::create_slot_queue(2);
-    stage1_inc::spawn(chunk_q, slot_q);
+    let spec_q = pipeline::create_spec_queue(2);
+    stage1_inc::spawn(chunk_q, slot_q, spec_q);
     wav_sim::spawn(QSO_WAVS, chunk_q);
 
-    log::info!("rx-wavsim: decode loop ready; awaiting slots from stage1_inc");
+    log::info!("rx-wavsim: decode loop ready; awaiting spec/slot from stage1_inc");
     loop {
+        let spec = pipeline::recv_box::<pipeline::SpecBundle>(spec_q);
+        let t_s2_start = now_us();
+        let pass1 = dual_core::coarse_sync_split_with_allsum(
+            &spec.spec,
+            100.0,
+            3_000.0,
+            1.0,
+            PASS1_LIMIT,
+            &spec.allsum_head,
+            &spec.allsum_tail,
+        );
+        let t_s2_end = now_us();
+        drop(spec);
+
         let slot = pipeline::recv_box::<pipeline::Slot>(slot_q);
-        decode_one_slot(*slot);
+        decode_one_slot(*slot, pass1, t_s2_end - t_s2_start);
     }
 }
 
-fn decode_one_slot(slot: pipeline::Slot) {
+fn decode_one_slot(
+    slot: pipeline::Slot,
+    pass1: alloc::vec::Vec<mfsk_core::core::sync::SyncCandidate>,
+    stage2_us: i64,
+) {
     let wav_idx = slot.wav_idx;
     let inc_us = slot.inc_total_us;
+    let pass1_n = pass1.len();
+    let post_slot_t0 = now_us();
 
     log::info!(
-        "rx-wavsim: WAV[{wav_idx}] slot received (audio={} samples, n_time={}, n_freq={})",
+        "rx-wavsim: WAV[{wav_idx}] slot received (audio={} samples, pass1={pass1_n})",
         slot.audio.len(),
-        slot.spec.n_time,
-        slot.spec.n_freq,
     );
-
-    let t0 = now_us();
-    let pass1 = dual_core::coarse_sync_split_with_allsum(
-        &slot.spec,
-        100.0,
-        3_000.0,
-        1.0,
-        PASS1_LIMIT,
-        &slot.allsum_head,
-        &slot.allsum_tail,
-    );
-    let t1 = now_us();
     log::info!(
-        "  stage 2 (sync): {:>7} us  ({} cand)",
-        t1 - t0,
-        pass1.len()
+        "  stage 2 (during cap): {:>7} us  ({pass1_n} cand)",
+        stage2_us
     );
 
     let t2 = now_us();
@@ -98,7 +104,7 @@ fn decode_one_slot(slot: pipeline::Slot) {
     };
     let t3 = now_us();
     log::info!(
-        "  pass 2:         {:>7} us  → top {}",
+        "  pass 2:               {:>7} us  → top {}",
         t3 - t2,
         pass2.len()
     );
@@ -111,14 +117,14 @@ fn decode_one_slot(slot: pipeline::Slot) {
     };
     let t5 = now_us();
     log::info!(
-        "  stage 3:        {:>7} us  ({} result(s))",
+        "  stage 3:              {:>7} us  ({} result(s))",
         t5 - t4,
         results.len()
     );
     log::info!(
-        "  ─── slot total: {:>7} us = {:.3} s",
-        t5 - t0,
-        (t5 - t0) as f64 / 1e6
+        "  ─── post-SlotEnd:     {:>7} us = {:.3} s",
+        t5 - post_slot_t0,
+        (t5 - post_slot_t0) as f64 / 1e6
     );
     log::info!(
         "  Phase-E: stage1_inc {} us in advance ({}% of capture)",

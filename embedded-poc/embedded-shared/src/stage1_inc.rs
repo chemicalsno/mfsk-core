@@ -23,7 +23,7 @@ use esp_idf_svc::sys::{
 use mfsk_core::core::fft::{Fft16, FftPlanner16};
 use num_complex::Complex;
 
-use crate::pipeline::{recv_box, send_box, ChunkMsg, Slot};
+use crate::pipeline::{recv_box, send_box, ChunkMsg, Slot, SpecBundle};
 
 const PD_PASS: i32 = 1;
 
@@ -67,6 +67,7 @@ fn band_for(freq_min: f32, freq_max: f32, spec_n_freq: usize) -> (usize, usize) 
 struct WorkerCtx {
     chunk_q: QueueHandle_t,
     slot_q: QueueHandle_t,
+    spec_q: QueueHandle_t,
     n_freq: usize,
     head_ia: usize,
     head_n_freq: usize,
@@ -87,9 +88,15 @@ struct WorkerCtx {
 struct SlotInProgress {
     audio: Vec<i16>,
     audio_fill: usize,
+    /// Spec/allsum buffers — moved out into a `SpecBundle` and sent
+    /// downstream as soon as the last pair finalizes (typically ~200 ms
+    /// before SlotEnd). After `spec_sent` becomes true these are taken
+    /// (`mem::take`'d) and `next_pair == N_PAIRS` so they're not touched
+    /// by subsequent advance_pairs calls.
     spec: Vec<u16>,
     allsum_head: Vec<f32>,
     allsum_tail: Vec<f32>,
+    spec_sent: bool,
     next_pair: usize,
     shift: u32,
     shift_locked: bool,
@@ -105,6 +112,7 @@ impl SlotInProgress {
             spec: vec![0u16; n_freq * N_TIME],
             allsum_head: vec![0f32; head_n_freq * N_TIME],
             allsum_tail: vec![0f32; tail_n_freq * N_TIME],
+            spec_sent: false,
             next_pair: 0,
             shift: 0,
             shift_locked: false,
@@ -115,9 +123,12 @@ impl SlotInProgress {
 }
 
 /// Spawn the stage1_inc worker task. The task receives `ChunkMsg` from
-/// `chunk_q`, builds slot data incrementally, and pushes completed
-/// `Slot`s to `slot_q`.
-pub fn spawn(chunk_q: QueueHandle_t, slot_q: QueueHandle_t) {
+/// `chunk_q`, builds spec / allsum / audio incrementally, and emits
+///   - `SpecBundle` on `spec_q` as soon as the last FFT pair finalizes
+///     (≈ 200 ms before SlotEnd) so main can start stage 2 during the
+///     tail of capture
+///   - `Slot` on `slot_q` at SlotEnd so main can run pass 2 / stage 3
+pub fn spawn(chunk_q: QueueHandle_t, slot_q: QueueHandle_t, spec_q: QueueHandle_t) {
     let n_freq = n_freq_for(3_000.0);
     let (head_ia, head_n_freq) = band_for(ALLSUM_FREQ_MIN, ALLSUM_FREQ_MID, n_freq);
     let (tail_ia, tail_n_freq) = band_for(ALLSUM_FREQ_MID, ALLSUM_FREQ_MAX, n_freq);
@@ -136,6 +147,7 @@ pub fn spawn(chunk_q: QueueHandle_t, slot_q: QueueHandle_t) {
     let ctx = Box::new(WorkerCtx {
         chunk_q,
         slot_q,
+        spec_q,
         n_freq,
         head_ia,
         head_n_freq,
@@ -240,8 +252,34 @@ fn advance_pairs(ctx: &mut WorkerCtx) {
         ctx.cur.next_pair = j + 1;
     }
 
+    // If the last pair just landed and we haven't sent SpecBundle yet,
+    // fire it now — main can run stage 2 in parallel with the tail of
+    // capture (audio chunks 148–150 still arriving).
+    if ctx.cur.next_pair == N_PAIRS && !ctx.cur.spec_sent {
+        emit_spec_bundle(ctx);
+    }
+
     let t1 = unsafe { esp_timer_get_time() };
     ctx.cur.inc_total_us += t1 - t0;
+}
+
+fn emit_spec_bundle(ctx: &mut WorkerCtx) {
+    let n_freq = ctx.n_freq;
+    let head_n = ctx.head_n_freq;
+    let tail_n = ctx.tail_n_freq;
+    let spec = core::mem::replace(&mut ctx.cur.spec, vec![0u16; n_freq * N_TIME]);
+    let head = core::mem::replace(&mut ctx.cur.allsum_head, vec![0f32; head_n * N_TIME]);
+    let tail = core::mem::replace(&mut ctx.cur.allsum_tail, vec![0f32; tail_n * N_TIME]);
+    let bundle = Box::new(SpecBundle {
+        spec: mfsk_core::ft8::decode_block::Spectrogram::from_parts(n_freq, N_TIME, spec),
+        allsum_head: head,
+        allsum_tail: tail,
+        // wav_idx is only known at SlotEnd; main matches SpecBundle to
+        // Slot by FIFO order of receipt, so this is informational only.
+        wav_idx: usize::MAX,
+    });
+    send_box(ctx.spec_q, bundle);
+    ctx.cur.spec_sent = true;
 }
 
 fn compute_pair_into(ctx: &mut WorkerCtx, j_a: usize, j_b: usize) {
@@ -355,33 +393,27 @@ fn update_one_half(
 fn finalize_slot(ctx: &mut WorkerCtx, wav_idx: usize, total_samples: usize) {
     // Drain any remaining pairs that the audio supports.
     advance_pairs(ctx);
-    let cur = &ctx.cur;
-    let pairs_done = cur.next_pair;
-    if pairs_done < N_PAIRS {
+    if !ctx.cur.spec_sent {
+        // Pair 92 didn't complete during capture (under-fed slot).
+        // Send what we have so main doesn't deadlock waiting for spec.
         log::warn!(
-            "stage1_inc: slot {wav_idx} ended with {pairs_done}/{N_PAIRS} pairs (audio_fill={}, expected ≥{})",
-            cur.audio_fill,
-            N_PAIRS * 2 * NSTEP
+            "stage1_inc: slot {wav_idx} pair_done={}/{N_PAIRS}, sending partial SpecBundle",
+            ctx.cur.next_pair
         );
+        emit_spec_bundle(ctx);
     }
-    if cur.audio_fill != total_samples {
+    if ctx.cur.audio_fill != total_samples {
         log::warn!(
             "stage1_inc: slot {wav_idx} audio_fill={} != reported total {total_samples}",
-            cur.audio_fill
+            ctx.cur.audio_fill
         );
     }
 
-    // Move the completed slot out and replace `cur` with a fresh one.
     let fresh = SlotInProgress::new(ctx.n_freq, ctx.head_n_freq, ctx.tail_n_freq);
     let done = core::mem::replace(&mut ctx.cur, fresh);
 
     let slot = Box::new(Slot {
         audio: done.audio,
-        spec: mfsk_core::ft8::decode_block::Spectrogram::from_parts(
-            ctx.n_freq, N_TIME, done.spec,
-        ),
-        allsum_head: done.allsum_head,
-        allsum_tail: done.allsum_tail,
         wav_idx,
         inc_total_us: done.inc_total_us,
     });
