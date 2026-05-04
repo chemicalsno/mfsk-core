@@ -7,7 +7,7 @@
 //! subtracts it in place so weaker signals become decodable.
 
 use super::{decode::DecodeResult, wave_gen::message_to_tones};
-use crate::core::dsp::subtract::{GfskParams, SubtractCfg, subtract_tones};
+use crate::core::dsp::subtract::{GfskParams, SubtractCfg, subtract_tones, subtract_tones_lpf};
 
 /// FT8 subtract configuration: 12 kHz sample rate, 6.25 Hz tone spacing,
 /// 1920 samples/symbol, frame origin at 0.5 s, GFSK pulse shaping
@@ -42,6 +42,18 @@ pub fn subtract_signal(audio: &mut [i16], result: &DecodeResult) {
 pub fn subtract_signal_weighted(audio: &mut [i16], result: &DecodeResult, gain: f32) {
     let tones = message_to_tones(&result.message77);
     subtract_tones(audio, &tones, result.freq_hz, result.dt_sec, gain, &FT8_CFG);
+}
+
+/// WSJT-X-style channel-aware subtract for FT8. Wraps
+/// [`crate::core::dsp::subtract::subtract_tones_lpf`] with the FT8 cfg
+/// and `lpf_half = 2000` matching WSJT-X NFILT=4000.
+///
+/// Use this on real-WAV decodes after [`refine_signal_freq`] to get
+/// near-clean signal removal. Falls back to a no-op when audio is
+/// shorter than the FT8 frame.
+pub fn subtract_signal_lpf(audio: &mut [i16], result: &DecodeResult) {
+    let tones = message_to_tones(&result.message77);
+    subtract_tones_lpf(audio, &tones, result.freq_hz, result.dt_sec, &FT8_CFG, 2000);
 }
 
 /// Refine `result.freq_hz` by grid-searching ±2.5 Hz at 0.1 Hz resolution

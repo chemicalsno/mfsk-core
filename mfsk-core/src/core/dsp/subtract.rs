@@ -166,6 +166,137 @@ pub fn refine_freq(
     best_freq
 }
 
+/// WSJT-X-style channel-aware subtract.
+///
+/// Estimates a **time-varying** complex amplitude `cfilt(t) = LPF[audio(t) *
+/// conjg(cref(t))]` instead of a single global LS amplitude, then
+/// subtracts `2 * Re[cfilt * cref]` sample-by-sample. The LPF tracks
+/// channel fading (QSB) and slow phase drift that defeat the
+/// constant-amplitude path in [`subtract_tones`].
+///
+/// Mirrors `WSJT-X/lib/ft8/subtractft8.f90`. The LPF kernel is a
+/// cosine² window of length `2 * lpf_half + 1`. WSJT-X uses
+/// `lpf_half = 2000` (NFILT=4000, ~0.33 s at 12 kHz).
+///
+/// # Cost
+///
+/// Direct convolution: `lpf_half * NFRAME` MACs per call (~608 M for
+/// FT8). On host f32 this is ~0.5–1 s; embedded paths should switch
+/// to an FFT-convolution version. Acceptable as a one-shot per
+/// successfully-decoded message in `decode_frame_subtract`.
+///
+/// # Requirements
+///
+/// `cfg.gfsk` must be `Some` — abrupt-transition references won't
+/// match real WSJT signals. The subtract reference is built via
+/// [`crate::core::dsp::gfsk::synth_complex_f32_into`].
+pub fn subtract_tones_lpf(
+    audio: &mut [i16],
+    tones: &[u8],
+    freq_hz: f32,
+    dt_sec: f32,
+    cfg: &SubtractCfg,
+    lpf_half: usize,
+) {
+    let g = match cfg.gfsk {
+        Some(g) => g,
+        None => return, // LPF subtract is only meaningful with GFSK reference
+    };
+
+    let nframe = tones.len() * cfg.samples_per_symbol;
+    let mut cref_re = vec![0.0f32; nframe];
+    let mut cref_im = vec![0.0f32; nframe];
+    let gfsk_cfg = crate::core::dsp::gfsk::GfskCfg {
+        sample_rate: cfg.sample_rate,
+        samples_per_symbol: cfg.samples_per_symbol,
+        bt: g.bt,
+        hmod: g.hmod,
+        ramp_samples: g.ramp_samples,
+    };
+    crate::core::dsp::gfsk::synth_complex_f32_into(
+        &mut cref_re,
+        &mut cref_im,
+        tones,
+        freq_hz,
+        1.0,
+        &gfsk_cfg,
+    );
+
+    let signed_start = ((cfg.base_offset_s + dt_sec) * cfg.sample_rate).round() as i64;
+    let (audio_off, ref_off) = if signed_start < 0 {
+        (0usize, (-signed_start) as usize)
+    } else {
+        (signed_start as usize, 0usize)
+    };
+    if ref_off >= nframe {
+        return;
+    }
+    let len = (nframe - ref_off).min(audio.len().saturating_sub(audio_off));
+    if len == 0 {
+        return;
+    }
+
+    // camp(t) = audio(t) * conjg(cref(t)) = audio*(cref_re - j*cref_im)
+    let mut camp_re = vec![0.0f32; len];
+    let mut camp_im = vec![0.0f32; len];
+    for i in 0..len {
+        let rx = audio[audio_off + i] as f32;
+        camp_re[i] = rx * cref_re[ref_off + i];
+        camp_im[i] = -rx * cref_im[ref_off + i];
+    }
+
+    // Cosine² LPF kernel of length 2*lpf_half + 1, normalized so sum = 1.
+    let nk = 2 * lpf_half + 1;
+    let mut kern = vec![0.0f32; nk];
+    let mut sumw = 0.0f32;
+    for j in 0..nk {
+        let x = (j as f32 - lpf_half as f32) * PI / lpf_half as f32;
+        let w = x.cos().powi(2);
+        kern[j] = w;
+        sumw += w;
+    }
+    for w in kern.iter_mut() {
+        *w /= sumw;
+    }
+
+    // Direct convolution: cfilt[i] = sum_k kern[k] * camp[i + k - lpf_half],
+    // clamping out-of-range indices to nearest edge (effectively reflecting
+    // the truncated filter response — WSJT-X uses an explicit
+    // `endcorrection` factor for the same effect).
+    let mut cfilt_re = vec![0.0f32; len];
+    let mut cfilt_im = vec![0.0f32; len];
+    for i in 0..len {
+        let (mut sr, mut si, mut sw) = (0.0f32, 0.0f32, 0.0f32);
+        let lo = (i as i64 - lpf_half as i64).max(0) as usize;
+        let hi = (i + lpf_half + 1).min(len);
+        for j in lo..hi {
+            let k = j as i64 - i as i64 + lpf_half as i64;
+            if k < 0 || k as usize >= nk {
+                continue;
+            }
+            let w = kern[k as usize];
+            sr += w * camp_re[j];
+            si += w * camp_im[j];
+            sw += w;
+        }
+        // End correction: renormalize for the truncated filter window.
+        if sw > f32::EPSILON {
+            cfilt_re[i] = sr / sw;
+            cfilt_im[i] = si / sw;
+        }
+    }
+
+    // Subtract: audio[i] -= 2 * Re[cfilt(t) * cref(t)]
+    //         = 2 * (cfilt_re * cref_re - cfilt_im * cref_im)
+    for i in 0..len {
+        let cr = cref_re[ref_off + i];
+        let ci = cref_im[ref_off + i];
+        let sub = 2.0 * (cfilt_re[i] * cr - cfilt_im[i] * ci);
+        let v = audio[audio_off + i] as f32 - sub;
+        audio[audio_off + i] = v.clamp(-32_768.0, 32_767.0) as i16;
+    }
+}
+
 /// Subtract a tone sequence from `audio` in place, with a fractional gain.
 ///
 /// `gain = 1.0` performs full least-squares subtraction. `gain < 1.0` is
