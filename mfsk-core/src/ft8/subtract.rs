@@ -44,6 +44,34 @@ pub fn subtract_signal_weighted(audio: &mut [i16], result: &DecodeResult, gain: 
     subtract_tones(audio, &tones, result.freq_hz, result.dt_sec, gain, &FT8_CFG);
 }
 
+/// Refine `result.freq_hz` by grid-searching ±2.5 Hz at 0.1 Hz resolution
+/// for the carrier that maximises the LS amplitude of the GFSK reference
+/// against `audio`. Returns the refined frequency.
+///
+/// Use this before [`subtract_signal`] / [`subtract_signal_weighted`]
+/// when the input is a real-WAV decode (not a self-synthesised signal).
+/// mfsk-core's coarse_sync reports carriers on a 2.93 Hz bin grid; real
+/// signals routinely sit ±0.5..3 Hz off-bin and the resulting phase
+/// drift over the 12.7 s frame defeats the constant-amplitude LS in
+/// `subtract_tones`. Empirical: refines CQ F5RXL on qso3_busy from
+/// 1198 → 1196.8 Hz, |amp| jumps 3.6 → 16.2 (~4.5×).
+///
+/// Cost: ~50 GFSK reference builds × ~150 k samples each. On host f32
+/// this is a few ms per signal — call once per decoded result rather
+/// than per pass-2 candidate.
+pub fn refine_signal_freq(audio: &[i16], result: &DecodeResult) -> f32 {
+    let tones = message_to_tones(&result.message77);
+    crate::core::dsp::subtract::refine_freq(
+        audio,
+        &tones,
+        result.freq_hz,
+        result.dt_sec,
+        &FT8_CFG,
+        2.5,
+        0.1,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::decode::{DecodeDepth, DecodeStrictness};

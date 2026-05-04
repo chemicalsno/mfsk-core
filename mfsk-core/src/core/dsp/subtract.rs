@@ -90,6 +90,82 @@ fn generate_iq(tones: &[u8], freq_hz: f32, cfg: &SubtractCfg) -> (Vec<f32>, Vec<
     (w_cos, w_sin)
 }
 
+/// LS amplitude magnitude for a candidate `(freq_hz, dt_sec)`. Returns
+/// `sqrt(a² + b²)` where `(a, b)` are the cos/sin LS projections of
+/// `audio` onto the GFSK reference at `freq_hz`. Higher = closer match.
+fn ls_amp_mag(audio: &[i16], tones: &[u8], freq_hz: f32, dt_sec: f32, cfg: &SubtractCfg) -> f32 {
+    let (w_cos, w_sin) = generate_iq(tones, freq_hz, cfg);
+    let signed_start = ((cfg.base_offset_s + dt_sec) * cfg.sample_rate).round() as i64;
+    let (audio_off, ref_off) = if signed_start < 0 {
+        (0usize, (-signed_start) as usize)
+    } else {
+        (signed_start as usize, 0usize)
+    };
+    if ref_off >= w_cos.len() {
+        return 0.0;
+    }
+    let len = (w_cos.len() - ref_off).min(audio.len().saturating_sub(audio_off));
+    if len == 0 {
+        return 0.0;
+    }
+    let (mut na, mut nb, mut da, mut db) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+    for i in 0..len {
+        let rx = audio[audio_off + i] as f64;
+        let c = w_cos[ref_off + i] as f64;
+        let s = w_sin[ref_off + i] as f64;
+        na += rx * c;
+        nb += rx * s;
+        da += c * c;
+        db += s * s;
+    }
+    let a = if da > 0.0 { na / da } else { 0.0 };
+    let b = if db > 0.0 { nb / db } else { 0.0 };
+    ((a * a + b * b) as f32).sqrt()
+}
+
+/// Refine the carrier frequency around `freq_hz_init` by grid search,
+/// returning the freq that maximises the LS amplitude magnitude of the
+/// GFSK reference vs `audio`.
+///
+/// This compensates for mfsk-core's bin-resolution coarse_sync output:
+/// at NFFT_SPEC=4096 / 12 kHz the carrier is reported on a 2.93 Hz grid,
+/// but real signals routinely sit ±0.5..3 Hz off-bin. Over a 12.7 s FT8
+/// frame even 1 Hz of error accumulates ~25π rad of phase rotation,
+/// enough to wipe out a constant-amplitude LS projection — so subtract
+/// can't actually remove the signal until the freq is refined.
+///
+/// `radius_hz` is the half-window (recommend 2.5 Hz to cover one bin
+/// either side); `step_hz` is the grid resolution (0.1 Hz works on
+/// host f32, embedded paths may use coarser steps for speed).
+///
+/// Mirrors WSJT-X's `ft8b.f90` `sync8d` + `ctwk` step (32-element
+/// twiddle table over ±2.5 Hz).
+pub fn refine_freq(
+    audio: &[i16],
+    tones: &[u8],
+    freq_hz_init: f32,
+    dt_sec: f32,
+    cfg: &SubtractCfg,
+    radius_hz: f32,
+    step_hz: f32,
+) -> f32 {
+    debug_assert!(cfg.gfsk.is_some(), "refine_freq requires GFSK shaping");
+    let mut best_freq = freq_hz_init;
+    let mut best_amp = ls_amp_mag(audio, tones, freq_hz_init, dt_sec, cfg);
+    let mut df = -radius_hz;
+    while df <= radius_hz {
+        if df.abs() > f32::EPSILON {
+            let a = ls_amp_mag(audio, tones, freq_hz_init + df, dt_sec, cfg);
+            if a > best_amp {
+                best_amp = a;
+                best_freq = freq_hz_init + df;
+            }
+        }
+        df += step_hz;
+    }
+    best_freq
+}
+
 /// Subtract a tone sequence from `audio` in place, with a fractional gain.
 ///
 /// `gain = 1.0` performs full least-squares subtraction. `gain < 1.0` is
