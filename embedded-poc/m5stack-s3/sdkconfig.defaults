@@ -21,6 +21,14 @@ CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
 CONFIG_FREERTOS_IDLE_TASK_STACKSIZE=4096
 CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=4096
 
+# ── FreeRTOS task notification slots ─────────────────────────────────
+# Default 1 slot causes cross-talk: `wav_sim` notifies main on slot 0
+# (WAV-complete), and `dual_core` worker also notifies main on slot 0
+# (dispatch-done). Main's `ulTaskGenericNotifyTake` then races between
+# them, breaking Phase E2 dispatch with empty result Vecs. Bump to 2
+# so dual_core can use slot 1 for its handshake.
+CONFIG_FREERTOS_TASK_NOTIFICATION_ARRAY_ENTRIES=2
+
 # ── Disable unused subsystems to free internal SRAM ──────────────────
 # decode_block wants the audio slot (360 KB) in internal SRAM for
 # speed (Octal PSRAM ~80 MB/s vs internal SRAM ~hundreds MB/s).

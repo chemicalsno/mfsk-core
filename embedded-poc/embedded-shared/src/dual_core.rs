@@ -128,6 +128,9 @@ static mut MAIN_TASK: TaskHandle_t = ptr::null_mut();
 extern "C" fn worker_main(_arg: *mut core::ffi::c_void) {
     log::info!("dsp_worker: started on core {}", current_core());
     loop {
+        // Main → worker uses slot 0 (worker has no other senders).
+        // Worker → main uses slot 1 to avoid colliding with `wav_sim`'s
+        // WAV-complete notifies into main's slot 0.
         unsafe {
             let _ = ulTaskGenericNotifyTake(0, PD_TRUE, u32::MAX);
         }
@@ -203,10 +206,16 @@ extern "C" fn worker_main(_arg: *mut core::ffi::c_void) {
                 log::warn!("dsp_worker: woke with empty slot");
             }
         }
+        // Notify main on slot 1 — slot 0 is owned by `wav_sim` for
+        // WAV-complete notifications. Sharing it would let main's
+        // dispatch-wait wake on a stray wav_sim notify and read a
+        // half-written `worker_out`. Requires
+        // `CONFIG_FREERTOS_TASK_NOTIFICATION_ARRAY_ENTRIES >= 2` in
+        // the binary crate's sdkconfig.
         unsafe {
             xTaskGenericNotify(
                 MAIN_TASK,
-                0,
+                1,
                 0,
                 eNotifyAction_eIncrement,
                 core::ptr::null_mut(),
@@ -321,7 +330,7 @@ pub fn coarse_sync_split_with_allsum(
         coarse_sync_with_allsum(spec, freq_min, mid, sync_min, max_cand, allsum_head);
 
     unsafe {
-        let _ = ulTaskGenericNotifyTake(0, PD_TRUE, u32::MAX);
+        let _ = ulTaskGenericNotifyTake(1, PD_TRUE, u32::MAX);
     }
 
     let worker = worker_out.expect("worker did not write result");
@@ -371,7 +380,7 @@ pub fn pass2_split(
     let mut local = refine_candidates_into(audio, head, max_cand, basis_re_main, basis_im_main);
 
     unsafe {
-        let _ = ulTaskGenericNotifyTake(0, PD_TRUE, u32::MAX);
+        let _ = ulTaskGenericNotifyTake(1, PD_TRUE, u32::MAX);
     }
 
     let worker = worker_out.expect("worker did not write result");
@@ -425,7 +434,7 @@ pub fn stage3_split(
     };
 
     unsafe {
-        let _ = ulTaskGenericNotifyTake(0, PD_TRUE, u32::MAX);
+        let _ = ulTaskGenericNotifyTake(1, PD_TRUE, u32::MAX);
     }
 
     let worker = worker_out.expect("worker did not write result");
