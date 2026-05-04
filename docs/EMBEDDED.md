@@ -525,15 +525,45 @@ budget; see "Streaming RX pipeline architecture" below).
 
 `q_thresh = 12` (production default, full recall).
 
+`qso3_busy.wav` is the **WSJT-X formally-distributed FT8 reference
+recording** (`samples/FT8/210703_133430.wav`, busy 7-station slot;
+verified bit-identical via `cmp` 2026-05-04). `qso1` / `qso2` are
+informational on-air captures — useful as breadth but not formal
+reference.
+
 | WAV | results | Core2 LX6 post-SlotEnd | S3 LX7 post-SlotEnd |
 |---|---|---:|---:|
-| qso1 (mid-band, 3 stations)        | 3/3 ✓ | **1.303 s** | **0.574 s** |
-| qso2 (mid-band, 5 stations)        | 5/5 ✓ | **0.632 s** | **0.370 s** |
-| qso3 (busy band, 7 stations)       | 7/7 ✓ | **1.434 s** | **0.707 s** |
+| qso1 (mid-band, 3 stations)            | 3/3 ✓ | **1.303 s** | **0.574 s** |
+| qso2 (mid-band, 5 stations)            | 5/5 ✓ | **0.632 s** | **0.370 s** |
+| **qso3 busy band (WSJT-X reference)**  | 7/7 ✓ | **1.434 s** | **0.707 s** |
 
-Recall: 15/15 ground-truth callsigns on both chips, including weak
-signals down to -18.2 dB (`N1PJT`), -17.9 / -18.0 dB (`OH3NIV`,
-`LZ1JZ`). Phantom-free.
+Recall on the embedded budget (PASS1=30, max_cand=15, BpAll, q=12,
+no OSD): 15/15 callsigns recovered including weak signals down to
+-18.2 dB (`N1PJT`), -17.9 / -18.0 dB (`OH3NIV`, `LZ1JZ`).
+Phantom-free.
+
+### vs host wide-band on the WSJT-X reference
+
+A side-by-side run of `decode_frame` (host wide-band: rustfft,
+`BpAllOsd`, max_cand=200, OSD-3 fallback) vs `decode_block`
+(embedded equivalent: integer pipeline, max_cand=15, q=12) on the
+same `qso3_busy.wav` (test:
+`mfsk-core/tests/ft8_reference_suite_recall.rs`):
+
+| run | callsigns / 13 truth | wall-clock | hardware |
+|---|---:|---:|---|
+| host wide-band (`decode_frame BpAllOsd 200`) | **13 / 13** | 140 ms | Ryzen desktop |
+| host fixed-point (= embedded, `decode_block` 15) | 7 / 13 | 6 ms | Ryzen desktop |
+| **M5StickS3 LX7** (`decode_block`, real silicon)  | 7 / 13 | **707 ms** | post-SlotEnd, 240 MHz dual-core |
+| **M5Stack Core2 LX6** (`decode_block`, real silicon) | 7 / 13 | **1434 ms** | post-SlotEnd, 240 MHz dual-core |
+
+The 6 callsigns the embedded path misses on the busy band require the
+wider PASS1=200 search + OSD-3 fallback that host wide-band runs and
+the embedded budget skips. The wall-clock gap between host fixed-point
+(6 ms) and embedded silicon (707 ms / 1434 ms) is the bare CPU ratio
+(Ryzen ~5 GHz × 16 cores vs Xtensa 240 MHz × 2 cores) — no
+algorithmic / pipeline overhead, since both run the identical integer
+pipeline.
 
 Per-stage breakdown (qso3 busy band):
 
