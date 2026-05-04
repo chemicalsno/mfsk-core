@@ -26,9 +26,6 @@ use mfsk_core::msg::wsjt77::unpack77;
 
 use crate::{dual_core, esp_dsp_fft, pipeline, stage1_inc, wav_sim};
 
-const PASS1_LIMIT: usize = 30;
-const MAX_CAND: usize = 15;
-
 /// Per-core BASIS scratch (main side). 60 KB × 2, internal DRAM.
 static mut BASIS_RE: [i16; BASIS_SCRATCH_LEN] = [0; BASIS_SCRATCH_LEN];
 static mut BASIS_IM: [i16; BASIS_SCRATCH_LEN] = [0; BASIS_SCRATCH_LEN];
@@ -39,14 +36,21 @@ fn now_us() -> i64 {
 
 /// Run the rx_wavsim bench.
 ///
-/// `wavs` is the playlist (≥ 1 baked WAV; cycled indefinitely).
-/// `q_thresh` is the stage-3 `sync_quality` early-reject threshold —
-/// pass [`mfsk_core::ft8::decode_block::DEFAULT_Q_THRESH`] (12) for
-/// full recall (production). Higher values (14) drop borderline-weak
-/// BP staircase work but cost weak decodes on qso3-class slots; the
-/// trade-off was A/B-tested on Core2 / S3 and is documented in
-/// `docs/EMBEDDED.md`.
-pub fn run(wavs: &'static [&'static [u8]], q_thresh: u32) -> ! {
+/// * `wavs` — playlist (≥ 1 baked WAV; cycled indefinitely).
+/// * `pass1_limit` — coarse_sync candidate cap (typical 30 for ship
+///   recall floor; raise to 100 to recover one extra borderline weak
+///   signal at ~1.7× post-SlotEnd time on LX7).
+/// * `max_cand` — pass 2 / stage 3 candidate cap (typical 15; raise
+///   to 30 alongside `pass1_limit=100`).
+/// * `q_thresh` — stage-3 `sync_quality` early-reject threshold; pass
+///   [`mfsk_core::ft8::decode_block::DEFAULT_Q_THRESH`] (= 12) for
+///   full recall.
+pub fn run(
+    wavs: &'static [&'static [u8]],
+    pass1_limit: usize,
+    max_cand: usize,
+    q_thresh: u32,
+) -> ! {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
     log::info!("rx-wavsim starting (mfsk-core {})", mfsk_core::VERSION);
@@ -81,7 +85,7 @@ pub fn run(wavs: &'static [&'static [u8]], q_thresh: u32) -> ! {
             100.0,
             3_000.0,
             1.0,
-            PASS1_LIMIT,
+            pass1_limit,
             &spec.allsum_head,
             &spec.allsum_tail,
         );
@@ -89,7 +93,13 @@ pub fn run(wavs: &'static [&'static [u8]], q_thresh: u32) -> ! {
         drop(spec);
 
         let slot = pipeline::recv_box::<pipeline::Slot>(slot_q);
-        decode_one_slot(*slot, pass1, t_s2_end - t_s2_start, q_thresh);
+        decode_one_slot(
+            *slot,
+            pass1,
+            t_s2_end - t_s2_start,
+            max_cand,
+            q_thresh,
+        );
     }
 }
 
@@ -97,6 +107,7 @@ fn decode_one_slot(
     slot: pipeline::Slot,
     pass1: Vec<SyncCandidate>,
     stage2_us: i64,
+    max_cand: usize,
     q_thresh: u32,
 ) {
     let wav_idx = slot.wav_idx;
@@ -116,7 +127,7 @@ fn decode_one_slot(
     let t2 = now_us();
     #[allow(static_mut_refs)]
     let pass2 = unsafe {
-        dual_core::pass2_split(&slot.audio, pass1, MAX_CAND, &mut BASIS_RE, &mut BASIS_IM)
+        dual_core::pass2_split(&slot.audio, pass1, max_cand, &mut BASIS_RE, &mut BASIS_IM)
     };
     let t3 = now_us();
     log::info!(

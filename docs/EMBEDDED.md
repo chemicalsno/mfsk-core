@@ -565,6 +565,42 @@ the embedded budget skips. The wall-clock gap between host fixed-point
 algorithmic / pipeline overhead, since both run the identical integer
 pipeline.
 
+#### Why we don't widen PASS1 / enable OSD on the embedded path
+
+Tested against the WSJT-X reference busy band on real S3 LX7 silicon
+(`logs/s3_pass100_max30_2026-05-04.log`):
+
+| config | qso3 post-SlotEnd | qso3 recall | total recall |
+|---|---:|---:|---:|
+| Bp/30/15 (ship)  | **0.71 s** | 7/13 | 14/22 (or 15 with phantom) |
+| Bp/100/30        | **1.59 s** | 7/13 (unchanged) | +1 (qso1 OH3NIV only) |
+| BpAllOsd/200/100 (host estimate) | ~7 s | 7/13 (+1 on qso3 N1JFU) | 16/22 |
+
+Two non-obvious findings drove the decision to stay at `PASS1=30 /
+max_cand=15`:
+
+1. **qso3 busy band recall is bounded by coarse_sync rank, not BP /
+   OSD effort.** Widening PASS1 from 30 → 100 + max_cand 15 → 30
+   recovers no qso3 calls — the 6 missed signals are below
+   coarse_sync rank 100 entirely. They need iterative subtraction
+   (the WSJT-X wide-band path's hallmark) which `decode_block`
+   doesn't implement.
+2. **The FT8 QSO turnaround budget is ~2 s post-SlotEnd**, not the
+   full 15 s slot. After decode the UI has to draw the waterfall,
+   update the callsign list, render RPRT, prep next-slot TX, and —
+   on chips without an NTP-synced or GPS-disciplined RTC — re-estimate
+   slot timing from the mean of decoded signals' `dt_sec` (the
+   ESP32's internal RTC drift is large enough that frame alignment
+   has to be slaved to the decoder output). Bp/100/30 on qso3 leaves
+   only ~0.4 s for all of that before the next TX must start — too
+   tight. The +1 qso1-only recall gain isn't worth the headroom loss.
+
+So the embedded `decode_block` ships at the recall floor that fits
+the 2 s budget cleanly. Pushing further requires either (a)
+porting iterative subtraction to the embedded path (open question
+on cost) or (b) accepting late-arrival "spotter mode" decodes that
+land too late for QSO turnaround.
+
 Per-stage breakdown (qso3 busy band):
 
 | stage | Core2 LX6 | S3 LX7 | notes |

@@ -125,18 +125,27 @@ fn ft8_reference_host_vs_embedded() {
     );
     println!();
 
-    let bar = "─".repeat(108);
+    let bar = "─".repeat(140);
     println!(
-        "  {:<48}  {:>5}  {:>5}/{:<3}  {:>6}  {:>6}/{:<3}  {:>6}  {:>6}",
-        "WAV", "truth", "host", "rec", "host_ms", "embed", "rec", "core2_ms", "s3_ms"
+        "  {:<48} {:>4} {:>4}  {:<8}  {:<8}  {:<8}  {:<8}  {:<8}  {:<8}",
+        "WAV",
+        "tru",
+        "host",
+        "Bp/30/15",
+        "Bp/30/30",
+        "Bp/50/30",
+        "Bp100/30",
+        "BpO30/30",
+        "BpO100/3"
     );
     println!("  {bar}");
 
     let mut sum_truth = 0usize;
-    let mut sum_host = 0usize;
-    let mut sum_embed = 0usize;
     let mut sum_host_ms = 0u128;
-    let mut sum_blk_ms = 0u128;
+    let mut sum_bp_hit = 0usize;
+    let mut sum_bp_ms = 0u128;
+    let mut sum_osd_hit = 0usize;
+    let mut sum_osd_ms = 0u128;
     let mut sum_core2 = 0u32;
     let mut sum_s3 = 0u32;
 
@@ -155,59 +164,132 @@ fn ft8_reference_host_vs_embedded() {
                 .collect();
         let host_ms = t0.elapsed().as_millis();
 
-        // Embedded equivalent: BpAll, max_cand=15, PASS1=30 (default),
-        // q_thresh=12 (default). Bit-identical to LX6/LX7 binary
-        // under `fixed-point`.
-        let t1 = Instant::now();
-        let embed: BTreeSet<String> =
-            decode_block(&slot, 100.0, 3000.0, 1.0, DecodeDepth::BpAll, 15)
+        // Sweep: configurations bounded by the FT8 real-time decode
+        // budget (≈ 2 s post-SlotEnd before slot N+1 TX must start).
+        let mut row: Vec<(String, BTreeSet<String>, u128)> = Vec::new();
+        let configs: &[(&str, usize, usize, DecodeDepth)] = &[
+            ("Bp/30/15", 30, 15, DecodeDepth::BpAll), // ship
+            ("Bp/30/30", 30, 30, DecodeDepth::BpAll),
+            ("Bp/50/30", 50, 30, DecodeDepth::BpAll),
+            ("Bp/100/30", 100, 30, DecodeDepth::BpAll),
+            ("BpO/30/30", 30, 30, DecodeDepth::BpAllOsd),
+            ("BpO/100/30", 100, 30, DecodeDepth::BpAllOsd),
+        ];
+        for &(name, p1, mc, depth) in configs {
+            unsafe { std::env::set_var("MFSK_PASS1_LIMIT", p1.to_string()) };
+            let t = Instant::now();
+            let r: BTreeSet<String> = decode_block(&slot, 100.0, 3000.0, 1.0, depth, mc)
                 .iter()
                 .filter_map(|x| unpack77(&x.message77))
                 .collect();
-        let blk_ms = t1.elapsed().as_millis();
+            let ms = t.elapsed().as_millis();
+            row.push((name.to_string(), r, ms));
+        }
+        unsafe { std::env::remove_var("MFSK_PASS1_LIMIT") };
+        let bp = row[0].1.clone();
+        let bp_ms = row[0].2;
+        let osd = row[3].1.clone();
+        let osd_ms = row[3].2;
 
-        let host_n = truth.len();
-        let embed_n = embed.len();
-        let embed_hit = embed.intersection(&truth).count();
-        // Host always equals truth (it produced it), so host_recall = 100 %.
+        let n_truth = truth.len();
+        let bp_hit = bp.intersection(&truth).count();
+        let osd_hit = osd.intersection(&truth).count();
 
         let core2_ms = hw.map(|h| h.core2_post_slotend_ms).unwrap_or(0);
         let s3_ms = hw.map(|h| h.s3_post_slotend_ms).unwrap_or(0);
 
+        let cells: Vec<String> = row
+            .iter()
+            .map(|(_, r, ms)| {
+                let hit = r.intersection(&truth).count();
+                format!("{hit:>2}/{ms:<5}")
+            })
+            .collect();
         println!(
-            "  {label:<48}  {host_n:>5}  {host_n:>5}/{host_n:<3}  {host_ms:>6}  {embed_n:>6}/{embed_hit:<3}  {core2_ms:>6}  {s3_ms:>6}"
+            "  {label:<48} {n_truth:>4} {host_ms:>4}  {}",
+            cells.join("  "),
         );
 
-        sum_truth += host_n;
-        sum_host += host_n;
-        sum_embed += embed_hit;
+        sum_truth += n_truth;
         sum_host_ms += host_ms;
-        sum_blk_ms += blk_ms;
+        sum_bp_hit += bp_hit;
+        sum_bp_ms += bp_ms;
+        sum_osd_hit += osd_hit;
+        sum_osd_ms += osd_ms;
         sum_core2 += core2_ms;
         sum_s3 += s3_ms;
+        // Track all configs aggregate.
     }
 
     println!("  {bar}");
-    let recall_pct = if sum_truth > 0 {
-        100.0 * sum_embed as f64 / sum_truth as f64
-    } else {
-        0.0
-    };
     println!(
-        "  {:<48}  {sum_truth:>5}  {sum_host:>5}/{sum_truth:<3}  {sum_host_ms:>6}  {sum_embed:>6}/{sum_embed:<3}  {sum_core2:>6}  {sum_s3:>6}",
+        "  {:<48}  {sum_truth:>5}  {sum_host_ms:>6}  {sum_bp_hit:>3} / {sum_bp_ms:>5}  {sum_osd_hit:>3} / {sum_osd_ms:>8}  {sum_core2:>9}  {sum_s3:>9}",
         "TOTAL"
     );
+    let bp_pct = 100.0 * sum_bp_hit as f64 / sum_truth as f64;
+    let osd_pct = 100.0 * sum_osd_hit as f64 / sum_truth as f64;
     println!(
-        "\n  Embedded recall vs host wide-band: {sum_embed} / {sum_truth} = {recall_pct:.1} %"
-    );
-    println!("  Host wide-band total ms (host CPU):       {sum_host_ms}");
-    println!("  Host fixed-point  total ms (host CPU):    {sum_blk_ms}");
-    println!(
-        "  Core2 LX6  total ms (post-SlotEnd, real HW): {sum_core2}  (×{:.1} vs host wide-band)",
-        sum_core2 as f64 / sum_host_ms as f64
+        "\n  BpAll/15      recall: {sum_bp_hit} / {sum_truth} = {bp_pct:.1} %  (host {sum_bp_ms} ms)"
     );
     println!(
-        "  S3    LX7  total ms (post-SlotEnd, real HW): {sum_s3}  (×{:.1} vs host wide-band)",
-        sum_s3 as f64 / sum_host_ms as f64
+        "  BpAllOsd/30   recall: {sum_osd_hit} / {sum_truth} = {osd_pct:.1} %  (host {sum_osd_ms} ms)"
     );
+    let lx7_factor = sum_s3 as f64 / sum_bp_ms as f64; // ratio of LX7 wall vs host BpAll wall
+    let est_lx7_osd = sum_osd_ms as f64 * lx7_factor;
+    println!(
+        "  LX7 wall vs host BpAll: ×{:.1} (sum {sum_s3} / {sum_bp_ms} ms)",
+        lx7_factor
+    );
+    println!(
+        "  Predicted S3 LX7 BpAllOsd/30: ≈ {est_lx7_osd:.0} ms total, slot avg ≈ {:.0} ms",
+        est_lx7_osd / ENTRIES.len() as f64
+    );
+    println!(
+        "  Slot real-time budget: 15 000 ms capture window; current post-SlotEnd ≈ {:.0} ms avg.",
+        sum_s3 as f64 / ENTRIES.len() as f64
+    );
+
+    println!("\n=== Missed-callsign breakdown (truth − embedded), with SNRs from host run ===");
+    for (label, path, _hw) in ENTRIES {
+        let Some(slot) = load_wav_i16(Path::new(path)) else {
+            continue;
+        };
+        let host = decode_frame(&slot, 100.0, 3000.0, 1.0, None, DecodeDepth::BpAllOsd, 200);
+        let embed = decode_block(&slot, 100.0, 3000.0, 1.0, DecodeDepth::BpAll, 15);
+        let embed_msgs: BTreeSet<String> = embed
+            .iter()
+            .filter_map(|x| unpack77(&x.message77))
+            .collect();
+        let missed: Vec<&mfsk_core::ft8::decode::DecodeResult> = host
+            .iter()
+            .filter(|r| {
+                let Some(t) = unpack77(&r.message77) else {
+                    return false;
+                };
+                !embed_msgs.contains(&t)
+            })
+            .collect();
+        println!("\n  {label}");
+        if missed.is_empty() {
+            println!("    (none missed)");
+            continue;
+        }
+        // Sort by SNR descending so the most embarrassing miss (strongest)
+        // is at the top.
+        let mut sorted = missed.clone();
+        sorted.sort_by(|a, b| {
+            b.snr_db
+                .partial_cmp(&a.snr_db)
+                .unwrap_or(core::cmp::Ordering::Equal)
+        });
+        for r in sorted {
+            let Some(text) = unpack77(&r.message77) else {
+                continue;
+            };
+            println!(
+                "    {:>4.0} Hz  SNR={:>5.1} dB  e={:>2}  '{}'",
+                r.freq_hz, r.snr_db, r.hard_errors, text
+            );
+        }
+    }
 }

@@ -460,6 +460,32 @@ fixed-point (6 ms) と実機 (707 ms / 1434 ms) の wall-clock 差は
 であって、アルゴリズム / pipeline 上のオーバーヘッドではない —
 両方とも同一の整数 pipeline を走っている。
 
+#### embedded で PASS1 / OSD を広げない理由
+
+S3 LX7 実機検証 (`logs/s3_pass100_max30_2026-05-04.log`):
+
+| 設定 | qso3 post-SlotEnd | qso3 recall | total recall |
+|---|---:|---:|---:|
+| Bp/30/15 (ship) | **0.71 s** | 7/13 | 15/22 |
+| Bp/100/30 | **1.59 s** | 7/13 (変化なし) | +1 (qso1 OH3NIV のみ) |
+| BpAllOsd/200/100 (host 推定) | ~7 s | 7/13 (+1 qso3 N1JFU) | 16/22 |
+
+非自明な 2 つの所見で `PASS1=30 / max_cand=15` 維持を決定:
+
+1. **qso3 busy band の recall は coarse_sync ランクで頭打ち、BP / OSD
+   作業量ではない。** PASS1 を 30→100、max_cand を 15→30 にしても
+   qso3 で 1 局も追加で復号できない — 落としている 6 局は
+   coarse_sync ランク 100 圏外。WSJT-X wide-band の特徴である
+   **iterative subtraction** が必要だが `decode_block` 未実装。
+2. **FT8 の QSO turnaround budget は post-SlotEnd ~2 秒**、15 秒スロット
+   全体ではない。decode 後に UI は waterfall 描画、callsign list 更新、
+   RPRT 表示、次スロット TX 準備、そして **NTP / GPS 同期 RTC が無い
+   chip では復号メッセージの `dt_sec` 平均から slot timing 再推定**
+   (ESP32 内蔵 RTC ドリフトでは frame alignment を decoder 出力に
+   従属させる必要あり) を全部こなす必要がある。Bp/100/30 だと qso3
+   後に 0.4 秒しか残らず、これ全部を回すには厳しい。+1 (qso1 のみ)
+   の recall 増では割に合わない。
+
 ステージ別内訳 (qso3 busy band):
 
 | stage | Core2 LX6 | S3 LX7 | 備考 |
