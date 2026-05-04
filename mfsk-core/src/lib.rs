@@ -125,7 +125,6 @@
 //! | `fft-rustfft` | yes      | Default host FFT backend (`rustfft`, requires `std`) |
 //! | `fft-extern`  |          | Pluggable FFT trait — caller binary supplies an `FftPlanner` impl |
 //! | `fixed-point` |          | Embedded integer pipeline: u16 spec + i16 DFT + Q3i8 LLR + integer NMS BP |
-//! | `relaxed-recall` |       | Tighter `q_thresh` (12→14) for slower MCUs              |
 //! | `profile-coarse` |       | Always-on coarse_sync sub-stage profiling               |
 //!
 //! ## Runtime registry

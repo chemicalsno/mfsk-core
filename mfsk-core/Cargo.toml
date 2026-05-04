@@ -28,14 +28,6 @@ alloc        = []
 # Aggregate features.
 full         = ["std", "fft-rustfft", "ft8", "ft4", "fst4", "wspr", "jt9", "jt65", "q65", "packet-bytes", "uvpacket"]
 
-# Sensitivity-relaxation knob for slower MCUs (LX6 / Cortex-M3-class).
-# Tightens the `process_candidates` `q_thresh` from 12 → 14, skipping
-# the BP-staircase work on borderline-weak candidates (≈ -1 to -2 dB
-# of marginal-SNR signals lost). Default OFF — only enable on chips
-# where slot-total wall-clock is the bottleneck. m5stack-core2 (LX6)
-# enables this; m5stack-s3 (LX7) keeps it off for full recall.
-relaxed-recall = []
-
 # FFT backend selection. `mfsk-core::core::fft::FftPlanner` is the
 # trait every decode-side caller talks to; one of these features must
 # be on whenever decode-side code is compiled (host gets rustfft;
@@ -102,7 +94,7 @@ rayon       = { version = "1", optional = true }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = [
-    'cfg(feature, values("std","alloc","ft8","ft4","fst4","wspr","jt9","jt65","q65","packet-bytes","uvpacket","parallel","full","fft-rustfft","fft-extern","fixed-point","profile-coarse","relaxed-recall"))',
+    'cfg(feature, values("std","alloc","ft8","ft4","fst4","wspr","jt9","jt65","q65","packet-bytes","uvpacket","parallel","full","fft-rustfft","fft-extern","fixed-point","profile-coarse"))',
 ] }
 
 # Build docs.rs with every protocol feature enabled so users browsing

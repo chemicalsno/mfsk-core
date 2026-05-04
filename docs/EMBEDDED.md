@@ -91,10 +91,21 @@ mfsk-core = { version = "0.5", default-features = false, features = [
     "fft-extern",       # caller supplies the FFT backend
     "fixed-point",      # u16 spec + i16 DFT + Q3i8 LLR + i16 NMS BP
     # Optional:
-    # "relaxed-recall",            # tighter q_thresh (12→14) for slower MCUs
     # "profile-coarse",            # always-on stage-2 sub-stage timing
 ] }
 ```
+
+Stage-3 sensitivity is now a runtime parameter on
+`process_candidates_into` (`q_thresh: u32`), not a Cargo feature.
+[`mfsk_core::ft8::decode_block::DEFAULT_Q_THRESH`] is 12 — full
+recall on every target we currently ship for. We A/B-tested 12 vs 14
+on both LX6 (Core2) and LX7 (M5StickS3) post-Phase-E + work-stealing
+(`logs/core2_q_sweep_2026-05-04.log`, `logs/s3_q_sweep_2026-05-04.log`)
+and found the relaxed q=14 saves only **0–78 ms on qso3 only** while
+costing **one weak decode on qso3** on each chip (a different
+borderline cand on each — W1DIG -15.5 dB on S3, N1PJT -18 dB on
+Core2). At sub-1.5 s post-SlotEnd on Core2 / sub-0.8 s on S3, the
+recall hit isn't worth the saving — keep `q_thresh` at the default.
 
 Feature reference:
 
@@ -105,7 +116,6 @@ Feature reference:
 | `fft-extern` | FFT backend via `mfsk_core_make_default_fft_planner` extern fn. | Any embedded target. |
 | `fft-rustfft` | rustfft as the FFT backend. | Host only. |
 | `fixed-point` | Embedded integer pipeline: u16 spectrogram + i16 internal DFT + Q3i8 LLR + integer NMS BP. | Any embedded target — recall-equivalent to the host f32 path with halved PSRAM bandwidth and ~6 KB BP scratch. |
-| `relaxed-recall` | Tighten `q_thresh` from 12 to 14, skipping BP on borderline-weak cands. | Slower MCUs (LX6 / Cortex-M3-class). |
 | `profile-coarse` | Always emits coarse_sync sub-stage timings to stderr. | Diagnosis only. |
 
 ## The two extern Rust contracts
@@ -583,6 +593,43 @@ point in history produces the dual-core-only numbers (qso3 3.22 s);
 log: `dual_core_phase_abcd_2026-05-03.log`. The 1.24 s gap between
 that and the streaming `rx-wavsim` total is exactly what Phase E hides
 under capture.
+
+### S3 LX7 (M5StickS3) — sub-1 s post-SlotEnd
+
+The same pipeline on ESP32-S3 LX7 (PIE SIMD on stage 1/2 dot products,
+otherwise identical to Core2) decodes the same three WAVs in **under
+1 s of post-SlotEnd wall-clock**, no relaxed-recall:
+
+| WAV | results | post-SlotEnd | stage 2 (during cap) | pass 2 | stage 3 |
+|---|---|---:|---:|---:|---:|
+| qso1 (mid-band, 3 stations) | 3/3 ✓ | **0.574 s** | 0.18 s (hidden) | 0.12 s | 0.44 s |
+| qso2 (mid-band, 5 stations) | 5/5 ✓ | **0.370 s** | 0.18 s (hidden) | 0.12 s | 0.24 s |
+| qso3 (busy band, 7 stations) | 7/7 ✓ | **0.707 s** | 0.18 s (hidden) | 0.12 s | 0.58 s |
+
+Two wall-clock improvements vs the Core2 numbers above:
+
+1. **Stage 2 is hidden under capture.** `stage1_inc` ships its
+   `SpecBundle` (spec + per-half allsums) on the spec_q queue as soon
+   as pair 92 finalises (≈ 200 ms before SlotEnd), so main runs
+   `coarse_sync_split_with_allsum` in parallel with the tail of audio
+   capture instead of inside the post-SlotEnd budget. See
+   `embedded_shared::pipeline::SpecBundle` and the
+   `embedded_shared::stage1_inc::worker_main` `emit_spec_bundle` call.
+2. **Stage 3 work-stealing.** `dual_core::stage3_split` no longer
+   pre-splits candidates into head / tail. Both PRO_CPU and APP_CPU
+   pull the next candidate from a shared
+   `Vec<Option<RefinedCandidate>>` via `AtomicUsize::fetch_add(1)`;
+   the busier core can't stall on a slow / failing candidate that
+   landed on the other side. On qso3 (where ~7 of 15 cands fail
+   and run all four LLR variants), this knocked stage 3 from
+   0.81 s → 0.58 s on its own (-28 %).
+
+Raw log:
+`embedded-poc/m5stack-s3/logs/s3_workstealing_2026-05-04.log`.
+
+Recall is fully preserved (decoded messages bit-identical to the
+prior fixed-split run; SNR / hard-error counts identical). MAX_CAND=15,
+PASS1_LIMIT=30, no relaxed-recall.
 
 ## Binary footprint (Core2 reference, `xtensa-esp32-elf-size -A`)
 

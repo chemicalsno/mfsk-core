@@ -74,6 +74,7 @@ enum Job {
         audio: *const i16,
         audio_len: usize,
         depth: DecodeDepth,
+        q_thresh: u32,
         slots_ptr: *mut Option<RefinedCandidate>,
         slots_len: usize,
         next_idx: *const AtomicUsize,
@@ -189,6 +190,7 @@ extern "C" fn worker_main(_arg: *mut core::ffi::c_void) {
                 audio,
                 audio_len,
                 depth,
+                q_thresh,
                 slots_ptr,
                 slots_len,
                 next_idx,
@@ -202,6 +204,7 @@ extern "C" fn worker_main(_arg: *mut core::ffi::c_void) {
                         slots_len,
                         &*next_idx,
                         depth,
+                        q_thresh,
                         &mut BASIS_RE_C1,
                         &mut BASIS_IM_C1,
                         &mut CS_SCRATCH_WORKER,
@@ -372,6 +375,7 @@ pub fn stage3_split(
     audio: &[i16],
     pass2: Vec<RefinedCandidate>,
     depth: DecodeDepth,
+    q_thresh: u32,
     basis_re_main: &mut [i16],
     basis_im_main: &mut [i16],
 ) -> Vec<DecodeResult> {
@@ -387,6 +391,7 @@ pub fn stage3_split(
         audio: audio.as_ptr(),
         audio_len: audio.len(),
         depth,
+        q_thresh,
         slots_ptr,
         slots_len,
         next_idx: next_idx_ptr,
@@ -402,6 +407,7 @@ pub fn stage3_split(
             slots_len,
             &next_idx,
             depth,
+            q_thresh,
             basis_re_main,
             basis_im_main,
             &mut CS_SCRATCH_MAIN,
@@ -424,12 +430,14 @@ pub fn stage3_split(
 /// SAFETY: `slots_ptr` must point to `slots_len` valid
 /// `Option<RefinedCandidate>` cells, and `next_idx` claims an exclusive
 /// index per `fetch_add` so the same slot is never read by two callers.
+#[allow(clippy::too_many_arguments)]
 unsafe fn drain_stage3_queue(
     audio: &[i16],
     slots_ptr: *mut Option<RefinedCandidate>,
     slots_len: usize,
     next_idx: &AtomicUsize,
     depth: DecodeDepth,
+    q_thresh: u32,
     basis_re: &mut [i16],
     basis_im: &mut [i16],
     cs_scratch: &mut [[mfsk_core::core::scalar::Cmplx<f32>; 8]; 79],
@@ -449,6 +457,7 @@ unsafe fn drain_stage3_queue(
             audio,
             core::mem::take(&mut single),
             depth,
+            q_thresh,
             basis_re,
             basis_im,
             cs_scratch,

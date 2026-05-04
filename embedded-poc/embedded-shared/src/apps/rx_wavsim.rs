@@ -40,7 +40,13 @@ fn now_us() -> i64 {
 /// Run the rx_wavsim bench.
 ///
 /// `wavs` is the playlist (≥ 1 baked WAV; cycled indefinitely).
-pub fn run(wavs: &'static [&'static [u8]]) -> ! {
+/// `q_thresh` is the stage-3 `sync_quality` early-reject threshold —
+/// pass [`mfsk_core::ft8::decode_block::DEFAULT_Q_THRESH`] (12) for
+/// full recall (production). Higher values (14) drop borderline-weak
+/// BP staircase work but cost weak decodes on qso3-class slots; the
+/// trade-off was A/B-tested on Core2 / S3 and is documented in
+/// `docs/EMBEDDED.md`.
+pub fn run(wavs: &'static [&'static [u8]], q_thresh: u32) -> ! {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
     log::info!("rx-wavsim starting (mfsk-core {})", mfsk_core::VERSION);
@@ -62,7 +68,9 @@ pub fn run(wavs: &'static [&'static [u8]]) -> ! {
     stage1_inc::spawn(chunk_q, slot_q, spec_q);
     wav_sim::spawn(wavs, chunk_q);
 
-    log::info!("rx-wavsim: decode loop ready; awaiting spec/slot from stage1_inc");
+    log::info!(
+        "rx-wavsim: decode loop ready (q_thresh={q_thresh}); awaiting spec/slot from stage1_inc"
+    );
     loop {
         // SpecBundle arrives ≈ 200 ms before SlotEnd, so stage 2 runs
         // in parallel with the tail of capture.
@@ -81,18 +89,23 @@ pub fn run(wavs: &'static [&'static [u8]]) -> ! {
         drop(spec);
 
         let slot = pipeline::recv_box::<pipeline::Slot>(slot_q);
-        decode_one_slot(*slot, pass1, t_s2_end - t_s2_start);
+        decode_one_slot(*slot, pass1, t_s2_end - t_s2_start, q_thresh);
     }
 }
 
-fn decode_one_slot(slot: pipeline::Slot, pass1: Vec<SyncCandidate>, stage2_us: i64) {
+fn decode_one_slot(
+    slot: pipeline::Slot,
+    pass1: Vec<SyncCandidate>,
+    stage2_us: i64,
+    q_thresh: u32,
+) {
     let wav_idx = slot.wav_idx;
     let inc_us = slot.inc_total_us;
     let pass1_n = pass1.len();
     let post_slot_t0 = now_us();
 
     log::info!(
-        "rx-wavsim: WAV[{wav_idx}] slot received (audio={} samples, pass1={pass1_n})",
+        "rx-wavsim: WAV[{wav_idx}] slot received (audio={} samples, pass1={pass1_n}, q_thresh={q_thresh})",
         slot.audio.len(),
     );
     log::info!(
@@ -116,7 +129,14 @@ fn decode_one_slot(slot: pipeline::Slot, pass1: Vec<SyncCandidate>, stage2_us: i
     let t4 = now_us();
     #[allow(static_mut_refs)]
     let results = unsafe {
-        dual_core::stage3_split(&slot.audio, pass2, depth, &mut BASIS_RE, &mut BASIS_IM)
+        dual_core::stage3_split(
+            &slot.audio,
+            pass2,
+            depth,
+            q_thresh,
+            &mut BASIS_RE,
+            &mut BASIS_IM,
+        )
     };
     let t5 = now_us();
     log::info!(

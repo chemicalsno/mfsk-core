@@ -86,10 +86,20 @@ mfsk-core = { version = "0.5", default-features = false, features = [
     "fft-extern",       # FFT backend は呼び出し側提供
     "fixed-point",      # u16 spec + i16 DFT + Q3i8 LLR + i16 NMS BP
     # 任意:
-    # "relaxed-recall",            # q_thresh を 12→14 に締めて遅い MCU を救う
     # "profile-coarse",            # stage-2 サブステージ常時計測
 ] }
 ```
+
+Stage-3 の感度は Cargo feature ではなく `process_candidates_into` の
+ランタイム引数 `q_thresh: u32` で渡します。
+[`mfsk_core::ft8::decode_block::DEFAULT_Q_THRESH`] は 12 で、現状
+出荷している全 target で full recall。Phase E + work-stealing 後の
+LX6 (Core2) / LX7 (M5StickS3) 実機で 12 vs 14 を A/B 測定し
+(`logs/core2_q_sweep_2026-05-04.log`、`logs/s3_q_sweep_2026-05-04.log`)、
+relaxed q=14 は **qso3 でのみ 0–78 ms 削減**するが、各 chip で **qso3 の弱
+信号 1 局を失う** (S3: W1DIG -15.5 dB, Core2: N1PJT -18 dB) — 12
+で post-SlotEnd 1.5 s 切り (Core2) / 0.8 s 切り (S3) を達成済みなので、
+recall を犠牲にする価値は無く q=12 デフォルト推奨。
 
 Feature 一覧:
 
@@ -100,7 +110,6 @@ Feature 一覧:
 | `fft-extern` | `mfsk_core_make_default_fft_planner` extern fn 経由で FFT backend | 組み込み全般 |
 | `fft-rustfft` | rustfft を FFT backend | ホスト専用 |
 | `fixed-point` | u16 spec + i16 内部 DFT + Q3i8 LLR + i16 NMS BP の組み込み整数パイプライン | どの組み込みでも。host f32 と recall 同等で PSRAM 帯域半減、BP scratch ~6 KB |
-| `relaxed-recall` | `q_thresh` を 12→14 に締め、境界弱信号で BP をスキップ | 低速 MCU (LX6 / Cortex-M3 系) |
 | `profile-coarse` | coarse_sync サブステージ計測を常時出力 | 診断専用 |
 
 ## 2 つの extern Rust 契約
@@ -473,6 +482,41 @@ Compute bench (`main.rs` sweep、streaming overlap 無し) の同時期
 log: `dual_core_phase_abcd_2026-05-03.log`。この 3.22 s と streaming
 版 1.98 s の 1.24 s 差が、まさに Phase E が capture window 下に
 隠した stage 1 の wall-clock です。
+
+### S3 LX7 (M5StickS3) — post-SlotEnd で sub-1 s
+
+同じ pipeline を ESP32-S3 LX7 (stage 1/2 の dot product に PIE SIMD
+が効く以外は Core2 と同一) で動かすと、3 つの WAV 全てが
+**post-SlotEnd 1 秒以内** で復号完了します (relaxed-recall 不使用):
+
+| WAV | 結果 | post-SlotEnd | stage 2 (capture 中) | pass 2 | stage 3 |
+|---|---|---:|---:|---:|---:|
+| qso1 (mid-band, 3 局) | 3/3 ✓ | **0.574 s** | 0.18 s (隠蔽) | 0.12 s | 0.44 s |
+| qso2 (mid-band, 5 局) | 5/5 ✓ | **0.370 s** | 0.18 s (隠蔽) | 0.12 s | 0.24 s |
+| qso3 (busy band, 7 局) | 7/7 ✓ | **0.707 s** | 0.18 s (隠蔽) | 0.12 s | 0.58 s |
+
+Core2 の数値と比べた wall-clock 改善は 2 つ:
+
+1. **Stage 2 が capture 末尾と並列実行され隠蔽される。**
+   `stage1_inc` が pair 92 完成時 (SlotEnd の ~200 ms 前) に
+   `SpecBundle` (spec + per-half allsum) を `spec_q` queue で送出し、
+   main 側は audio capture 末尾と並列で `coarse_sync_split_with_allsum`
+   を実行。post-SlotEnd の budget には入らない。
+   `embedded_shared::pipeline::SpecBundle` と
+   `embedded_shared::stage1_inc::worker_main` の `emit_spec_bundle`
+   呼び出し参照。
+2. **Stage 3 work-stealing。** `dual_core::stage3_split` は
+   candidate を head / tail に事前分割しない。PRO_CPU と APP_CPU が
+   共有 `Vec<Option<RefinedCandidate>>` から `AtomicUsize::fetch_add(1)`
+   で動的に取り合う。失敗 cand が偏って一方が手待ちになる事態が
+   原理的に発生しない。qso3 (15 cand 中 7 が失敗、4 LLR variant
+   全部走る) で stage 3 単独 0.81 s → 0.58 s (-28 %)。
+
+生ログ: `embedded-poc/m5stack-s3/logs/s3_workstealing_2026-05-04.log`。
+
+Recall は完全保持 (decode メッセージ・SNR・hard error count が固定
+分割版と bit-identical)。MAX_CAND=15、PASS1_LIMIT=30、relaxed-recall
+は使用していない。
 
 ## バイナリフットプリント (Core2 リファレンス, ELF)
 

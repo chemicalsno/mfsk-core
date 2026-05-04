@@ -224,7 +224,14 @@ fn decode_one(slot: &[i16], max_cand: usize, _dt_grid: u8, _df_grid: u8, _q_thre
     let t4 = now_us();
     #[allow(static_mut_refs)]
     let results = unsafe {
-        dual_core::stage3_split(slot, pass2, depth, &mut BASIS_RE, &mut BASIS_IM)
+        dual_core::stage3_split(
+            slot,
+            pass2,
+            depth,
+            mfsk_core::ft8::decode_block::DEFAULT_Q_THRESH,
+            &mut BASIS_RE,
+            &mut BASIS_IM,
+        )
     };
     let t5 = now_us();
     log::info!(

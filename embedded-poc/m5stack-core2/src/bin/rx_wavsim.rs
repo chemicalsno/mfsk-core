@@ -11,5 +11,8 @@ const QSO_WAVS: &[&[u8]] = &[
 ];
 
 fn main() -> ! {
-    embedded_shared::apps::rx_wavsim::run(QSO_WAVS)
+    embedded_shared::apps::rx_wavsim::run(
+        QSO_WAVS,
+        mfsk_core::ft8::decode_block::DEFAULT_Q_THRESH,
+    )
 }

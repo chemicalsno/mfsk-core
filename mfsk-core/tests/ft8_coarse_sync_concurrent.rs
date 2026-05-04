@@ -347,6 +347,7 @@ fn full_pipeline_dispatch_matches_sequential() {
                 &audio[..],
                 seq_pass2.clone(),
                 DecodeDepth::BpAll,
+                mfsk_core::ft8::decode_block::DEFAULT_Q_THRESH,
                 &mut basis_re,
                 &mut basis_im,
             )
@@ -411,12 +412,26 @@ fn full_pipeline_dispatch_matches_sequential() {
             let h = s.spawn(move || {
                 let mut br = vec![0i16; BASIS_SCRATCH_LEN];
                 let mut bi = vec![0i16; BASIS_SCRATCH_LEN];
-                process_candidates_into(&audio[..], head, DecodeDepth::BpAll, &mut br, &mut bi)
+                process_candidates_into(
+                    &audio[..],
+                    head,
+                    DecodeDepth::BpAll,
+                    mfsk_core::ft8::decode_block::DEFAULT_Q_THRESH,
+                    &mut br,
+                    &mut bi,
+                )
             });
             let t = s.spawn(move || {
                 let mut br = vec![0i16; BASIS_SCRATCH_LEN];
                 let mut bi = vec![0i16; BASIS_SCRATCH_LEN];
-                process_candidates_into(&audio[..], tail, DecodeDepth::BpAll, &mut br, &mut bi)
+                process_candidates_into(
+                    &audio[..],
+                    tail,
+                    DecodeDepth::BpAll,
+                    mfsk_core::ft8::decode_block::DEFAULT_Q_THRESH,
+                    &mut br,
+                    &mut bi,
+                )
             });
             let mut all = h.join().unwrap();
             all.extend(t.join().unwrap());
@@ -563,6 +578,7 @@ fn spawn_persistent_worker() -> (mpsc::SyncSender<WorkerJob>, std::thread::JoinH
                         audio,
                         cands,
                         depth,
+                        mfsk_core::ft8::decode_block::DEFAULT_Q_THRESH,
                         &mut basis_re,
                         &mut basis_im,
                         &mut cs_scratch,
@@ -634,6 +650,7 @@ fn full_pipeline_persistent_worker_static_buffers_match() {
                 &audio[..],
                 seq_pass2.clone(),
                 DecodeDepth::BpAll,
+                mfsk_core::ft8::decode_block::DEFAULT_Q_THRESH,
                 &mut br,
                 &mut bi,
             )
@@ -718,7 +735,14 @@ fn full_pipeline_persistent_worker_static_buffers_match() {
         let main_s3 = {
             let mut br = vec![0i16; BASIS_SCRATCH_LEN];
             let mut bi = vec![0i16; BASIS_SCRATCH_LEN];
-            process_candidates_into(&audio[..], head_in, DecodeDepth::BpAll, &mut br, &mut bi)
+            process_candidates_into(
+                &audio[..],
+                head_in,
+                DecodeDepth::BpAll,
+                mfsk_core::ft8::decode_block::DEFAULT_Q_THRESH,
+                &mut br,
+                &mut bi,
+            )
         };
         let worker_s3 = s3_rx.recv().unwrap();
         let mut par_stage3: Vec<DecodeResult> = main_s3;

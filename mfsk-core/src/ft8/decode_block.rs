@@ -180,27 +180,14 @@ const NMS_ALPHA: f32 = 0.75;
 /// `compute_llr` (full nsym=3) + 4-variant BP staircase on dead-end
 /// candidates. q ≥ 14 starts losing borderline weak signals
 /// (W1DIG -14 dB, etc.) — the W1DIG-style "e=15" full-LLR-fallback
-/// decodes have q in the 12-13 range. Override per-call via
-/// `MFSK_Q_THRESH` when std is enabled.
-/// `relaxed-recall` feature: tightens q-threshold from 12 → 14 to
-/// skip the borderline-weak BP staircase work (W1DIG-style e=15
-/// full-LLR-fallback decodes drop out). Used on LX6-class chips where
-/// a few weak signals are an acceptable cost for sub-1.5 s slot total.
-#[cfg(feature = "relaxed-recall")]
-const Q_THRESH_DEFAULT: u32 = 14;
-#[cfg(not(feature = "relaxed-recall"))]
-const Q_THRESH_DEFAULT: u32 = 12;
-fn q_thresh() -> u32 {
-    #[cfg(feature = "std")]
-    {
-        if let Ok(s) = std::env::var("MFSK_Q_THRESH")
-            && let Ok(v) = s.parse::<u32>()
-        {
-            return v;
-        }
-    }
-    Q_THRESH_DEFAULT
-}
+/// decodes have q in the 12-13 range.
+///
+/// Pass via the `q_thresh` parameter on
+/// [`process_candidates_into`] / [`process_candidates_into_with_cs_scratch`].
+/// Slower MCUs (LX6 / Cortex-M3-class) typically pick **14** to drop
+/// the borderline-weak BP staircase work for sub-1.5 s slot total at
+/// the cost of a few weak signals.
+pub const DEFAULT_Q_THRESH: u32 = 12;
 
 // ── Spectrogram ─────────────────────────────────────────────────────────────
 
@@ -1570,7 +1557,7 @@ pub fn decode_block<S: AudioSample>(
     let pass1 = coarse_sync(&spec, freq_min, freq_max, sync_min, pass1_limit());
     drop(spec);
     let pass2 = refine_candidates(audio, pass1, max_cand);
-    process_candidates(audio, pass2, depth)
+    process_candidates(audio, pass2, depth, DEFAULT_Q_THRESH)
 }
 
 /// Variant of [`decode_block`] that accepts caller-provided
@@ -1599,7 +1586,7 @@ pub fn decode_block_into<S: AudioSample>(
     let pass1 = coarse_sync(&spec, freq_min, freq_max, sync_min, pass1_limit());
     drop(spec);
     let pass2 = refine_candidates_into(audio, pass1, max_cand, basis_re, basis_im);
-    process_candidates_into(audio, pass2, depth, basis_re, basis_im)
+    process_candidates_into(audio, pass2, depth, DEFAULT_Q_THRESH, basis_re, basis_im)
 }
 
 /// Pass-1 candidate cap — coarse_sync emits at most this many
@@ -1815,20 +1802,31 @@ type LlrT = f32;
 /// staircase. The Costas DFT was already done in Pass 2 — we only
 /// add the data-symbol DFT here.
 ///
+/// `q_thresh` is the post-fill `sync_quality` early-reject threshold
+/// (see [`DEFAULT_Q_THRESH`]).
+///
 /// **Pub for benchmarking only — do not depend on it.**
 #[doc(hidden)]
 pub fn process_candidates<S: AudioSample>(
     audio: &[S],
     cands: Vec<RefinedCandidate>,
     depth: DecodeDepth,
+    q_thresh: u32,
 ) -> Vec<DecodeResult> {
     let mut cs_scratch: alloc::boxed::Box<[[Cmplx<f32>; 8]; 79]> =
         alloc::vec![[Cmplx::<f32>::default(); 8]; 79]
             .try_into()
             .unwrap();
-    process_candidates_with(audio, cands, depth, &mut cs_scratch, |cs, cand, mask| {
-        fill_symbol_spectra(cs, audio, cand.freq_hz, cand.dt_sec, mask);
-    })
+    process_candidates_with(
+        audio,
+        cands,
+        depth,
+        q_thresh,
+        &mut cs_scratch,
+        |cs, cand, mask| {
+            fill_symbol_spectra(cs, audio, cand.freq_hz, cand.dt_sec, mask);
+        },
+    )
 }
 
 /// Variant of [`process_candidates`] that uses caller-provided basis
@@ -1845,6 +1843,7 @@ pub fn process_candidates_into<S: AudioSample>(
     audio: &[S],
     cands: Vec<RefinedCandidate>,
     depth: DecodeDepth,
+    q_thresh: u32,
     basis_re: &mut [i16],
     basis_im: &mut [i16],
 ) -> Vec<DecodeResult> {
@@ -1856,6 +1855,7 @@ pub fn process_candidates_into<S: AudioSample>(
         audio,
         cands,
         depth,
+        q_thresh,
         basis_re,
         basis_im,
         &mut cs_scratch,
@@ -1875,21 +1875,29 @@ pub fn process_candidates_into_with_cs_scratch<S: AudioSample>(
     audio: &[S],
     cands: Vec<RefinedCandidate>,
     depth: DecodeDepth,
+    q_thresh: u32,
     basis_re: &mut [i16],
     basis_im: &mut [i16],
     cs_scratch: &mut [[Cmplx<f32>; 8]; 79],
 ) -> Vec<DecodeResult> {
-    process_candidates_with(audio, cands, depth, cs_scratch, |cs, cand, mask| {
-        fill_symbol_spectra_into(
-            cs,
-            audio,
-            cand.freq_hz,
-            cand.dt_sec,
-            mask,
-            basis_re,
-            basis_im,
-        );
-    })
+    process_candidates_with(
+        audio,
+        cands,
+        depth,
+        q_thresh,
+        cs_scratch,
+        |cs, cand, mask| {
+            fill_symbol_spectra_into(
+                cs,
+                audio,
+                cand.freq_hz,
+                cand.dt_sec,
+                mask,
+                basis_re,
+                basis_im,
+            );
+        },
+    )
 }
 
 /// Common body of `process_candidates` / `process_candidates_into`
@@ -1903,6 +1911,7 @@ fn process_candidates_with<S: AudioSample, F>(
     _audio: &[S],
     cands: Vec<RefinedCandidate>,
     depth: DecodeDepth,
+    q_thresh: u32,
     cs_scratch: &mut [[Cmplx<f32>; 8]; 79],
     mut fill: F,
 ) -> Vec<DecodeResult>
@@ -1912,7 +1921,7 @@ where
     // dt is already parabolically refined by coarse_sync; no grid here.
 
     let mut results: Vec<DecodeResult> = Vec::new();
-    let q_thr = q_thresh();
+    let q_thr = q_thresh;
     // BP scratch pool — instantiated once and reused across all
     // candidates × all 5 BP calls per candidate. Eliminates the
     // ~12 KB-per-call `tlsf_malloc` traffic that dominated stage-3
