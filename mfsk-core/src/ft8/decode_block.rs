@@ -182,11 +182,12 @@ const NMS_ALPHA: f32 = 0.75;
 /// (W1DIG -14 dB, etc.) — the W1DIG-style "e=15" full-LLR-fallback
 /// decodes have q in the 12-13 range.
 ///
-/// Pass via the `q_thresh` parameter on
-/// [`process_candidates_into`] / [`process_candidates_into_with_cs_scratch`].
-/// Slower MCUs (LX6 / Cortex-M3-class) typically pick **14** to drop
-/// the borderline-weak BP staircase work for sub-1.5 s slot total at
-/// the cost of a few weak signals.
+/// Pass via the `q_thresh` parameter on `process_candidates_into` /
+/// `process_candidates_into_with_cs_scratch` (both `#[doc(hidden)]`,
+/// embedded-only under `fixed-point`). Slower MCUs (LX6 /
+/// Cortex-M3-class) typically pick **14** to drop the borderline-weak
+/// BP staircase work for sub-1.5 s slot total at the cost of a few
+/// weak signals.
 pub const DEFAULT_Q_THRESH: u32 = 12;
 
 // ── Spectrogram ─────────────────────────────────────────────────────────────
@@ -2301,8 +2302,16 @@ mod tests {
     /// score-loop ordering on busy bands. The embedded port uses
     /// per-half precompute (`coarse_sync_split_with_allsum_per_half_busy_band`
     /// is the supported path) so this test is `#[ignore]`.
+    /// Locks in the documented divergence: precomputing a full-band
+    /// allsum once and slicing it for each half does NOT match the
+    /// per-half-from-scratch precompute that `coarse_sync_with_allsum`
+    /// ships with. Marked `#[should_panic]` so CI captures the
+    /// expected mismatch — if this test ever stops panicking, the
+    /// f32 sliding-window drift has been fixed and the embedded
+    /// `stage1_inc::emit_spec_bundle` could potentially share an
+    /// allsum across halves.
     #[test]
-    #[ignore = "documents f32 sliding-window drift; per-half precompute is the supported pattern"]
+    #[should_panic(expected = "mismatch")]
     fn coarse_sync_split_with_allsum_busy_band() {
         let msg = pack_cq();
         // 5 signals across [100, 3000] Hz band — 2 in head [100, 1550]
