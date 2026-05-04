@@ -480,11 +480,12 @@ S3 LX7 実機検証 (`logs/s3_pass100_max30_2026-05-04.log`):
 2. **FT8 の QSO turnaround budget は post-SlotEnd ~2 秒**、15 秒スロット
    全体ではない。decode 後に UI は waterfall 描画、callsign list 更新、
    RPRT 表示、次スロット TX 準備、そして **NTP / GPS 同期 RTC が無い
-   chip では復号メッセージの `dt_sec` 平均から slot timing 再推定**
-   (ESP32 内蔵 RTC ドリフトでは frame alignment を decoder 出力に
-   従属させる必要あり) を全部こなす必要がある。Bp/100/30 だと qso3
-   後に 0.4 秒しか残らず、これ全部を回すには厳しい。+1 (qso1 のみ)
-   の recall 増では割に合わない。
+   chip では復号メッセージの `dt_sec` の中央値から slot timing 再推定**
+   (素朴な平均は外れ値に弱く、CRC は通るが sync がずれた 1 局で
+   slot 位相が暴れる。ESP32 内蔵 RTC ドリフトでは frame alignment を
+   この decoder 出力由来の推定値に従属させる必要あり) を全部こなす
+   必要がある。Bp/100/30 だと qso3 後に 0.4 秒しか残らず、これ全部を
+   回すには厳しい。+1 (qso1 のみ) の recall 増では割に合わない。
 
 ステージ別内訳 (qso3 busy band):
 

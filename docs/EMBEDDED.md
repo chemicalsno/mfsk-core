@@ -589,11 +589,14 @@ max_cand=15`:
    full 15 s slot. After decode the UI has to draw the waterfall,
    update the callsign list, render RPRT, prep next-slot TX, and —
    on chips without an NTP-synced or GPS-disciplined RTC — re-estimate
-   slot timing from the mean of decoded signals' `dt_sec` (the
-   ESP32's internal RTC drift is large enough that frame alignment
-   has to be slaved to the decoder output). Bp/100/30 on qso3 leaves
-   only ~0.4 s for all of that before the next TX must start — too
-   tight. The +1 qso1-only recall gain isn't worth the headroom loss.
+   slot timing from the **median** `dt_sec` of decoded signals (a
+   plain mean is outlier-sensitive: a single bogus-sync but
+   CRC-valid decode skews the slot phase noticeably; the ESP32's
+   internal RTC drift is large enough that frame alignment has to
+   be slaved to this decoder-derived estimate). Bp/100/30 on qso3
+   leaves only ~0.4 s for all of that before the next TX must start
+   — too tight. The +1 qso1-only recall gain isn't worth the
+   headroom loss.
 
 So the embedded `decode_block` ships at the recall floor that fits
 the 2 s budget cleanly. Pushing further requires either (a)
