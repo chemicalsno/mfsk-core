@@ -1348,8 +1348,7 @@ pub fn fill_symbol_spectra<S: AudioSample>(
     fill_symbol_spectra_generic::<f32, S>(out, audio, freq_hz, dt_sec, mask);
 }
 
-/// Generic fixed-point fill — writes `Cmplx<Sc>`. f32 wrapper above;
-/// Q14i16 path used under `fixed-point-cs`.
+/// Generic fixed-point fill — writes `Cmplx<Sc>`. f32 wrapper above.
 #[doc(hidden)]
 #[cfg(feature = "fixed-point")]
 pub fn fill_symbol_spectra_generic<Sc: crate::core::scalar::SpecScalar, S: AudioSample>(
@@ -1414,8 +1413,7 @@ pub fn fill_symbol_spectra_into<S: AudioSample>(
 }
 
 /// Generic version of [`fill_symbol_spectra_into`] — writes
-/// `Cmplx<Sc>` for any spec scalar. f32 wrapper above; Q14i16 path
-/// used under `fixed-point-cs`.
+/// `Cmplx<Sc>` for any spec scalar. f32 wrapper above.
 #[doc(hidden)]
 #[cfg(feature = "fixed-point")]
 pub fn fill_symbol_spectra_into_generic<Sc: crate::core::scalar::SpecScalar, S: AudioSample>(
@@ -1722,8 +1720,7 @@ where
     // which is the heap-fragmentation fix Task #2 was opened for.
     // Old code collected all PASS1=30 cs Boxes (240 KB) before the
     // truncate; new code never holds more than max_cand=15 Boxes
-    // (120 KB peak, halving again to 60 KB once `fixed-point-cs`
-    // ships Cmplx<Q14i16>).
+    // (120 KB peak).
     //
     // The heap stores (q, cand_idx, RefinedCandidate); cand_idx
     // breaks ties deterministically (insertion order) so the
@@ -1812,10 +1809,12 @@ where
 }
 
 /// LLR / BP scalar for the embedded RX hot loop. Selected at compile
-/// time: `Q11i16` under `fixed-point-bp` (integer-only, target FPU-less
-/// MCUs / architectural consistency); `f32` otherwise (host / FPU
-/// targets where soft-emu cost is irrelevant). Both routes go
-/// through the same generic NMS implementation in `fec::ldpc::bp`.
+/// time: `Q3i8` under `llr-i8` (smallest scratch, default for
+/// memory-constrained MCUs); `Q11i16` under `fixed-point-llr`
+/// (integer-only, target FPU-less MCUs / architectural consistency);
+/// `f32` otherwise (host / FPU targets where soft-emu cost is
+/// irrelevant). All three routes go through the same generic NMS
+/// implementation in `fec::ldpc::bp`.
 #[cfg(feature = "llr-i8")]
 type LlrT = crate::core::scalar::Q3i8;
 #[cfg(all(feature = "fixed-point-llr", not(feature = "llr-i8")))]
@@ -1971,9 +1970,9 @@ where
         let mut accepted: Option<(crate::fec::ldpc::bp::BpResult, u8)> = None;
 
         // Step 1: fast llra. The LLR / BP scalar is selected at compile
-        // time via the `fixed-point-bp` feature (Q11i16 → integer-only
-        // hot loop on FPU-less embedded targets; f32 → host path).
-        // Both go through the *same* generic NMS implementation —
+        // time via `llr-i8` (Q3i8) / `fixed-point-llr` (Q11i16) /
+        // default (f32) — see the `LlrT` definition above. All three
+        // go through the *same* generic NMS implementation,
         // bit-identical AWGN behaviour by design.
         let llr_a_fast: super::llr::LlrSet<LlrT> = super::llr::compute_llr_fast(cs_scratch);
         let bp_step1 = crate::fec::ldpc::bp::bp_decode_nms_with_scratch::<LlrT>(

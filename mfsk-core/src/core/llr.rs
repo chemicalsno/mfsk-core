@@ -130,8 +130,7 @@ fn normalize_bmet(bmet: &mut [f32]) {
 ///
 /// The `Complex<f32>` cs API is a layout-compatible wrapper around
 /// the generic `compute_llr_generic` — use the generic form when
-/// the caller already holds [`Cmplx<S>`] storage (e.g. the
-/// embedded fixed-point cs Box on Phase 2+ of the i16 migration).
+/// the caller already holds [`Cmplx<S>`] storage.
 pub fn compute_llr<P: Protocol, T: LlrScalar>(cs: &[Complex<f32>]) -> LlrSet<T> {
     compute_llr_generic::<P, f32, T>(complex_slice_as_cmplx_f32(cs), 3)
 }

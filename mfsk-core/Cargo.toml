@@ -66,10 +66,6 @@ fixed-point  = []
 # f32 BP ~1 ms/decode already, so this is mainly an
 # architectural-consistency feature.
 fixed-point-llr = ["fixed-point"]
-# Backward-compat alias for the old name. New code should use
-# `fixed-point-llr`; this alias will be retired after the next minor
-# release.
-fixed-point-bp = ["fixed-point-llr"]
 
 # Q3 i8 LLR / BP scalar (range ±16, 1/8 LSB) — halves BP scratch vs
 # `fixed-point-llr` (Q11i16) at the cost of coarser LLR quantisation.
@@ -79,15 +75,6 @@ fixed-point-bp = ["fixed-point-llr"]
 # `ft8::decode_block` to `Q3i8`. Mutually exclusive with the f32 LLR
 # default — pick at most one of {none, fixed-point-llr, llr-i8}.
 llr-i8 = ["fixed-point-llr"]
-
-# Fixed-point cs (complex symbol spectra) — stores cs entries as
-# `Cmplx<Q14i16>` (Q14 fixed-point i16 per re/im) instead of
-# `Cmplx<f32>`. Halves cs memory footprint (8 KB → 4 KB per
-# Box<[[Cmplx<S>;8];79]>) and removes the f32 cast at the DFT-output
-# boundary on the embedded fixed-point path. Only valuable in
-# combination with `fixed-point` (the spec / DFT-internal i16 path);
-# pulls in `fixed-point-llr` so the integer pipeline runs end-to-end.
-fixed-point-cs = ["fixed-point", "fixed-point-llr"]
 
 # Fixed-point coarse_sync inner loop (allsum / t / t0 in i32 instead of
 # f32). Architecturally completes the integer pipeline so FPU-less
@@ -147,7 +134,7 @@ rayon       = { version = "1", optional = true }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = [
-    'cfg(feature, values("std","alloc","ft8","ft4","fst4","wspr","jt9","jt65","q65","packet-bytes","uvpacket","parallel","osd-deep","eq-fallback","full","embedded-tx","embedded-rx","fft-rustfft","fft-extern","fixed-point","fixed-point-bp","fixed-point-llr","fixed-point-cs","fixed-point-coarse-i32","llr-i8","profile-coarse"))',
+    'cfg(feature, values("std","alloc","ft8","ft4","fst4","wspr","jt9","jt65","q65","packet-bytes","uvpacket","parallel","osd-deep","eq-fallback","full","embedded-tx","embedded-rx","fft-rustfft","fft-extern","fixed-point","fixed-point-llr","fixed-point-coarse-i32","llr-i8","profile-coarse","relaxed-recall"))',
 ] }
 
 # Build docs.rs with every protocol feature enabled so users browsing
