@@ -160,27 +160,21 @@ fn decode_one_slot(stream: *mut MfskFt8Stream) {
     // entirely on core 0 so core 1 is free for stage1_inc.
     let pass1 = match &allsum_pair_opt {
         Some((head, tail)) => {
-            // Sequential per-half on main. Phase E2 dispatch
-            // (`coarse_sync_split_with_allsum`) exists in dual_core
-            // but produces 0-result decodes on slots 2+ even with
-            // diagnostic logs showing main+worker each compute valid
-            // 30-cand lists. Cross-slot state corruption suspected
-            // (same qso1 WAV gives 3 results in slot 1, 0 in slot 4).
-            // Investigation deferred.
-            let mut p = mfsk_core::ft8::decode_block::coarse_sync_with_allsum(
-                &spec, 100.0, 1550.0, 1.0, PASS1_LIMIT, head,
-            );
-            let t = mfsk_core::ft8::decode_block::coarse_sync_with_allsum(
-                &spec, 1550.0, 3_000.0, 1.0, PASS1_LIMIT, tail,
-            );
-            p.extend(t);
-            p.sort_by(|a, b| {
-                b.score
-                    .partial_cmp(&a.score)
-                    .unwrap_or(core::cmp::Ordering::Equal)
-            });
-            p.truncate(PASS1_LIMIT);
-            p
+            // Phase E2 dual-core dispatch. Safe to run post-capture
+            // because `take_spec_and_allsum` resets AUDIO_FILL=0 atomically
+            // with the buffer swap, so wav_sim's next-slot pushes land
+            // at offset 0 immediately rather than being dropped (which
+            // previously shifted the next slot's audio by N×100 ms and
+            // corrupted Costas alignment).
+            dual_core::coarse_sync_split_with_allsum(
+                &spec,
+                100.0,
+                3_000.0,
+                1.0,
+                PASS1_LIMIT,
+                head,
+                tail,
+            )
         }
         None => dual_core::coarse_sync_split(&spec, 100.0, 3_000.0, 1.0, PASS1_LIMIT),
     };

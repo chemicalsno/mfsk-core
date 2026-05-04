@@ -351,6 +351,20 @@ pub fn take_spec_and_allsum() -> Option<(
     if pairs < N_PAIRS {
         return None;
     }
+    // Reset AUDIO_FILL atomically with the spec/allsum buffer swap so
+    // the next slot's `wav_sim::push_chunk` calls land at offset 0
+    // immediately. Without this reset, push_chunk's `if off +
+    // samples.len() <= NMAX` check sees AUDIO_FILL=NMAX (this slot's
+    // final value) and DROPS every chunk between `take_spec_and_allsum`
+    // and `mark_slot_boundary` — wav_sim's loop progresses through
+    // dropped chunks anyway, then later pushes land at offset 0 with
+    // samples from N×100 ms into the next WAV (where N = drops),
+    // shifting the next slot's audio by ~0.4 s in baseline / ~0.7 s
+    // in Phase E2 dispatch and corrupting Costas alignment.
+    // `next_pair` etc. are still reset by `mark_slot_boundary` at the
+    // end of decode — between this point and that, advance_pairs is
+    // dormant (next_pair stays at N_PAIRS).
+    AUDIO_FILL.store(0, Ordering::Release);
     unsafe {
         let inner = (*STATE.inner.get())
             .as_mut()
