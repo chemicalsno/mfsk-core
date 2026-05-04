@@ -34,12 +34,6 @@ full         = ["std", "fft-rustfft", "ft8", "ft4", "fst4", "wspr", "jt9", "jt65
 embedded-tx  = ["alloc", "ft8", "ft4", "wspr"]
 embedded-rx  = ["alloc", "ft8", "ft4", "wspr", "fft-extern"]
 
-# Target-specific presets. ESP32-S3 (Xtensa LX7 + HW FPU + esp-dsp ASM,
-# typical 8 MB PSRAM module) is the embedded reference platform; this
-# alias bundles the right baseline so caller crates only have to flip
-# one feature.
-esp32s3      = ["embedded-rx"]
-
 # Sensitivity-relaxation knob for slower MCUs (LX6 / Cortex-M3-class).
 # Tightens the `process_candidates` `q_thresh` from 12 → 14, skipping
 # the BP-staircase work on borderline-weak candidates (≈ -1 to -2 dB
@@ -153,7 +147,7 @@ rayon       = { version = "1", optional = true }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = [
-    'cfg(feature, values("std","alloc","ft8","ft4","fst4","wspr","jt9","jt65","q65","packet-bytes","uvpacket","parallel","osd-deep","eq-fallback","full","embedded-tx","embedded-rx","esp32s3","fft-rustfft","fft-extern","fixed-point","fixed-point-bp","fixed-point-llr","fixed-point-cs","fixed-point-coarse-i32","llr-i8","profile-coarse"))',
+    'cfg(feature, values("std","alloc","ft8","ft4","fst4","wspr","jt9","jt65","q65","packet-bytes","uvpacket","parallel","osd-deep","eq-fallback","full","embedded-tx","embedded-rx","fft-rustfft","fft-extern","fixed-point","fixed-point-bp","fixed-point-llr","fixed-point-cs","fixed-point-coarse-i32","llr-i8","profile-coarse"))',
 ] }
 
 # Build docs.rs with every protocol feature enabled so users browsing

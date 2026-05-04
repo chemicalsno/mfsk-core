@@ -5,6 +5,7 @@
 
 extern crate alloc;
 
+pub mod apps;
 pub mod dual_core;
 pub mod esp_dsp_fft;
 pub mod internal_pool;

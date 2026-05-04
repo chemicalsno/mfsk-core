@@ -179,7 +179,6 @@ and per-mode performance characterisation.
 | `fft-extern`  |         | Pluggable FFT trait — caller binary supplies an `FftPlanner` impl (esp-dsp on ESP32-S3, CMSIS-DSP on RP2350, …) |
 | `embedded-tx` |         | `no_std + alloc` TX-only preset (FT8 + FT4 + WSPR, no FFT backend pulled in) |
 | `embedded-rx` |         | `no_std + alloc` RX preset (FT8 + FT4 + WSPR + `fft-extern`) |
-| `esp32s3`     |         | Alias for `embedded-rx` — used by `embedded-poc/esp32s3/` |
 
 ## Quick example
 

@@ -82,5 +82,5 @@ embuild = "0.33"
 # and LX7 (S3).
 [[package.metadata.esp-idf-sys.extra_components]]
 remote_component = { name = "espressif/esp-dsp", version = "^1.4" }
-bindings_header = "src/bindings.h"
+bindings_header = "../bindings.h"
 bindings_module = "esp_dsp"
