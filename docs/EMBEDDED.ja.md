@@ -22,7 +22,7 @@ DSP / FEC パイプライン全体が **scalar trait** 化されており、
   `bp_decode_generic_nms<P, T>` — すべて scalar 型を generic 引数に
   取り、`(P, S, T)` の組ごとに 1 monomorphisation。
 
-`fixed-point` / `fixed-point-llr` / `fixed-point-cs` の Cargo feature
+`fixed-point` の Cargo feature
 は **protocol glue がどの scalar 型を選ぶかを切り替える**だけで、
 generic 本体は変わりません。組み込みポートはコードの 99 % を
 ホストビルドと共有 — バグ修正・最適化は一回当てればどちらにも効きます。
@@ -31,8 +31,8 @@ generic 本体は変わりません。組み込みポートはコードの 99 % 
 
 | コンポーネント | generic 対象 | fixed-point 切替 |
 |---|---|---|
-| LDPC BP NMS (`fec::ldpc::bp`) | `LlrScalar` | ✅ `fixed-point-llr` |
-| LLR 計算 (`core::llr`) | `SpecScalar` × `LlrScalar` | ✅ `fixed-point-llr` |
+| LDPC BP NMS (`fec::ldpc::bp`) | `LlrScalar` | ✅ `fixed-point` |
+| LLR 計算 (`core::llr`) | `SpecScalar` × `LlrScalar` | ✅ `fixed-point` |
 | BP scratch pool (`BpScratch<P, T>`) | `LdpcParams` × `LlrScalar` | ✅ — FT8 LDPC(174,91) と FST4/uvpacket LDPC(240,101) 両方 |
 | FT8 spectrogram + DFT (`ft8::decode_block`) | `SpecScalar` × `AudioSample` | ✅ `fixed-point` |
 | **FT4 / WSPR / Q65 / JT9 / JT65** | (ホスト f32 のみ) | ❌ — これらは `decode_block` を経由していない |
@@ -84,11 +84,9 @@ mfsk-core = { version = "0.5", default-features = false, features = [
     "alloc",            # Vec / Box / String — decode で必須
     "ft8",              # FT8 protocol glue
     "fft-extern",       # FFT backend は呼び出し側提供
-    "fixed-point",      # u16 spectrogram + i16 内部 DFT
-    "fixed-point-llr",  # Q11 LLR + i16 BP NMS (FPU 軽負荷 + 省メモリ)
+    "fixed-point",      # u16 spec + i16 DFT + Q3i8 LLR + i16 NMS BP
     # 任意:
-    # "fixed-point-cs",            # Cmplx<Q14i16> cs 格納 (RAM 半減)
-    # "fixed-point-coarse-i32",    # i32 coarse_sync (FPU 無し MCU 専用)
+    # "relaxed-recall",            # q_thresh を 12→14 に締めて遅い MCU を救う
     # "profile-coarse",            # stage-2 サブステージ常時計測
 ] }
 ```
@@ -101,10 +99,8 @@ Feature 一覧:
 | `alloc` | `extern crate alloc` + Vec / Box | 全 decode パス |
 | `fft-extern` | `mfsk_core_make_default_fft_planner` extern fn 経由で FFT backend | 組み込み全般 |
 | `fft-rustfft` | rustfft を FFT backend | ホスト専用 |
-| `fixed-point` | spectrogram cell を `u16`、内部 DFT を i16 | 組み込み (PSRAM 帯域半減) |
-| `fixed-point-llr` | Q11 LLR + i16 NMS BP | 組み込み — 整数パイプラインを揃える |
-| `fixed-point-cs` | `Cmplx<Q14i16>` cs 格納 (8 KB → 4 KB / Box) | RAM タイトな組み込み。LX6 は無くても動く |
-| `fixed-point-coarse-i32` | stage-2 allsum / score を i32 | **FPU 無しのみ** (RP2040, M0+)。LX6/LX7 では FPU+ALU 並列性が崩れて遅くなる |
+| `fixed-point` | u16 spec + i16 内部 DFT + Q3i8 LLR + i16 NMS BP の組み込み整数パイプライン | どの組み込みでも。host f32 と recall 同等で PSRAM 帯域半減、BP scratch ~6 KB |
+| `relaxed-recall` | `q_thresh` を 12→14 に締め、境界弱信号で BP をスキップ | 低速 MCU (LX6 / Cortex-M3 系) |
 | `profile-coarse` | coarse_sync サブステージ計測を常時出力 | 診断専用 |
 
 ## 2 つの extern Rust 契約
@@ -183,8 +179,8 @@ PSRAM 構成の ESP32 では低速 basis でホットパスが走ります。
 |---|---|---|---|
 | spectrogram cell | u16 (mag²) | `>> FP_SPEC_SHIFT (12)` | `ft8::decode_block::Spectrogram` |
 | DFT 基底 | Q15 i16 (cos, sin) | ±2¹⁵ ≈ ±1.0 | `fill_symbol_spectra_into` |
-| シンボル cs | `Cmplx<f32>` (デフォルト) または `Cmplx<Q14i16>` (`fixed-point-cs`) | f32 制限なし、Q14 ±2 | `core::scalar::Cmplx` |
-| LLR | f32 (ホスト) または Q11 i16 (`fixed-point-llr`) | f32 制限なし、Q11 ±16 | `core::scalar::LlrScalar` |
+| シンボル cs | `Cmplx<f32>` (デフォルト) または `Cmplx<Q14i16>` (manual via `core::scalar`) | f32 制限なし、Q14 ±2 | `core::scalar::Cmplx` |
+| LLR | f32 (ホスト) または Q3i8 (`fixed-point`) | f32 制限なし、Q3 ±16, 1/8 LSB | `core::scalar::LlrScalar` |
 | BP メッセージ | T (LLR と同じ) | — | `fec::ldpc::bp::bp_decode_generic_nms_with_scratch` |
 
 ## C / C++ / 非 Rust ESP-IDF プロジェクトから使う (`mfsk-ffi-ft8`)
@@ -349,7 +345,7 @@ rustflags = ["-C", "link-arg=-nostartfiles", "-C", "panic=abort"]
 | Feature | Default | 用途 |
 |---|---|---|
 | `host` | ✓ | ホストビルド — `mfsk-core/std + ft8 + fft-rustfft`。`mfsk_ft8_decode_i16` (caller scratch) と `mfsk_ft8_decode_i16_alloc` (heap 簡便) の**両方**を export |
-| `embedded-fixed-point` | — | `no_std + alloc`。`mfsk-core/fft-extern + fixed-point + fixed-point-llr`。**`mfsk_ft8_decode_i16` のみ** export — heap-alloc 簡便版は意図的に除外 (上記参照)。`mfsk_core_make_default_fft_planner_*` と `mfsk_core_dot_q15_i32` を linker が解決する必要 (典型的には小さな Rust shim が esp-dsp に橋渡し) |
+| `embedded-fixed-point` | — | `no_std + alloc`。`mfsk-core/fft-extern + fixed-point`。**`mfsk_ft8_decode_i16` のみ** export — heap-alloc 簡便版は意図的に除外 (上記参照)。`mfsk_core_make_default_fft_planner_*` と `mfsk_core_dot_q15_i32` を linker が解決する必要 (典型的には小さな Rust shim が esp-dsp に橋渡し) |
 | `embedded-runtime` | — | crate 内に default `#[panic_handler]` (libc `abort` 呼び) + `#[global_allocator]` (libc `malloc`/`free`) を提供。自己完結 `staticlib` 用。同じイメージに別の Rust ランタイムを重ねるときは OFF |
 
 ### ESP-IDF (CMake) プロジェクトへの組み込み
@@ -405,7 +401,7 @@ mfsk-core はデコード/エンコードパイプラインまでです。以下
 あって、メンテされるアプリケーションではありません。他ターゲットは
 独自の glue を書いてください。中身を template として参照してください。
 
-## パフォーマンスベンチマーク (Core2 LX6, `fixed-point` + `fixed-point-llr`)
+## パフォーマンスベンチマーク (Core2 LX6, `fixed-point`)
 
 m5stack-core2 バイナリにベイクされた 3 つの実 QSO 録音を、3 sweep
 連続デコード。stage 内訳は 1 周目 (cold cache)、合計レンジは 3 sweep
@@ -419,9 +415,10 @@ m5stack-core2 バイナリにベイクされた 3 つの実 QSO 録音を、3 sw
 
 - **Stage 1** = spectrogram。92 × N=4096 i16 complex FFT を two-for-one
   real-FFT trick で実行 (`compute_spectrogram` under `fixed-point`)。
-- **Stage 2** = 991 carrier bin × 27 lag の Costas 粗同期。LX6 では
-  FPU-add 律速 — i32 パスより f32 パスのほうが速い
-  (`fixed-point-coarse-i32` の節参照)。
+- **Stage 2** = 991 carrier bin × 27 lag の Costas 粗同期。LX6/LX7 では
+  FPU-add 律速 — f32 allsum を FPU で動かしつつインデックス計算を ALU で
+  並列化できる。i32 化すると両方が ALU に直列化して ~25 % stage-2
+  wall-clock を浪費するため、整数 coarse_sync feature は廃止済み。
 - **Stage 3** = 候補ごとの refine fill + LLR + BP staircase。
   Core2 では OSD off (`OSD_ENABLED=false` in 例の main.rs)。
   qso1 (3 結果) と qso3 (7 結果) の差は、結果あたりの fill +

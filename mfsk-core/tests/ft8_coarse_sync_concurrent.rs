@@ -10,7 +10,7 @@
 //! Run:
 //! ```sh
 //! cargo test --release -p mfsk-core \
-//!     --features fft-rustfft,ft8,fixed-point,fixed-point-llr,profile-coarse \
+//!     --features fft-rustfft,ft8,fixed-point,profile-coarse \
 //!     --test ft8_coarse_sync_concurrent -- --include-ignored --nocapture
 //! ```
 //!

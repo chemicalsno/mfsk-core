@@ -275,22 +275,12 @@ impl Spectrogram {
     }
 }
 
-/// coarse_sync inner-loop accumulator. Phase 3 of the integer-pure
-/// embedded port: under `fixed-point-coarse-i32` the allsum / t_blocks
-/// / t0_blocks chain stays in `i32` (sums of u16 power cells, max
-/// ~2^25 ≪ i31), and only the final score division converts to f32.
-/// Otherwise the alias collapses to f32 so the host path is
-/// bit-identical and the LX6/LX7 FPU+ALU parallelism is preserved.
-///
-/// **Why a separate feature from `fixed-point`**: on ESP32 LX6 the f32
-/// allsum loop overlaps on the FPU with integer index arithmetic on
-/// the ALU; switching to i32 serialises onto the integer ALU and costs
-/// ~25 % stage-2 wall-clock (~+200 ms / qso on Core2). FPU-less targets
-/// (RP2040, Cortex-M0+, Hazard3) are the opposite — flip this feature
-/// on there to avoid f32 emulation in stage 2.
-#[cfg(feature = "fixed-point-coarse-i32")]
-type CoarseAcc = i32;
-#[cfg(not(feature = "fixed-point-coarse-i32"))]
+/// coarse_sync inner-loop accumulator. f32 — overlaps on the FPU with
+/// integer index arithmetic on the ALU on ESP32 LX6/LX7; the integer
+/// `i32` variant (formerly `fixed-point-coarse-i32`) serialises both
+/// onto the ALU and costs ~25 % stage-2 wall-clock on Core2, so it
+/// was retired. If an FPU-less target (RP2040, Cortex-M0+, Hazard3)
+/// is added later, reintroduce the i32 alias on a per-target cfg.
 type CoarseAcc = f32;
 
 impl Spectrogram {
@@ -1808,18 +1798,16 @@ where
     count
 }
 
-/// LLR / BP scalar for the embedded RX hot loop. Selected at compile
-/// time: `Q3i8` under `llr-i8` (smallest scratch, default for
-/// memory-constrained MCUs); `Q11i16` under `fixed-point-llr`
-/// (integer-only, target FPU-less MCUs / architectural consistency);
-/// `f32` otherwise (host / FPU targets where soft-emu cost is
-/// irrelevant). All three routes go through the same generic NMS
-/// implementation in `fec::ldpc::bp`.
-#[cfg(feature = "llr-i8")]
+/// LLR / BP scalar for the hot loop. `Q3i8` under `fixed-point`
+/// (embedded integer pipeline; recall-equivalent to Q11i16 with half
+/// the BP scratch — Issue #15 Phase 1 validated 2026-05-03), `f32`
+/// otherwise (host / FPU targets). Both go through the same generic
+/// NMS implementation in `fec::ldpc::bp`. The Q11i16 type still lives
+/// in `core::scalar` for manual use / tests, but is no longer wired
+/// into a built-in feature.
+#[cfg(feature = "fixed-point")]
 type LlrT = crate::core::scalar::Q3i8;
-#[cfg(all(feature = "fixed-point-llr", not(feature = "llr-i8")))]
-type LlrT = crate::core::scalar::Q11i16;
-#[cfg(not(feature = "fixed-point-llr"))]
+#[cfg(not(feature = "fixed-point"))]
 type LlrT = f32;
 
 /// Stage 3: take Pass-2 refined candidates (cand + Costas-only cs +
@@ -1970,10 +1958,9 @@ where
         let mut accepted: Option<(crate::fec::ldpc::bp::BpResult, u8)> = None;
 
         // Step 1: fast llra. The LLR / BP scalar is selected at compile
-        // time via `llr-i8` (Q3i8) / `fixed-point-llr` (Q11i16) /
-        // default (f32) — see the `LlrT` definition above. All three
-        // go through the *same* generic NMS implementation,
-        // bit-identical AWGN behaviour by design.
+        // time via `fixed-point` (Q3i8) or default (f32) — see the
+        // `LlrT` definition above. Both go through the *same* generic
+        // NMS implementation, bit-identical AWGN behaviour by design.
         let llr_a_fast: super::llr::LlrSet<LlrT> = super::llr::compute_llr_fast(cs_scratch);
         let bp_step1 = crate::fec::ldpc::bp::bp_decode_nms_with_scratch::<LlrT>(
             &mut bp_scratch,

@@ -548,13 +548,6 @@ AP 対応版は `msg::pipeline_ap` に配置 (AP hint 構築が
 | `q65`         | off        | Q65-30A + Q65-60A‥E ZST、4 デコード戦略、synth              |
 | `full`        | off        | 全 7 プロトコルの集約                                        |
 | `parallel`    | on         | パイプラインで rayon `par_iter` (WASM は無効化)              |
-| `osd-deep`    | off        | AP ≥55 bit ロック時に OSD-3 フォールバック追加              |
-| `eq-fallback` | off        | `EqMode::Adaptive` が EQ 失敗時に非 EQ にフォールバック      |
-
-`osd-deep` + `eq-fallback` は重い: FT4 −18 dB 成功率を 5/10 → 6/10 に
-引き上げる代償としてデコード時間が約 10× 増える。WASM の 7.5 s スロット
-予算内に収まるよう **既定 off**、CPU 余裕のあるデスクトップでのみ
-有効化する想定。
 
 ## 6. Rust から利用する
 

@@ -173,12 +173,11 @@ and per-mode performance characterisation.
 | `uvpacket`    |         | Applied example *(experimental)*: NFM voice-channel packet protocol (QPSK + LDPC), reuses `Ldpc240_101` |
 | `full`        |         | Aggregate of all seven WSJT protocols + uvpacket + packet-bytes |
 | `parallel`    | ✓       | Rayon-parallel candidate processing          |
-| `osd-deep`    |         | OSD-3 fallback on AP decodes (extra CPU)     |
-| `eq-fallback` |         | Non-EQ fallback inside `EqMode::Adaptive`    |
 | `fft-rustfft` | ✓       | Default host FFT backend (`rustfft`, requires `std`) |
 | `fft-extern`  |         | Pluggable FFT trait — caller binary supplies an `FftPlanner` impl (esp-dsp on ESP32-S3, CMSIS-DSP on RP2350, …) |
-| `embedded-tx` |         | `no_std + alloc` TX-only preset (FT8 + FT4 + WSPR, no FFT backend pulled in) |
-| `embedded-rx` |         | `no_std + alloc` RX preset (FT8 + FT4 + WSPR + `fft-extern`) |
+| `fixed-point` |         | Embedded integer pipeline: u16 spectrogram + i16 DFT + Q3i8 LLR + integer NMS BP |
+| `relaxed-recall` |      | Tighter `q_thresh` (12→14) for slower MCUs   |
+| `profile-coarse` |      | Always-on coarse_sync sub-stage profiling (host has `MFSK_PROFILE_COARSE` env var alternative) |
 
 ## Quick example
 

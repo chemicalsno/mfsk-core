@@ -36,7 +36,6 @@ embedded-fixed-point = [
     "mfsk-core/ft8",
     "mfsk-core/fft-extern",
     "mfsk-core/fixed-point",
-    "mfsk-core/fixed-point-llr",
 ]
 
 # Provide default `#[panic_handler]` + `#[global_allocator]` inside

@@ -573,14 +573,6 @@ construction is 77-bit specific.
 | `q65`         | off     | Q65-30A + Q65-60A‥E ZSTs, four decode strategies, synth      |
 | `full`        | off     | Aggregate of all seven protocols                              |
 | `parallel`    | on      | Enables rayon `par_iter` in pipeline (no-op under WASM)       |
-| `osd-deep`    | off     | Adds OSD-3 fallback to AP decodes under ≥55-bit lock          |
-| `eq-fallback` | off     | Lets `EqMode::Adaptive` fall back to non-EQ when EQ fails     |
-
-Both `osd-deep` and `eq-fallback` are heavy: they were measured to
-boost FT4's −18 dB success rate by ~5/10 → 6/10 at the cost of ~10×
-decode time. Left **off** by default so the stock build fits a 7.5 s
-WASM slot comfortably; turn them on when running on a desktop where
-CPU budget is abundant.
 
 ## 6. Using from Rust
 

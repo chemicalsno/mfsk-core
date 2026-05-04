@@ -1,11 +1,24 @@
-# LLR / BP scalar quantisation — recall comparison
+# LLR / BP scalar quantisation — recall comparison (historical, 2026-05-03)
 
-Phase 1 of the LX7 optimisation plan (GitHub issue #15) introduces `Q3i8`,
+> **Note (2026-05-04):** This document records the Phase 1 selection that
+> validated `Q3i8` as the embedded LLR scalar. After Phase 1 confirmed it
+> as recall-equivalent to the previously-shipped `Q11i16` variant with
+> half the BP scratch, the user-facing Cargo features were collapsed:
+> the `fixed-point-llr` and `llr-i8` features no longer exist; the
+> single `fixed-point` feature now wires `Q3i8` directly. The
+> `Q11i16` type still lives in `mfsk_core::core::scalar` for manual
+> use / regression testing, but no built-in feature wires it into the
+> decode hot loop. The numbers below were captured before the feature
+> consolidation; the `--features fixed-point-llr` / `--features llr-i8`
+> commands shown later in this document are historical and won't work
+> on current code.
+
+Phase 1 of the LX7 optimisation plan (GitHub issue #15) introduced `Q3i8`,
 an 8-bit Q3 fixed-point LLR scalar (range ±16, 1/8 LSB), as an alternative
-to the existing `f32` (default) and `Q11i16` (`fixed-point-llr` feature)
-LLR types. The motivation is **memory**: BP scratch on FT8 LDPC(174,91)
-shrinks from ~12 KB (`Q11i16`) to ~6 KB (`Q3i8`), freeing 6 KB of
-internal DRAM on Core2 (LX6) where the budget is tight.
+to the existing `f32` (default) and `Q11i16` LLR types. The motivation
+is **memory**: BP scratch on FT8 LDPC(174,91) shrinks from ~12 KB
+(`Q11i16`) to ~6 KB (`Q3i8`), freeing 6 KB of internal DRAM on Core2
+(LX6) where the budget is tight.
 
 This document records the recall delta the i8 path costs vs the f32 / i16
 references, measured on the same `decode_block` integration test

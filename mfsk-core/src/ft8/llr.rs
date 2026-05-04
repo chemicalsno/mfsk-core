@@ -19,9 +19,9 @@ pub use crate::core::llr::LlrSet as GenericLlrSet;
 
 /// FT8 LLR bundle: four fixed-length (174-bit) variants. Generic over
 /// the [`LlrScalar`] storage; defaults to `f32` for backward
-/// compatibility (`LlrSet` ≡ `LlrSet<f32>`). The Q11i16 instantiation
-/// (`LlrSet<Q11i16>`) feeds the integer-only NMS BP under the
-/// `fixed-point-llr` feature.
+/// compatibility (`LlrSet` ≡ `LlrSet<f32>`). The `Q3i8` instantiation
+/// (`LlrSet<Q3i8>`) feeds the integer-only NMS BP under the
+/// `fixed-point` feature.
 pub struct LlrSet<T: LlrScalar = f32> {
     pub llra: [T; LDPC_N],
     pub llrb: [T; LDPC_N],
@@ -61,7 +61,7 @@ pub fn symbol_spectra(cd0: &[Complex<f32>], i_start: usize) -> Box<[[Cmplx<f32>;
 }
 
 /// Compute soft LLRs from complex symbol spectra. Generic over the
-/// LLR scalar `T` (`f32` host path, `Q11i16` under `fixed-point-llr`).
+/// LLR scalar `T` (`f32` host path, `Q3i8` under `fixed-point`).
 /// cs storage stays `Complex<f32>`-typed for source compat; the
 /// internal `compute_llr_generic` consumes a layout-cast
 /// `&[Cmplx<f32>]` view via `flatten_cs`.

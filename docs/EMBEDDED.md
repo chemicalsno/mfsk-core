@@ -22,7 +22,7 @@ embedded-friendly integer path **with no duplicated code**:
   `bp_decode_generic_nms<P, T>` — all take the scalar types as
   generic parameters; one monomorphisation per `(P, S, T)` triple.
 
-The `fixed-point` / `fixed-point-llr` / `fixed-point-cs` Cargo
+The `fixed-point` Cargo
 features just **swap which scalar types the protocol glue picks**;
 the generic body is unchanged. This means the embedded port shares
 99 % of its code with the host build — bug fixes and optimisations
@@ -32,8 +32,8 @@ land once and apply everywhere.
 
 | Component | Generic over | Fixed-point switch wired? |
 |---|---|---|
-| LDPC BP NMS (`fec::ldpc::bp`) | `LlrScalar` | ✅ via `fixed-point-llr` |
-| LLR computation (`core::llr`) | `SpecScalar` × `LlrScalar` | ✅ via `fixed-point-llr` |
+| LDPC BP NMS (`fec::ldpc::bp`) | `LlrScalar` | ✅ via `fixed-point` |
+| LLR computation (`core::llr`) | `SpecScalar` × `LlrScalar` | ✅ via `fixed-point` |
 | BP scratch pool (`BpScratch<P, T>`) | `LdpcParams` × `LlrScalar` | ✅ — works for FT8 LDPC(174,91) and FST4/uvpacket LDPC(240,101) |
 | FT8 spectrogram + DFT (`ft8::decode_block`) | `SpecScalar` × `AudioSample` | ✅ via `fixed-point` |
 | **FT4 / WSPR / Q65 / JT9 / JT65** | (host f32 only) | ❌ — these protocols don't go through `decode_block` today |
@@ -89,11 +89,9 @@ mfsk-core = { version = "0.5", default-features = false, features = [
     "alloc",            # Vec / Box / String — required for decode
     "ft8",              # FT8 protocol glue
     "fft-extern",       # caller supplies the FFT backend
-    "fixed-point",      # u16 spectrogram + i16 internal DFT
-    "fixed-point-llr",  # Q11 LLR + i16 BP NMS (FPU-friendly + smaller)
+    "fixed-point",      # u16 spec + i16 DFT + Q3i8 LLR + i16 NMS BP
     # Optional:
-    # "fixed-point-cs",            # Cmplx<Q14i16> cs storage (halves RAM)
-    # "fixed-point-coarse-i32",    # i32 coarse_sync (ONLY for FPU-less MCUs)
+    # "relaxed-recall",            # tighter q_thresh (12→14) for slower MCUs
     # "profile-coarse",            # always-on stage-2 sub-stage timing
 ] }
 ```
@@ -106,12 +104,9 @@ Feature reference:
 | `alloc` | `extern crate alloc` + Vec / Box. | All decode paths. |
 | `fft-extern` | FFT backend via `mfsk_core_make_default_fft_planner` extern fn. | Any embedded target. |
 | `fft-rustfft` | rustfft as the FFT backend. | Host only. |
-| `fixed-point` | Spectrogram cells stored as `u16`, internal DFT in i16. | Embedded (halves PSRAM bandwidth). |
-| `fixed-point-llr` | Q11 LLR + i16 NMS BP. | Embedded — match the rest of the integer pipeline. |
-| `fixed-point-cs` | `Cmplx<Q14i16>` cs storage (4 KB instead of 8 KB per `Box<[[Cmplx<S>;8];79]>`). | RAM-tight embedded; LX6 is fine without. |
-| `fixed-point-coarse-i32` | Stage-2 allsum / score in i32. | **FPU-less only** (RP2040, M0+). Hurts on LX6/LX7 (FPU+ALU parallelism collapses). |
+| `fixed-point` | Embedded integer pipeline: u16 spectrogram + i16 internal DFT + Q3i8 LLR + integer NMS BP. | Any embedded target — recall-equivalent to the host f32 path with halved PSRAM bandwidth and ~6 KB BP scratch. |
+| `relaxed-recall` | Tighten `q_thresh` from 12 to 14, skipping BP on borderline-weak cands. | Slower MCUs (LX6 / Cortex-M3-class). |
 | `profile-coarse` | Always emits coarse_sync sub-stage timings to stderr. | Diagnosis only. |
-| `bp-crc-bail` | (reserved) | — |
 
 ## The two extern Rust contracts
 
@@ -192,8 +187,8 @@ slow basis on the hot path.
 |---|---|---|---|
 | Spectrogram cell | u16 (mag²) | `>> FP_SPEC_SHIFT (12)` | `ft8::decode_block::Spectrogram` |
 | DFT basis | Q15 i16 (cos, sin) | ±2¹⁵ ≈ ±1.0 | `fill_symbol_spectra_into` |
-| Symbol cs | `Cmplx<f32>` (default) or `Cmplx<Q14i16>` (`fixed-point-cs`) | f32 unbounded; Q14 ±2 | `core::scalar::Cmplx` |
-| LLR | f32 (host) or Q11 i16 (`fixed-point-llr`) | f32 unbounded; Q11 ±16 | `core::scalar::LlrScalar` |
+| Symbol cs | `Cmplx<f32>` (default) or `Cmplx<Q14i16>` (manual via `core::scalar`) | f32 unbounded; Q14 ±2 | `core::scalar::Cmplx` |
+| LLR | f32 (host) or Q3i8 (`fixed-point`) | f32 unbounded; Q3 ±16, 1/8 LSB | `core::scalar::LlrScalar` |
 | BP messages | T (same as LLR) | — | `fec::ldpc::bp::bp_decode_generic_nms_with_scratch` |
 
 ## Using from C / C++ / non-Rust ESP-IDF projects (`mfsk-ffi-ft8`)
@@ -450,7 +445,7 @@ rustflags = ["-C", "link-arg=-nostartfiles", "-C", "panic=abort"]
 | Feature | Default | Purpose |
 |---|---|---|
 | `host` | ✓ | Host build — pulls `mfsk-core/std + ft8 + fft-rustfft`. Both `mfsk_ft8_decode_i16` (caller scratch) and `mfsk_ft8_decode_i16_alloc` (heap convenience) are exported. |
-| `embedded-fixed-point` | — | `no_std + alloc`. Pulls `mfsk-core/fft-extern + fixed-point + fixed-point-llr`. **Only `mfsk_ft8_decode_i16` is exported** — the heap-alloc convenience is excluded by design (see above). The linker must resolve `mfsk_core_make_default_fft_planner_*` and `mfsk_core_dot_q15_i32` (typically via a small Rust shim that bridges esp-dsp). |
+| `embedded-fixed-point` | — | `no_std + alloc`. Pulls `mfsk-core/fft-extern + fixed-point`. **Only `mfsk_ft8_decode_i16` is exported** — the heap-alloc convenience is excluded by design (see above). The linker must resolve `mfsk_core_make_default_fft_planner_*` and `mfsk_core_dot_q15_i32` (typically via a small Rust shim that bridges esp-dsp). |
 | `embedded-runtime` | — | Provides default `#[panic_handler]` (calls libc `abort`) + `#[global_allocator]` (libc `malloc`/`free`). Needed for a self-contained `staticlib`; turn off when stacking another Rust runtime in the same image. |
 
 ### Linking it into an ESP-IDF (CMake) project
@@ -508,7 +503,7 @@ of those (using esp-idf-svc) for one specific board — it is an
 should expect to write their own glue. Reference what's there as a
 template; copy what's useful.
 
-## Performance benchmark (Core2 LX6, `fixed-point` + `fixed-point-llr`)
+## Performance benchmark (Core2 LX6, `fixed-point`)
 
 Three on-air recordings baked into the m5stack-core2 binary as WAV
 assets, decoded back-to-back over three full sweeps. Per-stage
@@ -525,8 +520,10 @@ min–max across three iterations.
   FFTs via the two-for-one real-FFT trick (see `compute_spectrogram`
   under `fixed-point`).
 - **Stage 2** = coarse Costas correlation across 991 carrier bins ×
-  27 lags. FPU-add bound on LX6 — the f32 path is faster than the
-  i32 path here (see `fixed-point-coarse-i32` rationale above).
+  27 lags. FPU-add bound on LX6/LX7 — the f32 allsum path overlaps
+  with integer index arithmetic on the ALU; an integer-only variant
+  (formerly the `fixed-point-coarse-i32` feature) was retired since
+  it serialised both onto the ALU and cost ~25 % stage-2 wall-clock.
 - **Stage 3** = per-candidate refine fill + LLR + BP staircase.
   OSD off on Core2 (`OSD_ENABLED=false` in the example main.rs);
   the spread between qso1 (3 results) and qso3 (7 results) is from

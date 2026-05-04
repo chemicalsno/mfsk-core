@@ -122,12 +122,11 @@
 //! | `q65`         |          | Q65-30A + Q65-60A‥E (65-FSK, QRA(15,65) GF(64)) |
 //! | `full`        |          | Aggregate of all seven protocols + uvpacket + packet-bytes |
 //! | `parallel`    | yes      | Rayon-parallel candidate processing          |
-//! | `osd-deep`    |          | OSD-3 fallback on AP decodes (extra CPU)     |
-//! | `eq-fallback` |          | Non-EQ fallback inside `EqMode::Adaptive`    |
 //! | `fft-rustfft` | yes      | Default host FFT backend (`rustfft`, requires `std`) |
 //! | `fft-extern`  |          | Pluggable FFT trait — caller binary supplies an `FftPlanner` impl |
-//! | `embedded-tx` |          | `no_std + alloc` TX-only preset (FT8 + FT4 + WSPR) |
-//! | `embedded-rx` |          | `no_std + alloc` RX preset (FT8 + FT4 + WSPR + `fft-extern`) |
+//! | `fixed-point` |          | Embedded integer pipeline: u16 spec + i16 DFT + Q3i8 LLR + integer NMS BP |
+//! | `relaxed-recall` |       | Tighter `q_thresh` (12→14) for slower MCUs              |
+//! | `profile-coarse` |       | Always-on coarse_sync sub-stage profiling               |
 //!
 //! ## Runtime registry
 //!

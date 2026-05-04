@@ -130,23 +130,15 @@ where
 
     let fec = P::Fec::default();
 
-    // Prepare EQ / non-EQ views of the symbol spectra. The non-EQ fallback
-    // inside `EqMode::Adaptive` doubles per-candidate cost for only a
-    // marginal gain (~1/20 extra decodes at -18 dB), so it is feature-
-    // gated behind `eq-fallback`. Default Adaptive behaviour is
-    // "EQ-only" — matches FT8's historical single-path approach.
+    // Prepare EQ / non-EQ views of the symbol spectra. EqMode::Adaptive
+    // is "EQ-only" — matches FT8's historical single-path approach.
+    // The non-EQ fallback (~1/20 extra decodes at -18 dB) was retired
+    // because it doubled per-candidate cost for marginal gain.
     let cs_eq = {
         let mut v = cs_raw.clone();
         equalize_local::<P>(&mut v);
         v
     };
-    #[cfg(feature = "eq-fallback")]
-    let try_order: &[(&[Complex<f32>], bool)] = match eq_mode {
-        EqMode::Off => &[(&cs_raw, false)],
-        EqMode::Local => &[(&cs_eq, true)],
-        EqMode::Adaptive => &[(&cs_eq, true), (&cs_raw, false)],
-    };
-    #[cfg(not(feature = "eq-fallback"))]
     let try_order: &[(&[Complex<f32>], bool)] = match eq_mode {
         EqMode::Off => &[(&cs_raw, false)],
         EqMode::Local | EqMode::Adaptive => &[(&cs_eq, true)],
@@ -220,13 +212,7 @@ where
                         return Some(res);
                     }
                     if depth == DecodeDepth::BpAllOsd {
-                        // Default is depth-2 only (matches FT8's AP path).
-                        // `osd-deep` feature enables the depth-3 fallback
-                        // under heavy AP locks — ~0.5 dB threshold gain
-                        // at ~25% extra runtime.
-                        #[cfg(feature = "osd-deep")]
-                        let depths: &[u32] = if locked >= 55 { &[2, 3] } else { &[2] };
-                        #[cfg(not(feature = "osd-deep"))]
+                        // OSD depth-2 only (matches FT8's AP path).
                         let depths: &[u32] = &[2];
                         let _ = locked;
                         for &od in depths {
