@@ -7,15 +7,26 @@
 //! subtracts it in place so weaker signals become decodable.
 
 use super::{decode::DecodeResult, wave_gen::message_to_tones};
-use crate::core::dsp::subtract::{SubtractCfg, subtract_tones};
+use crate::core::dsp::subtract::{GfskParams, SubtractCfg, subtract_tones};
 
 /// FT8 subtract configuration: 12 kHz sample rate, 6.25 Hz tone spacing,
-/// 1920 samples/symbol, frame origin at 0.5 s.
+/// 1920 samples/symbol, frame origin at 0.5 s, GFSK pulse shaping
+/// matching `wave_gen::tones_to_*` (BT=2.0, hmod=1.0, ramp=nsps/8).
+///
+/// The GFSK shaping is required for correct subtract: without it, the
+/// reference reverts to abrupt phase transitions and only achieves
+/// ~-19 dB drop on a perfectly clean self-synthesised signal vs > -100 dB
+/// with GFSK. See test `tests/ft8_subtract_self_test.rs`.
 const FT8_CFG: SubtractCfg = SubtractCfg {
     sample_rate: 12_000.0,
     tone_spacing_hz: 6.25,
     samples_per_symbol: 1920,
     base_offset_s: 0.5,
+    gfsk: Some(GfskParams {
+        bt: 2.0,
+        hmod: 1.0,
+        ramp_samples: 1920 / 8,
+    }),
 };
 
 /// Subtract a decoded FT8 signal from `audio` in-place (full amplitude).

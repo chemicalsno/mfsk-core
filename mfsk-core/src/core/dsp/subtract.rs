@@ -25,14 +25,52 @@ pub struct SubtractCfg {
     /// places `t = 0` of the transmitted frame at 0.5 s for FT8, 0.5 s for
     /// FT4 as well — so typically 0.5.
     pub base_offset_s: f32,
+    /// GFSK pulse-shaping parameters. `Some` → match real WSJT-style
+    /// transmissions (FT8 BT=2.0, FT4 BT=2.0, FST4 BT=1.0). `None` → use
+    /// abrupt phase transitions; reference will not match real signals
+    /// — only retained for non-GFSK protocols and round-trip tests.
+    pub gfsk: Option<GfskParams>,
+}
+
+/// Subset of [`crate::core::dsp::gfsk::GfskCfg`] needed to shape the
+/// subtract reference. `sample_rate` and `samples_per_symbol` are
+/// already on `SubtractCfg` so we only carry the GFSK-specific knobs.
+#[derive(Clone, Copy, Debug)]
+pub struct GfskParams {
+    /// Bandwidth-time product. FT8/FT4 use 2.0.
+    pub bt: f32,
+    /// Modulation index. 1.0 for FT8.
+    pub hmod: f32,
+    /// Cosine ramp length at start/end (samples). FT8 uses `nsps / 8`.
+    pub ramp_samples: usize,
 }
 
 /// Generate phase-continuous cosine/sine references for a symbol stream.
 ///
 /// Returns `(w_cos, w_sin)` each of length `tones.len() * cfg.samples_per_symbol`.
 /// `freq_hz` is the carrier of tone 0.
+///
+/// When `cfg.gfsk` is `Some`, the references are GFSK-shaped (matches
+/// the actual transmitted FT8/FT4 waveform — required for any subtract
+/// against real WSJT-style signals). Otherwise the legacy abrupt
+/// per-symbol frequency switching is used.
 fn generate_iq(tones: &[u8], freq_hz: f32, cfg: &SubtractCfg) -> (Vec<f32>, Vec<f32>) {
     let n = tones.len() * cfg.samples_per_symbol;
+    if let Some(g) = cfg.gfsk {
+        let gfsk_cfg = crate::core::dsp::gfsk::GfskCfg {
+            sample_rate: cfg.sample_rate,
+            samples_per_symbol: cfg.samples_per_symbol,
+            bt: g.bt,
+            hmod: g.hmod,
+            ramp_samples: g.ramp_samples,
+        };
+        let mut w_cos = vec![0.0f32; n];
+        let mut w_sin = vec![0.0f32; n];
+        crate::core::dsp::gfsk::synth_complex_f32_into(
+            &mut w_cos, &mut w_sin, tones, freq_hz, 1.0, &gfsk_cfg,
+        );
+        return (w_cos, w_sin);
+    }
     let mut w_cos = vec![0.0f32; n];
     let mut w_sin = vec![0.0f32; n];
     let mut phase = 0.0f32;
@@ -135,11 +173,15 @@ mod tests {
     #[test]
     fn subtract_tones_negative_dt_aligns_via_ref_offset() {
         // Fake FT8-shape config: small frame for cheap test.
+        // Tests intentionally exercise the abrupt-transition path so audio
+        // and reference share identical shape (cleanest > -100 dB drop).
+        // The GFSK path is exercised by `tests/ft8_subtract_self_test.rs`.
         let cfg = SubtractCfg {
             sample_rate: 12_000.0,
             tone_spacing_hz: 6.25,
             samples_per_symbol: 1920,
             base_offset_s: 0.5,
+            gfsk: None,
         };
         let tones: Vec<u8> = (0..79).map(|k| (k % 8) as u8).collect();
         let (w_cos, _w_sin) = generate_iq(&tones, 1500.0, &cfg);
@@ -180,11 +222,15 @@ mod tests {
     /// Sanity: positive DT path also works (regression check).
     #[test]
     fn subtract_tones_positive_dt_works() {
+        // Tests intentionally exercise the abrupt-transition path so audio
+        // and reference share identical shape (cleanest > -100 dB drop).
+        // The GFSK path is exercised by `tests/ft8_subtract_self_test.rs`.
         let cfg = SubtractCfg {
             sample_rate: 12_000.0,
             tone_spacing_hz: 6.25,
             samples_per_symbol: 1920,
             base_offset_s: 0.5,
+            gfsk: None,
         };
         let tones: Vec<u8> = (0..79).map(|k| (k % 8) as u8).collect();
         let (w_cos, _) = generate_iq(&tones, 1500.0, &cfg);

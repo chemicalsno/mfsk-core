@@ -153,6 +153,99 @@ pub fn synth_f32_into(out: &mut [f32], tones: &[u8], f0_hz: f32, amplitude: f32,
     }
 }
 
+/// Complex GFSK synthesis: writes both `cos(phi)` and `sin(phi)` into
+/// caller-provided buffers using the same phase progression as
+/// [`synth_f32_into`]. Used by signal-cancellation paths that need an
+/// IQ pair for least-squares amplitude estimation against arbitrary
+/// channel phase.
+///
+/// Both `out_cos` and `out_sin` must have length
+/// [`synth_output_len`]`(tones.len(), cfg.samples_per_symbol)`.
+pub fn synth_complex_f32_into(
+    out_cos: &mut [f32],
+    out_sin: &mut [f32],
+    tones: &[u8],
+    f0_hz: f32,
+    amplitude: f32,
+    cfg: &GfskCfg,
+) {
+    let nsps = cfg.samples_per_symbol;
+    let nsym = tones.len();
+    assert!(nsym > 0, "synth_complex_f32_into: empty tone sequence");
+    let nwave = synth_output_len(nsym, nsps);
+    assert_eq!(
+        out_cos.len(),
+        nwave,
+        "synth_complex_f32_into: out_cos.len() must equal synth_output_len()"
+    );
+    assert_eq!(
+        out_sin.len(),
+        nwave,
+        "synth_complex_f32_into: out_sin.len() must equal synth_output_len()"
+    );
+    let twopi = 2.0 * PI;
+    let dt = 1.0 / cfg.sample_rate;
+
+    let pulse_len = 3 * nsps;
+    let pulse: Vec<f32> = (0..pulse_len)
+        .map(|i| {
+            let tt = (i as f32 - 1.5 * nsps as f32) / nsps as f32;
+            gfsk_pulse(cfg.bt, tt)
+        })
+        .collect();
+
+    let total = (nsym + 2) * nsps;
+    let mut dphi = vec![0.0f32; total];
+    let dphi_peak = twopi * cfg.hmod / nsps as f32;
+
+    for (j, &tone) in tones.iter().enumerate() {
+        let ib = j * nsps;
+        for i in 0..pulse_len {
+            if ib + i < total {
+                dphi[ib + i] += dphi_peak * pulse[i] * tone as f32;
+            }
+        }
+    }
+    for i in 0..(2 * nsps).min(total) {
+        dphi[i] += dphi_peak * tones[0] as f32 * pulse[nsps + i];
+    }
+    let ofs = nsym * nsps;
+    for i in 0..(2 * nsps) {
+        if ofs + i < total {
+            dphi[ofs + i] += dphi_peak * tones[nsym - 1] as f32 * pulse[i];
+        }
+    }
+    for d in dphi.iter_mut() {
+        *d += twopi * f0_hz * dt;
+    }
+
+    let mut phi = 0.0f32;
+    for k in 0..nwave {
+        out_cos[k] = amplitude * phi.cos();
+        out_sin[k] = amplitude * phi.sin();
+        phi += dphi[nsps + k];
+        if phi > twopi {
+            phi -= twopi;
+        }
+    }
+
+    // Half-cosine envelope on each end (same as synth_f32_into).
+    let nramp = cfg.ramp_samples.min(nwave / 2);
+    if nramp > 0 {
+        for i in 0..nramp {
+            let env = (1.0 - (twopi * i as f32 / (2.0 * nramp as f32)).cos()) / 2.0;
+            out_cos[i] *= env;
+            out_sin[i] *= env;
+        }
+        let k1 = nwave - nramp;
+        for i in 0..nramp {
+            let env = (1.0 + (twopi * i as f32 / (2.0 * nramp as f32)).cos()) / 2.0;
+            out_cos[k1 + i] *= env;
+            out_sin[k1 + i] *= env;
+        }
+    }
+}
+
 /// Synthesise a PCM waveform from an FSK tone sequence.
 ///
 /// Vec-returning convenience wrapper for [`synth_f32_into`]. Allocates
