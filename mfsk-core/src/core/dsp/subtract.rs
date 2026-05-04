@@ -68,8 +68,25 @@ pub fn subtract_tones(
 ) {
     let (w_cos, w_sin) = generate_iq(tones, freq_hz, cfg);
 
-    let start = ((cfg.base_offset_s + dt_sec) * cfg.sample_rate).round() as usize;
-    let len = w_cos.len().min(audio.len().saturating_sub(start));
+    // Signed start (samples). For `dt_sec < -base_offset_s` the FT8 frame
+    // begins **before** the audio buffer — the leading portion of the
+    // reference falls outside `audio[..]` and must be clipped.
+    //
+    // Pre-fix: `as usize` saturated negative values to 0, leaving
+    // `start = 0` and the entire reference aligned to `audio[0..]`.
+    // For e.g. `dt_sec = -0.78` (FT8 reports up to ±2.5 s) this misaligned
+    // the reference by 3360 samples → near-zero LS amplitude → effectively
+    // no-op subtract on legitimately-decoded signals at large negative DT.
+    let signed_start = ((cfg.base_offset_s + dt_sec) * cfg.sample_rate).round() as i64;
+    let (audio_off, ref_off) = if signed_start < 0 {
+        (0usize, (-signed_start) as usize)
+    } else {
+        (signed_start as usize, 0usize)
+    };
+    if ref_off >= w_cos.len() {
+        return;
+    }
+    let len = (w_cos.len() - ref_off).min(audio.len().saturating_sub(audio_off));
     if len == 0 {
         return;
     }
@@ -80,13 +97,10 @@ pub fn subtract_tones(
     // precision.
     let (num_a, num_b, den_a, den_b) =
         (0..len).fold((0.0f32, 0.0f32, 0.0f32, 0.0f32), |(na, nb, da, db), i| {
-            let rx = audio[start + i] as f32;
-            (
-                na + rx * w_cos[i],
-                nb + rx * w_sin[i],
-                da + w_cos[i] * w_cos[i],
-                db + w_sin[i] * w_sin[i],
-            )
+            let rx = audio[audio_off + i] as f32;
+            let wc = w_cos[ref_off + i];
+            let ws = w_sin[ref_off + i];
+            (na + rx * wc, nb + rx * ws, da + wc * wc, db + ws * ws)
         });
 
     let a = if den_a > f32::EPSILON {
@@ -101,8 +115,95 @@ pub fn subtract_tones(
     };
 
     for i in 0..len {
-        let sub = gain * (a * w_cos[i] + b * w_sin[i]);
-        let new_val = audio[start + i] as f32 - sub;
-        audio[start + i] = new_val.clamp(-32_768.0, 32_767.0) as i16;
+        let sub = gain * (a * w_cos[ref_off + i] + b * w_sin[ref_off + i]);
+        let new_val = audio[audio_off + i] as f32 - sub;
+        audio[audio_off + i] = new_val.clamp(-32_768.0, 32_767.0) as i16;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test for `subtract_tones` start-clipping with negative DT.
+    ///
+    /// Pre-fix: `((base_offset_s + dt_sec) * sample_rate) as usize` silently
+    /// saturated negative values to 0, leaving the reference misaligned by
+    /// thousands of samples — the LS projection then estimated near-zero
+    /// amplitude and the subtract was effectively a no-op for any decode
+    /// reporting `dt_sec < -base_offset_s`.
+    #[test]
+    fn subtract_tones_negative_dt_aligns_via_ref_offset() {
+        // Fake FT8-shape config: small frame for cheap test.
+        let cfg = SubtractCfg {
+            sample_rate: 12_000.0,
+            tone_spacing_hz: 6.25,
+            samples_per_symbol: 1920,
+            base_offset_s: 0.5,
+        };
+        let tones: Vec<u8> = (0..79).map(|k| (k % 8) as u8).collect();
+        let (w_cos, _w_sin) = generate_iq(&tones, 1500.0, &cfg);
+
+        // Build audio that starts mid-frame (signal began before sample 0):
+        // shift the reference left by 3360 samples and take only the
+        // overlapping tail. amplitude = 5000.
+        let shift = 3360usize;
+        let amp = 5000.0f32;
+        let mut audio: Vec<i16> = vec![0i16; 180_000];
+        let n = w_cos.len() - shift;
+        for i in 0..n.min(audio.len()) {
+            audio[i] = (amp * w_cos[shift + i]).clamp(-32_768.0, 32_767.0) as i16;
+        }
+        let pre_energy: f64 = audio.iter().map(|&s| (s as f64) * (s as f64)).sum();
+
+        // Reported dt corresponds to signal-start at sample -3360, i.e.
+        // dt_sec = -3360 / 12_000 = -0.28 → start = (0.5 - 0.28) * 12k = 2640.
+        // With shift=3360 the actual signal-start is -3360 from sample 0, so
+        // the equivalent decoded dt_sec is (0 - shift) / sample_rate -
+        // base_offset_s = -shift/sr - 0.5 = -0.78 (mirroring qso3 CQ F5RXL).
+        let dt_sec = -(shift as f32) / cfg.sample_rate - cfg.base_offset_s;
+        subtract_tones(&mut audio, &tones, 1500.0, dt_sec, 1.0, &cfg);
+
+        let post_energy: f64 = audio.iter().map(|&s| (s as f64) * (s as f64)).sum();
+        let drop_db = 10.0 * (post_energy / pre_energy).log10();
+
+        // With proper alignment: post energy should drop by ≥ 30 dB
+        // (clean signal, exact reference match — only quantization noise left).
+        assert!(
+            drop_db < -30.0,
+            "subtract_tones failed to remove signal at dt_sec={dt_sec:.3} \
+             (drop only {drop_db:.1} dB; expected < -30 dB). \
+             Pre-fix bug: `start as usize` saturated negative to 0."
+        );
+    }
+
+    /// Sanity: positive DT path also works (regression check).
+    #[test]
+    fn subtract_tones_positive_dt_works() {
+        let cfg = SubtractCfg {
+            sample_rate: 12_000.0,
+            tone_spacing_hz: 6.25,
+            samples_per_symbol: 1920,
+            base_offset_s: 0.5,
+        };
+        let tones: Vec<u8> = (0..79).map(|k| (k % 8) as u8).collect();
+        let (w_cos, _) = generate_iq(&tones, 1500.0, &cfg);
+
+        let dt_sec: f32 = 0.2;
+        let start = ((cfg.base_offset_s + dt_sec) * cfg.sample_rate).round() as usize;
+        let amp = 5000.0f32;
+        let mut audio: Vec<i16> = vec![0i16; 180_000];
+        for i in 0..w_cos.len() {
+            audio[start + i] = (amp * w_cos[i]).clamp(-32_768.0, 32_767.0) as i16;
+        }
+        let pre: f64 = audio.iter().map(|&s| (s as f64) * (s as f64)).sum();
+
+        subtract_tones(&mut audio, &tones, 1500.0, dt_sec, 1.0, &cfg);
+        let post: f64 = audio.iter().map(|&s| (s as f64) * (s as f64)).sum();
+        let drop_db = 10.0 * (post / pre).log10();
+        assert!(
+            drop_db < -30.0,
+            "positive-DT subtract drop only {drop_db:.1} dB"
+        );
     }
 }
