@@ -209,7 +209,7 @@
 //! ```toml
 //! # Cargo.toml
 //! [dependencies]
-//! mfsk-core = { version = "0.1", features = ["ft8", "ft4"] }
+//! mfsk-core = { version = "0.5", features = ["ft8", "ft4"] }
 //! ```
 //!
 //! Round-trip a synthesised FT8 frame through the decoder:

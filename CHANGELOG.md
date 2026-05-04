@@ -1,5 +1,129 @@
 # Changelog
 
+## 0.5.4 — embedded streaming pipeline + S3 LX7 sub-1 s + bench against WSJT-X reference
+
+API-additive patch on the host side; all changes are concentrated in
+`embedded-poc/embedded-shared` (the M5Stack Core2 / M5StickS3 sample
+crates) and the FT8 `decode_block` parameter list. The headlines:
+
+- **M5StickS3 (ESP32-S3 LX7) gets a full-recall sub-1 s decode**:
+  qso3 busy band (the WSJT-X formally-distributed reference WAV
+  `samples/FT8/210703_133430.wav`) decodes 7/13 callsigns in
+  **0.707 s post-SlotEnd**; same recall, 1.434 s on Core2 LX6.
+  No relaxed-recall feature, no MAX_CAND reduction.
+- **The streaming RX pipeline was redesigned around FreeRTOS Queues**.
+  Old shared-state-with-resets coordination (`STATE: UnsafeCell`,
+  `AUDIO_FILL` / `PAIR_DONE` atomics, `mark_slot_boundary`,
+  `take_spec_and_allsum`, `peek_latest`) is retired in favour of
+  single-ownership `Box<ChunkMsg>` / `Box<SpecBundle>` / `Box<Slot>`
+  pointer-passing through depth-1/2 queues.
+- **A reference-vs-host benchmark test** comparing host wide-band
+  `decode_frame` (BpAllOsd, max_cand=200) against the embedded
+  `decode_block` on the WSJT-X recording is added at
+  `tests/ft8_reference_suite_recall.rs`. It shows the embedded
+  budget caps at 7/13 on busy band — the missing 6 require iterative
+  subtraction, which `decode_block` doesn't implement.
+
+### Library (mfsk-core)
+
+API additions:
+
+- `pub const DEFAULT_Q_THRESH: u32 = 12` (in `ft8::decode_block`) —
+  the recommended `process_candidates*` `q_thresh` knob.
+
+API change (only affects `#[doc(hidden)]` callers — `decode_block` /
+`decode_block_into` keep their signatures by passing the default
+internally):
+
+- `process_candidates(audio, cands, depth)`
+  → `process_candidates(audio, cands, depth, q_thresh)`.
+- `process_candidates_into(audio, cands, depth, basis_re, basis_im)`
+  → `process_candidates_into(audio, cands, depth, q_thresh,
+  basis_re, basis_im)`.
+- `process_candidates_into_with_cs_scratch(...)` similarly gains
+  `q_thresh: u32`.
+
+The `MFSK_Q_THRESH` env-var override on `q_thresh()` and the
+matching `Q_THRESH_DEFAULT` const are removed.
+
+Feature surface trimmed (23 → 16; all removals are
+embedded-targeted — host library consumers using the default feature
+set are unaffected):
+
+- Retired: `relaxed-recall` (now a runtime parameter — see
+  `q_thresh` above), `fixed-point-llr` and `llr-i8` (folded into
+  `fixed-point`; the integer pipeline now always uses `Q3i8` LLR,
+  which Phase 1 of issue #15 confirmed is recall-equivalent to
+  `Q11i16` with half the BP scratch), `fixed-point-coarse-i32`
+  (only useful on FPU-less targets we don't currently ship for —
+  hurts on LX6/LX7), `fixed-point-bp` (alias for `fixed-point-llr`),
+  `fixed-point-cs` (placeholder, never wired up), `osd-deep` and
+  `eq-fallback` (internal toggles, never enabled by any caller),
+  `embedded-tx` / `embedded-rx` (aggregate presets, no caller used
+  them), `esp32s3` (alias of `embedded-rx`, only referenced by the
+  retired `embedded-poc/esp32s3/` PoC crate).
+- Kept: `std`, `alloc`, `ft8`/`ft4`/`fst4`/`wspr`/`jt9`/`jt65`/`q65`/
+  `packet-bytes`/`uvpacket`, `parallel`, `fft-rustfft`, `fft-extern`,
+  `fixed-point` (now the single embedded knob), `profile-coarse`,
+  `full`.
+
+The `Q11i16` scalar type itself stays in `core::scalar` for manual /
+test use — only the built-in feature wiring is gone.
+
+### Embedded (`embedded-poc/`)
+
+- New `embedded-shared` library architecture: `pipeline` (queue
+  helpers + `ChunkMsg` / `SpecBundle` / `Slot` types), `wav_sim`
+  (WAV-fed producer task), `stage1_inc` (incremental FFT consumer +
+  per-slot finaliser), `dual_core` (job/result queues + work-stealing
+  stage 3 dispatch). All ownership transfers via `Box::into_raw`
+  raw-pointer items on FreeRTOS Queues — `mpsc::sync_channel`-equivalent
+  semantics, no shared mutable state.
+- New `apps` module: `rx_wavsim::run(wavs, pass1_limit, max_cand,
+  q_thresh)` and `compute_bench::run(target_name, qso_wavs)`. The
+  per-target `m5stack-{core2,s3}/src/bin/rx_wavsim.rs` and `main.rs`
+  now collapse to ~13-line shims that just supply WAV slices and
+  config.
+- `dual_core::stage3_split` is now **work-stealing**: both PRO_CPU
+  and APP_CPU pull individual candidates from a shared
+  `Vec<Option<RefinedCandidate>>` via `AtomicUsize::fetch_add(1)`,
+  absorbing the per-cand BP wall-clock variance (failed cands run
+  all 4 LLR variants; on qso3 ~7 of 15 fail). Saved **-239 ms on
+  qso3 S3** at zero recall change.
+- `stage1_inc` emits its `SpecBundle` on `spec_q` as soon as pair 92
+  finalises (≈ 200 ms before SlotEnd). Main runs stage 2 in parallel
+  with the tail of audio capture; only pass 2 + stage 3 are in the
+  post-SlotEnd budget.
+- Asset / header consolidation: `embedded-poc/{assets,bindings.h}`
+  shared between m5stack-core2 / m5stack-s3. The older
+  `embedded-poc/esp32s3/` PoC (synth + FFT round-trip) is retired
+  as superseded by m5stack-s3.
+
+### Performance benchmark (post-SlotEnd, q_thresh=12, full recall)
+
+Both chips on the same WAV trio at the production setting
+(PASS1=30, max_cand=15, BpAll, no OSD):
+
+| WAV  | results | Core2 LX6 | S3 LX7 |
+|------|---------|----------:|-------:|
+| qso1 (mid-band, 3 stations)        | 3/3 ✓ | 1.303 s | 0.574 s |
+| qso2 (mid-band, 5 stations)        | 5/5 ✓ | 0.632 s | 0.370 s |
+| qso3 busy band (WSJT-X reference)  | 7/7 ✓ | 1.434 s | 0.707 s |
+
+vs the 0.5.3 numbers (1.83 / 1.45 / 1.98 s slot-total on Core2): a
+29 / 56 / 28 % reduction respectively, mostly stage 3 work-stealing
+absorbing the per-cand variance.
+
+The host wide-band reference on the same qso3 WAV finds 13/13 in
+~140 ms (Ryzen, BpAllOsd, max_cand=200). The 6 callsigns the
+embedded path misses on the busy band are below the coarse_sync
+top-100 entirely — they need iterative subtraction (the WSJT-X
+wide-band path's hallmark, not in `decode_block`) to surface. A/B
+test on real S3 silicon (`logs/s3_pass100_max30_2026-05-04.log`)
+confirmed widening PASS1 → 100 / max_cand → 30 / OSD on the embedded
+path moves the qso3 needle by **zero** — see `docs/EMBEDDED.md` for
+the rationale on why ship stays at PASS1=30 / max_cand=15.
+
 ## 0.5.3 — embedded perf: dual-core decode + Phase E (Core2 LX6 sub-2 s)
 
 API-additive patch. The headline is on the embedded side: with full

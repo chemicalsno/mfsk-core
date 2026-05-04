@@ -80,7 +80,7 @@ for the data-flow diagram.
 
 ```toml
 [dependencies]
-mfsk-core = { version = "0.4", features = ["ft8", "ft4"] }
+mfsk-core = { version = "0.5", features = ["ft8", "ft4"] }
 ```
 
 ## Attribution
