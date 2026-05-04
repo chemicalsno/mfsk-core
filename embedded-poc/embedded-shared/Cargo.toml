@@ -1,0 +1,31 @@
+[package]
+name = "embedded-shared"
+version = "0.1.0"
+edition = "2021"
+authors = ["Minoru Tomobe <minoru.tomobe@gmail.com>"]
+rust-version = "1.82"
+
+# Shared library for `embedded-poc/m5stack-{core2,s3}` (LX6 / LX7).
+# Holds the FT8-RX glue that's identical across both chips:
+#
+#   * `wav_sim`        — baked-WAV feed task
+#   * `esp_dsp_fft`    — FftPlanner16 backed by espressif/esp-dsp
+#   * `dual_core`      — APP_CPU worker for Pass 2 / Stage 3 split
+#   * `stage1_inc`     — Phase E incremental stage-1 spectrogram
+#   * `internal_pool`  — `.bss`-resident scratch buffers (cs staging)
+#
+# Excluded from the host workspace via `embedded-poc` exclusion.
+# Compiled per-target against the +esp toolchain by the binary
+# crates that depend on it.
+
+[lib]
+name = "embedded_shared"
+
+[dependencies]
+log = "0.4"
+esp-idf-svc = { version = "0.52.1", features = ["critical-section", "embassy-time-driver", "embassy-sync"] }
+
+mfsk-core = { path = "../../mfsk-core", default-features = false, features = ["alloc", "ft8", "fft-extern", "fixed-point", "fixed-point-llr", "llr-i8", "profile-coarse"] }
+# `wav_sim::spawn` takes `*mut mfsk_ft8::MfskFt8Stream` from the bin.
+mfsk-ffi-ft8 = { path = "../../mfsk-ffi-ft8", default-features = false, features = ["embedded-fixed-point"] }
+num-complex = { version = "0.4", default-features = false }

@@ -182,6 +182,13 @@ const NMS_ALPHA: f32 = 0.75;
 /// (W1DIG -14 dB, etc.) — the W1DIG-style "e=15" full-LLR-fallback
 /// decodes have q in the 12-13 range. Override per-call via
 /// `MFSK_Q_THRESH` when std is enabled.
+/// `relaxed-recall` feature: tightens q-threshold from 12 → 14 to
+/// skip the borderline-weak BP staircase work (W1DIG-style e=15
+/// full-LLR-fallback decodes drop out). Used on LX6-class chips where
+/// a few weak signals are an acceptable cost for sub-1.5 s slot total.
+#[cfg(feature = "relaxed-recall")]
+const Q_THRESH_DEFAULT: u32 = 14;
+#[cfg(not(feature = "relaxed-recall"))]
 const Q_THRESH_DEFAULT: u32 = 12;
 fn q_thresh() -> u32 {
     #[cfg(feature = "std")]
@@ -1828,7 +1835,11 @@ pub fn process_candidates<S: AudioSample>(
     cands: Vec<RefinedCandidate>,
     depth: DecodeDepth,
 ) -> Vec<DecodeResult> {
-    process_candidates_with(audio, cands, depth, |cs, cand, mask| {
+    let mut cs_scratch: alloc::boxed::Box<[[Cmplx<f32>; 8]; 79]> =
+        alloc::vec![[Cmplx::<f32>::default(); 8]; 79]
+            .try_into()
+            .unwrap();
+    process_candidates_with(audio, cands, depth, &mut cs_scratch, |cs, cand, mask| {
         fill_symbol_spectra(cs, audio, cand.freq_hz, cand.dt_sec, mask);
     })
 }
@@ -1850,7 +1861,38 @@ pub fn process_candidates_into<S: AudioSample>(
     basis_re: &mut [i16],
     basis_im: &mut [i16],
 ) -> Vec<DecodeResult> {
-    process_candidates_with(audio, cands, depth, |cs, cand, mask| {
+    let mut cs_scratch: alloc::boxed::Box<[[Cmplx<f32>; 8]; 79]> =
+        alloc::vec![[Cmplx::<f32>::default(); 8]; 79]
+            .try_into()
+            .unwrap();
+    process_candidates_into_with_cs_scratch(
+        audio,
+        cands,
+        depth,
+        basis_re,
+        basis_im,
+        &mut cs_scratch,
+    )
+}
+
+/// Variant of [`process_candidates_into`] that also accepts a
+/// caller-provided per-symbol-spectra scratch (`cs_scratch`, 5 KB =
+/// `[[Cmplx<f32>; 8]; 79]`). Each candidate's PSRAM-resident `cs Box`
+/// is copied into this scratch before `fill_symbol_spectra_into` /
+/// LLR / BP run on it, then dropped — letting the BP / LLR hot loops
+/// read `cs` from internal DRAM (~5–10× faster than PSRAM on Xtensa
+/// LX6/LX7). Provide a `static mut` array in `.bss` for max win.
+#[cfg(feature = "fixed-point")]
+#[doc(hidden)]
+pub fn process_candidates_into_with_cs_scratch<S: AudioSample>(
+    audio: &[S],
+    cands: Vec<RefinedCandidate>,
+    depth: DecodeDepth,
+    basis_re: &mut [i16],
+    basis_im: &mut [i16],
+    cs_scratch: &mut [[Cmplx<f32>; 8]; 79],
+) -> Vec<DecodeResult> {
+    process_candidates_with(audio, cands, depth, cs_scratch, |cs, cand, mask| {
         fill_symbol_spectra_into(
             cs,
             audio,
@@ -1864,13 +1906,17 @@ pub fn process_candidates_into<S: AudioSample>(
 }
 
 /// Common body of `process_candidates` / `process_candidates_into`
-/// — the BP staircase logic is identical between the two; only the
-/// per-candidate `fill_symbol_spectra(_into)` call differs (heap-
-/// allocated basis vs caller-provided).
+/// / `process_candidates_into_with_cs_scratch` — the BP staircase
+/// logic is identical between them; only the per-candidate
+/// `fill_symbol_spectra(_into)` call differs (heap-allocated basis vs
+/// caller-provided). `cs_scratch` is the per-symbol-spectra working
+/// buffer that hot loops (BP / LLR / sync_quality) read from — see
+/// [`process_candidates_into_with_cs_scratch`] for the rationale.
 fn process_candidates_with<S: AudioSample, F>(
     _audio: &[S],
     cands: Vec<RefinedCandidate>,
     depth: DecodeDepth,
+    cs_scratch: &mut [[Cmplx<f32>; 8]; 79],
     mut fill: F,
 ) -> Vec<DecodeResult>
 where
@@ -1887,21 +1933,29 @@ where
     // `mfsk_core::fec::ldpc::bp::BpScratch`.
     let mut bp_scratch =
         crate::fec::ldpc::bp::BpScratch::<crate::fec::ldpc::params::Ldpc174_91Params, LlrT>::new();
-    for (cand, mut cs, _q_block0) in cands {
+    for (cand, cs_box, _q_block0) in cands {
+        // Stage cs into the caller's scratch (typically internal DRAM
+        // on Xtensa) so the LLR / BP / sync_quality hot loops below
+        // read from fast memory. The PSRAM-resident `cs_box` is
+        // dropped immediately after the copy. Cost: ~60 µs (5 KB at
+        // ~80 MB/s OCT PSRAM read on S3) vs many-hundred-µs gains in
+        // BP iter loop.
+        *cs_scratch = *cs_box;
+        drop(cs_box);
         // Two-step fill: sync blocks first, gate by full sync_quality,
         // then fill data symbols only for survivors. Saves the 58 ×
         // 8 = 464 data-symbol DFTs on every candidate that fails the
         // q gate (typically half of `max_cand`). `SyncBlocks12`
         // (instead of `SyncOnly`) skips re-filling block 0 — Pass 2
         // already populated it via `symbol_spectra_direct_into` on
-        // `SyncBlock0`, and that data survives in `cs` here. Saves
-        // an additional 56 DFTs / candidate.
-        fill(&mut cs, &cand, SymMask::SyncBlocks12);
-        let q = sync_quality(&cs);
+        // `SyncBlock0`, and that data survives in `cs_scratch` here.
+        // Saves an additional 56 DFTs / candidate.
+        fill(cs_scratch, &cand, SymMask::SyncBlocks12);
+        let q = sync_quality(cs_scratch);
         if q <= q_thr {
             continue;
         }
-        fill(&mut cs, &cand, SymMask::DataOnly);
+        fill(cs_scratch, &cand, SymMask::DataOnly);
         let refined_dt = cand.dt_sec;
 
         // ── Staircase: cheap → deeper → OSD ─────────────────────────
@@ -1921,7 +1975,7 @@ where
         // hot loop on FPU-less embedded targets; f32 → host path).
         // Both go through the *same* generic NMS implementation —
         // bit-identical AWGN behaviour by design.
-        let llr_a_fast: super::llr::LlrSet<LlrT> = super::llr::compute_llr_fast(&cs);
+        let llr_a_fast: super::llr::LlrSet<LlrT> = super::llr::compute_llr_fast(cs_scratch);
         let bp_step1 = crate::fec::ldpc::bp::bp_decode_nms_with_scratch::<LlrT>(
             &mut bp_scratch,
             &llr_a_fast.llra,
@@ -1966,7 +2020,8 @@ where
             }
             // Variant b: lazy nsym=2 only.
             if accepted.is_none() {
-                let llrb_arr: [LlrT; LDPC_N] = super::llr::compute_llr_partial::<LlrT>(&cs, 2);
+                let llrb_arr: [LlrT; LDPC_N] =
+                    super::llr::compute_llr_partial::<LlrT>(cs_scratch, 2);
                 let bp_b = crate::fec::ldpc::bp::bp_decode_nms_with_scratch::<LlrT>(
                     &mut bp_scratch,
                     &llrb_arr,
@@ -1981,7 +2036,8 @@ where
             }
             // Variant c: lazy nsym=3 (the expensive one).
             if accepted.is_none() {
-                let llrc_arr: [LlrT; LDPC_N] = super::llr::compute_llr_partial::<LlrT>(&cs, 3);
+                let llrc_arr: [LlrT; LDPC_N] =
+                    super::llr::compute_llr_partial::<LlrT>(cs_scratch, 3);
                 let bp_c = crate::fec::ldpc::bp::bp_decode_nms_with_scratch::<LlrT>(
                     &mut bp_scratch,
                     &llrc_arr,
@@ -2002,7 +2058,7 @@ where
         // Only fires when Steps 1+2 BP failed and `q >= 12`, so the
         // extra compute_llr is cheap relative to the OSD work itself.
         if accepted.is_none() && matches!(depth, DecodeDepth::BpAllOsd) && q >= 12 {
-            let llr_full_f32: super::llr::LlrSet<f32> = super::llr::compute_llr(&cs);
+            let llr_full_f32: super::llr::LlrSet<f32> = super::llr::compute_llr(cs_scratch);
             for (llr, pid) in [
                 (&llr_full_f32.llra, 4u8),
                 (&llr_full_f32.llrb, 5),
@@ -2047,7 +2103,7 @@ where
             continue;
         }
         let itone = message_to_tones(&bp.message77);
-        let snr_db = super::llr::compute_snr_db(&cs, &itone);
+        let snr_db = super::llr::compute_snr_db(cs_scratch, &itone);
         results.push(DecodeResult {
             message77: bp.message77,
             freq_hz: cand.freq_hz,

@@ -1,5 +1,7 @@
-//! M5Stack Core2 (ESP32-D0WD-V3, LX6 dual-core, 8 MB QUAD PSRAM,
-//! 16 MB Flash) FT8 test bench.
+//! M5Stack S3 (ESP32-S3, Xtensa LX7 dual-core @ 240 MHz, 8 MB Octal
+//! PSRAM 想定) FT8 test bench. m5stack-core2 (LX6) クレートからの
+//! 複製 — issue #15 Phase 2 baseline。タイミング数値は LX6 の実測値
+//! のままなので S3 ベンチ後に更新する。
 //!
 //! Goal: prove `mfsk_core::ft8::decode_block` (the embedded
 //! pow-of-2-FFT-only path) decodes a synthetic FT8 slot inside a
@@ -31,7 +33,8 @@
 // `esp_dsp_fft` exports `mfsk_core_make_default_fft_planner` — the
 // `extern "Rust"` factory `mfsk_core::core::fft::default_planner()`
 // links against under `fft-extern`. `pub use` keeps the linker from
-// stripping the factory as dead code.
+// stripping the factory as dead code. Re-exported from the shared
+// crate so the linker still sees the symbol in this bin.
 pub use embedded_shared::esp_dsp_fft;
 use embedded_shared::dual_core;
 
@@ -121,7 +124,7 @@ fn main() {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
 
-    log::info!("mfsk-core-m5stack-core2 PoC starting");
+    log::info!("mfsk-core-m5stack-s3 PoC starting");
     log::info!("mfsk-core version: {}", mfsk_core::VERSION);
 
     // ── Free heap (DRAM vs PSRAM) so we know the budget ──────────────

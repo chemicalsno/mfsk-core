@@ -31,9 +31,10 @@
 //! re-derived. Verified against `compute_spectrogram`'s loop in
 //! `mfsk-core/src/ft8/decode_block.rs:383` (post-Hann + 2-for-1 FFT).
 
+use core::cell::UnsafeCell;
 use core::ffi::c_void;
 use core::ptr;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 use alloc::boxed::Box;
 use alloc::vec;
@@ -130,9 +131,23 @@ struct Inner {
     inc_total_us: i64,
 }
 
-static mut STATE: Option<Inner> = None;
-static mut WORKER_TASK: TaskHandle_t = ptr::null_mut();
-static mut WAV_SIM_TASK_TARGET: TaskHandle_t = ptr::null_mut();
+/// Cross-task shared state. Initialised once in `init()` from main,
+/// then mutated by `push_chunk` (wav_sim task), `advance_pairs`
+/// (APP_CPU worker), and read by `take_spec*` / `mark_slot_boundary` /
+/// `last_slot_inc_us` (main task). Synchronisation comes from the
+/// `xTaskNotify` handshake (memory barrier on Xtensa) plus the audio
+/// fill / pair_done atomics — there's no overlapping mutation between
+/// init and any consumer. Uses the same `UnsafeCell + unsafe Sync`
+/// pattern as `dual_core::JOB_SLOT`.
+struct StateCell {
+    inner: UnsafeCell<Option<Inner>>,
+}
+/// SAFETY: see `STATE` doc comment.
+unsafe impl Sync for StateCell {}
+static STATE: StateCell = StateCell {
+    inner: UnsafeCell::new(None),
+};
+static WORKER_TASK: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 
 /// Number of pairs completed in the current slot. Reset to 0 by
 /// `mark_slot_boundary()`. Used by main to verify Phase E feasibility:
@@ -198,10 +213,12 @@ pub fn init() {
         peak_abs: 1,
         inc_total_us: 0,
     };
+    // SAFETY: init runs once before any task notification can fire.
     unsafe {
-        STATE = Some(inner);
+        *STATE.inner.get() = Some(inner);
     }
 
+    let mut handle: TaskHandle_t = ptr::null_mut();
     unsafe {
         let r = xTaskCreatePinnedToCore(
             Some(worker_main),
@@ -209,11 +226,12 @@ pub fn init() {
             16384,
             ptr::null_mut(),
             3, // below dual_core worker (5) and wav_sim (4)
-            &raw mut WORKER_TASK,
+            &raw mut handle,
             1, // APP_CPU
         );
         assert_eq!(r, PD_PASS, "xTaskCreatePinnedToCore(stage1_inc) failed: {r}");
     }
+    WORKER_TASK.store(handle as *mut c_void, Ordering::Release);
     log::info!(
         "stage1_inc: spawned (APP_CPU, prio 3); n_time={} n_pairs={} n_freq={}",
         N_TIME,
@@ -228,8 +246,15 @@ pub fn init() {
 /// DMA-done IRQ would deliver in production.
 pub fn push_chunk(samples: &[i16]) {
     // Update audio buffer + peak estimate (lock-free single producer).
+    // SAFETY: only the wav_sim task calls push_chunk; the APP_CPU
+    // worker mutates `next_pair` / `shift*` / `peak_abs` (via
+    // `advance_pairs`) but never touches `audio[]`. The shift / peak
+    // fields are mutated only after `audio_len >= 12_000` so init is
+    // observed via the AUDIO_FILL Release store above.
     unsafe {
-        let inner = STATE.as_mut().expect("stage1_inc not init'd");
+        let inner = (*STATE.inner.get())
+            .as_mut()
+            .expect("stage1_inc not init'd");
         let off = AUDIO_FILL.load(Ordering::Relaxed);
         if off + samples.len() <= NMAX {
             inner.audio[off..off + samples.len()].copy_from_slice(samples);
@@ -244,10 +269,11 @@ pub fn push_chunk(samples: &[i16]) {
         }
     }
     // Notify the worker.
-    unsafe {
-        if !WORKER_TASK.is_null() {
+    let task = WORKER_TASK.load(Ordering::Acquire);
+    if !task.is_null() {
+        unsafe {
             xTaskGenericNotify(
-                WORKER_TASK,
+                task as TaskHandle_t,
                 0,
                 0,
                 eNotifyAction_eIncrement,
@@ -263,7 +289,7 @@ pub fn mark_slot_boundary() {
     PAIR_DONE.store(0, Ordering::Release);
     AUDIO_FILL.store(0, Ordering::Release);
     unsafe {
-        if let Some(inner) = STATE.as_mut() {
+        if let Some(inner) = (*STATE.inner.get()).as_mut() {
             inner.next_pair = 0;
             inner.shift = 0;
             inner.shift_locked = false;
@@ -276,7 +302,12 @@ pub fn mark_slot_boundary() {
 /// Total wall-clock spent in `advance_pairs` over the current slot
 /// (µs). Read by main task at slot end to log Phase E feasibility.
 pub fn last_slot_inc_us() -> i64 {
-    unsafe { STATE.as_ref().map(|s| s.inc_total_us).unwrap_or(0) }
+    unsafe {
+        (*STATE.inner.get())
+            .as_ref()
+            .map(|s| s.inc_total_us)
+            .unwrap_or(0)
+    }
 }
 
 /// Take the incrementally-built spec out of the worker for this slot.
@@ -290,7 +321,9 @@ pub fn take_spec() -> Option<mfsk_core::ft8::decode_block::Spectrogram> {
         return None;
     }
     unsafe {
-        let inner = STATE.as_mut().expect("stage1_inc not init'd");
+        let inner = (*STATE.inner.get())
+            .as_mut()
+            .expect("stage1_inc not init'd");
         let n_freq = inner.n_freq;
         // Swap out the prebuilt buffer.
         let mut fresh = vec![0u16; n_freq * N_TIME];
@@ -319,7 +352,9 @@ pub fn take_spec_and_allsum() -> Option<(
         return None;
     }
     unsafe {
-        let inner = STATE.as_mut().expect("stage1_inc not init'd");
+        let inner = (*STATE.inner.get())
+            .as_mut()
+            .expect("stage1_inc not init'd");
         let n_freq = inner.n_freq;
         let head_n = inner.allsum_head_n_freq;
         let tail_n = inner.allsum_tail_n_freq;
@@ -361,7 +396,9 @@ fn advance_pairs() {
     let t0 = unsafe { esp_timer_get_time() };
     let audio_len = AUDIO_FILL.load(Ordering::Acquire);
     unsafe {
-        let inner = STATE.as_mut().expect("stage1_inc not init'd");
+        let inner = (*STATE.inner.get())
+            .as_mut()
+            .expect("stage1_inc not init'd");
 
         // Lock auto-gain shift once we've seen ~1 s of audio.
         if !inner.shift_locked && audio_len >= 12_000 {

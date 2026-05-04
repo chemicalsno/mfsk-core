@@ -100,7 +100,7 @@ static mut BASIS_IM: [i16; 15_360] = [0; 15_360];
 fn main() {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
-    log::info!("mfsk-core-m5stack-core2 RX skeleton (UNVERIFIED)");
+    log::info!("mfsk-core-m5stack-s3 RX skeleton (UNVERIFIED)");
     log::info!("mfsk-core version: {}", mfsk_core::VERSION);
 
     // Sanity: assert basis scratch sizing matches the FFI's expectation.

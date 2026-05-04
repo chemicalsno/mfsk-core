@@ -1,0 +1,9 @@
+# Custom partition table for M5StickS3 (8 MB flash).
+# Default singleapp (1 MB factory) is too small — release rx-wavsim ELF
+# extracts to ~1.77 MB on Xtensa LX7 (vs ~0.9 MB on LX6) due to esp-dsp
+# PIE SIMD variants and chip-specific driver code. 2 MB factory leaves
+# room for headroom + future feature flags.
+# Name,     Type, SubType, Offset,  Size
+nvs,        data, nvs,     0x9000,  0x6000
+phy_init,   data, phy,     0xf000,  0x1000
+factory,    app,  factory, 0x10000, 2M
