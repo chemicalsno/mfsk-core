@@ -160,13 +160,13 @@ fn decode_one_slot(stream: *mut MfskFt8Stream) {
     // entirely on core 0 so core 1 is free for stage1_inc.
     let pass1 = match &allsum_pair_opt {
         Some((head, tail)) => {
-            // Phase E2 dispatch (`coarse_sync_split_with_allsum`)
-            // exists in `dual_core.rs` and is timing-correct (slot 1
-            // separation from wav_sim) but produces 0-result decodes
-            // on slots 2+ of the rx_wavsim loop — slot 1 works, then
-            // recall collapses. Suspect FPU / heap state accumulation
-            // on APP_CPU between worker calls. Investigation deferred;
-            // sequential per-half on main is the recall-correct path.
+            // Sequential per-half on main. Phase E2 dispatch
+            // (`coarse_sync_split_with_allsum`) exists in dual_core
+            // but produces 0-result decodes on slots 2+ even with
+            // diagnostic logs showing main+worker each compute valid
+            // 30-cand lists. Cross-slot state corruption suspected
+            // (same qso1 WAV gives 3 results in slot 1, 0 in slot 4).
+            // Investigation deferred.
             let mut p = mfsk_core::ft8::decode_block::coarse_sync_with_allsum(
                 &spec, 100.0, 1550.0, 1.0, PASS1_LIMIT, head,
             );

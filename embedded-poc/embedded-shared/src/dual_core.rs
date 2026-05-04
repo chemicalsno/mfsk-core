@@ -171,10 +171,28 @@ extern "C" fn worker_main(_arg: *mut core::ffi::c_void) {
                 let spec_ref = unsafe { &*spec };
                 let allsum =
                     unsafe { core::slice::from_raw_parts(allsum_ptr, allsum_len) };
+                log::info!(
+                    "wkr cs2 spec={:p} n_freq={} n_time={} freq=[{:.0},{:.0}] allsum_ptr={:p} allsum_len={}",
+                    spec_ref as *const _,
+                    spec_ref.n_freq,
+                    spec_ref.n_time,
+                    freq_min,
+                    freq_max,
+                    allsum_ptr,
+                    allsum_len
+                );
                 let result =
                     mfsk_core::ft8::decode_block::coarse_sync_with_allsum(
                         spec_ref, freq_min, freq_max, sync_min, max_cand, allsum,
                     );
+                let first_score = result.first().map(|c| c.score).unwrap_or(0.0);
+                let first_freq = result.first().map(|c| c.freq_hz).unwrap_or(0.0);
+                log::info!(
+                    "wkr cs2 done: len={} first_freq={:.1} first_score={:.0}",
+                    result.len(),
+                    first_freq,
+                    first_score
+                );
                 unsafe {
                     *out = Some(result);
                 }
@@ -328,6 +346,14 @@ pub fn coarse_sync_split_with_allsum(
     // Main runs head in parallel with worker on tail.
     let mut local =
         coarse_sync_with_allsum(spec, freq_min, mid, sync_min, max_cand, allsum_head);
+    let main_first_score = local.first().map(|c| c.score).unwrap_or(0.0);
+    let main_first_freq = local.first().map(|c| c.freq_hz).unwrap_or(0.0);
+    log::info!(
+        "main cs2 head done: len={} first_freq={:.1} first_score={:.0}",
+        local.len(),
+        main_first_freq,
+        main_first_score
+    );
 
     unsafe {
         let _ = ulTaskGenericNotifyTake(1, PD_TRUE, u32::MAX);

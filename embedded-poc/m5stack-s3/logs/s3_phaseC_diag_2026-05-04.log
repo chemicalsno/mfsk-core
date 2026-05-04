@@ -1,0 +1,51 @@
+I (16731) rx_wavsim:   stage 1 (incremental):   59796 us  (184× FFT, 1043 freq bins)
+I (16741) rx_wavsim: main cs2 spec=0x3fcc3638 n_freq=1043 n_time=184 head_ptr=0x3c274960 head_len=91264 tail_ptr=0x3c2ce964 tail_len=91264
+I (16741) embedded_shared::dual_core: wkr cs2 spec=0x3fcc3638 n_freq=1043 n_time=184 freq=[1550,3000] allsum_ptr=0x3c2ce964 allsum_len=91264
+[coarse_sync prof] n_freq=496 n_lag=27  allsum=265 score=135892 dedupe+sort=31323  total=167480 us
+I (16921) embedded_shared::wav_sim: wav_sim: starting WAV[1] (360202 bytes)
+[coarse_sync prof] n_freq=496 n_lag=27  allsum=145 score=136477 dedupe+sort=29656  total=166278 us
+I (16931) embedded_shared::dual_core: wkr cs2 done: len=30 first_freq=2141.6 first_score=7
+I (16941) rx_wavsim:   stage 2 (sync):  201265 us  (30 cand)
+I (17061) rx_wavsim:   pass 2:          121714 us  → top 15
+I (17671) rx_wavsim:   stage 3:         607825 us  (3 result(s))
+I (17671) rx_wavsim:   ─── slot total:  997027 us = 0.997 s
+I (17671) rx_wavsim:   Phase-E PoC: stage1_inc 92 / 92 pairs done, 960986 us total in advance (6% of capture)
+I (17681) rx_wavsim:     [0]  1292 Hz  SNR= -7.7 dB  e=0  'CQ R7IW LN35'
+I (17691) rx_wavsim:     [1]  2095 Hz  SNR=-10.5 dB  e=6  'CQ DX R6WA LN32'
+I (17701) rx_wavsim:     [2]   683 Hz  SNR=-12.6 dB  e=7  'CQ TA6CQ KN70'
+I (32711) rx_wavsim:   stage 1 (incremental):   59805 us  (184× FFT, 1043 freq bins)
+I (32711) rx_wavsim: main cs2 spec=0x3fcc3638 n_freq=1043 n_time=184 head_ptr=0x3c440974 head_len=91264 tail_ptr=0x3c49a978 tail_len=91264
+I (32711) embedded_shared::dual_core: wkr cs2 spec=0x3fcc3638 n_freq=1043 n_time=184 freq=[1550,3000] allsum_ptr=0x3c49a978 allsum_len=91264
+[coarse_sync prof] n_freq=496 n_lag=27  allsum=270 score=138350 dedupe+sort=31833  total=170453 us
+I (32891) embedded_shared::wav_sim: wav_sim: starting WAV[2] (360246 bytes)
+[coarse_sync prof] n_freq=496 n_lag=27  allsum=143 score=138156 dedupe+sort=30121  total=168420 us
+I (32901) embedded_shared::dual_core: wkr cs2 done: len=30 first_freq=2097.7 first_score=5
+I (32911) rx_wavsim:   stage 2 (sync):  203675 us  (30 cand)
+I (33041) rx_wavsim:   pass 2:          122600 us  → top 15
+I (33141) rx_wavsim:   stage 3:         101397 us  (0 result(s))
+I (33141) rx_wavsim:   ─── slot total:  494333 us = 0.494 s
+I (33141) rx_wavsim:   Phase-E PoC: stage1_inc 92 / 92 pairs done, 964173 us total in advance (6% of capture)
+I (48141) rx_wavsim:   stage 1 (incremental):   59803 us  (184× FFT, 1043 freq bins)
+I (48141) rx_wavsim: main cs2 spec=0x3fcc3638 n_freq=1043 n_time=184 head_ptr=0x3c274960 head_len=91264 tail_ptr=0x3c2ce964 tail_len=91264
+I (48141) embedded_shared::dual_core: wkr cs2 spec=0x3fcc3638 n_freq=1043 n_time=184 freq=[1550,3000] allsum_ptr=0x3c2ce964 allsum_len=91264
+[coarse_sync prof] n_freq=496 n_lag=27  allsum=275 score=136051 dedupe+sort=33508  total=169834 us
+I (48321) embedded_shared::wav_sim: wav_sim: starting WAV[0] (360202 bytes)
+[coarse_sync prof] n_freq=496 n_lag=27  allsum=149 score=136812 dedupe+sort=35464  total=172425 us
+I (48331) embedded_shared::dual_core: wkr cs2 done: len=30 first_freq=2622.1 first_score=2030043136
+I (48341) rx_wavsim:   stage 2 (sync):  204291 us  (30 cand)
+I (48471) rx_wavsim:   pass 2:          120878 us  → top 15
+I (48571) rx_wavsim:   stage 3:         102103 us  (0 result(s))
+I (48571) rx_wavsim:   ─── slot total:  493473 us = 0.493 s
+I (48571) rx_wavsim:   Phase-E PoC: stage1_inc 92 / 92 pairs done, 961379 us total in advance (6% of capture)
+I (63571) rx_wavsim:   stage 1 (incremental):   59801 us  (184× FFT, 1043 freq bins)
+I (63571) rx_wavsim: main cs2 spec=0x3fcc3638 n_freq=1043 n_time=184 head_ptr=0x3c440974 head_len=91264 tail_ptr=0x3c49a978 tail_len=91264
+I (63571) embedded_shared::dual_core: wkr cs2 spec=0x3fcc3638 n_freq=1043 n_time=184 freq=[1550,3000] allsum_ptr=0x3c49a978 allsum_len=91264
+[coarse_sync prof] n_freq=496 n_lag=27  allsum=266 score=138413 dedupe+sort=31718  total=170397 us
+I (63751) embedded_shared::wav_sim: wav_sim: starting WAV[1] (360202 bytes)
+[coarse_sync prof] n_freq=496 n_lag=27  allsum=151 score=138111 dedupe+sort=30390  total=168652 us
+I (63761) embedded_shared::dual_core: wkr cs2 done: len=30 first_freq=2135.7 first_score=7
+I (63771) rx_wavsim:   stage 2 (sync):  203682 us  (30 cand)
+I (63901) rx_wavsim:   pass 2:          121702 us  → top 15
+I (64001) rx_wavsim:   stage 3:         102063 us  (0 result(s))
+I (64001) rx_wavsim:   ─── slot total:  494044 us = 0.494 s
+I (64001) rx_wavsim:   Phase-E PoC: stage1_inc 92 / 92 pairs done, 962964 us total in advance (6% of capture)
