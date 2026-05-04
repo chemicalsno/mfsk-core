@@ -410,113 +410,106 @@ mfsk-core はデコード/エンコードパイプラインまでです。以下
 あって、メンテされるアプリケーションではありません。他ターゲットは
 独自の glue を書いてください。中身を template として参照してください。
 
-## パフォーマンスベンチマーク (Core2 LX6, `fixed-point`)
+## パフォーマンスベンチマーク
 
-m5stack-core2 バイナリにベイクされた 3 つの実 QSO 録音を、3 sweep
-連続デコード。stage 内訳は 1 周目 (cold cache)、合計レンジは 3 sweep
-の最小〜最大。
+3 つの実 QSO 録音 (12 kHz / mono / i16 PCM、各 ≈ 360 KB) をバイナリに
+ベイクし、`rx-wavsim` streaming bench が queue pipeline に real-time
+pace で push、WAV 完了 notify ごとに 1 slot decode する構成で計測。
+**post-SlotEnd** = SlotEnd notify から「decode 完了」までの wall-clock
+= ユーザ体感 RX latency (stage 2 は capture 末尾と並列実行されるため
+この budget には入らない。「Streaming RX pipeline アーキテクチャ」節
+参照)。
 
-| WAV | 結果 | stage 1 (spec) | stage 2 (sync) | stage 3 (refine + BP) | **合計レンジ** |
-|---|---|---|---|---|---|
-| qso1 (mid-band, 3 局) | 3/3 vs `decode_frame` | 1.01 s | 0.77 s | 0.69 s | **2.87 – 3.24 s** |
-| qso2 (mid-band, 5 局) | 5/5 vs `decode_frame` | 1.01 s | 0.77 s | 0.92 s | **3.10 – 3.47 s** |
-| qso3 (busy band, 10 局のうち ≥7) | 7 (block-only 含む) | 1.01 s | 0.75 s | 1.83 s | **3.99 – 4.36 s** |
+`q_thresh = 12` (production デフォルト、full recall)。
 
-- **Stage 1** = spectrogram。92 × N=4096 i16 complex FFT を two-for-one
-  real-FFT trick で実行 (`compute_spectrogram` under `fixed-point`)。
-- **Stage 2** = 991 carrier bin × 27 lag の Costas 粗同期。LX6/LX7 では
-  FPU-add 律速 — f32 allsum を FPU で動かしつつインデックス計算を ALU で
-  並列化できる。i32 化すると両方が ALU に直列化して ~25 % stage-2
-  wall-clock を浪費するため、整数 coarse_sync feature は廃止済み。
-- **Stage 3** = 候補ごとの refine fill + LLR + BP staircase。
-  Core2 では OSD off (`OSD_ENABLED=false` in 例の main.rs)。
-  qso1 (3 結果) と qso3 (7 結果) の差は、結果あたりの fill +
-  Step-2 BP variant コスト。
+| WAV | 結果 | Core2 LX6 post-SlotEnd | S3 LX7 post-SlotEnd |
+|---|---|---:|---:|
+| qso1 (mid-band, 3 局)        | 3/3 ✓ | **1.303 s** | **0.574 s** |
+| qso2 (mid-band, 5 局)        | 5/5 ✓ | **0.632 s** | **0.370 s** |
+| qso3 (busy band, 7 局)       | 7/7 ✓ | **1.434 s** | **0.707 s** |
 
-3 sweep 通して recall は維持。後続 sweep の ~10 % drift は
-allocator と PSRAM cache の warm-up。
+Recall: 両 chip で ground-truth 15/15、`N1PJT` -18.2 dB、`OH3NIV` /
+`LZ1JZ` -17.9 / -18.0 dB の弱信号も含む。phantom 無し。
 
-生モニタログ:
-`embedded-poc/m5stack-core2/logs/release_0_5_0_2026-05-02.log`
-(0.5.0 リリース sweep) + コミットごとの perf-chain ログ
-(`stage3_bp_pool`, `stage3_syncblocks12`, `stage3_lazy_llr`,
-`two_for_one`, `phase3_coarse_i32`)。
+ステージ別内訳 (qso3 busy band):
 
-### Dual-core + Phase E (0.5.3)
+| stage | Core2 LX6 | S3 LX7 | 備考 |
+|---|---:|---:|---|
+| stage 1 (incremental, capture 中) | ≈ 1.0 s 分の compute / 15 s | 同 | capture CPU 利用率 ~6 % |
+| stage 2 `coarse_sync_split_with_allsum` (capture 中) | 0.65 s | 0.18 s | SlotEnd notify latency と並列、隠蔽済 |
+| pass 2 `pass2_split` (post-SlotEnd) | 0.19 s | 0.12 s | dual-core, head/tail split |
+| stage 3 `stage3_split` (post-SlotEnd) | 1.24 s | 0.58 s | dual-core, **work-stealing** per-cand |
 
-A 〜 E まで完全に積んだ pipeline 並列化 (FFT prewarm; per-core BASIS
-scratch; Pass 2 / Stage 3 / Stage 2 を PRO_CPU と APP_CPU で半分割;
-incremental stage 1 を capture window に隠蔽) で、同じ 3 録音が
-Core2 LX6 上で **sub-2 s** 帯に落ちます。`rx-wavsim` streaming bench
-(baked WAV を `mfsk_ft8_stream_*` ring に real-time pace で push、
-WAV 完了 notify で 1 slot decode) end-to-end の数値:
+両 chip がこのレンジに乗っている wall-clock 改善は 2 つ:
 
-| WAV | 結果 | stage 1 (take) | stage 2 | pass 2 | stage 3 | **合計** |
-|---|---|---|---|---|---|---|
-| qso1 (mid-band, 3 局) | 3/3 ✓ | 0.05 s | 0.68 s | 0.18 s | 0.92 s | **1.83 s** |
-| qso2 (mid-band, 5 局) | 5/5 ✓ | 0.05 s | 0.68 s | 0.18 s | 0.54 s | **1.45 s** |
-| qso3 (busy band, 7 局) | 7/7 ✓ | 0.05 s | 0.65 s | 0.18 s | 1.10 s | **1.98 s** |
+1. **Stage 2 を capture 中に隠蔽。** `stage1_inc` が pair 92 完成時
+   (SlotEnd の ~200 ms 前) に `SpecBundle` (spec + per-half allsum)
+   を `spec_q` で送出。main 側は audio capture 末尾と並列で
+   `coarse_sync_split_with_allsum` を実行 → post-SlotEnd budget に
+   は入らない。
+2. **Stage 3 work-stealing。** `dual_core::stage3_split` は candidate
+   を事前分割しない。PRO_CPU / APP_CPU が共有
+   `Vec<Option<RefinedCandidate>>` から `AtomicUsize::fetch_add(1)`
+   で動的に取り合うため、失敗 cand が偏って片方が手待ちになる事態が
+   発生しない。qso3 (15 cand 中 ~半数が失敗して 4 LLR variant 全
+   走り) の per-cand BP wall-clock 不均衡を吸収する。
 
-Recall: 3 WAV 通算 15/15 ground-truth callsign 全て decode、qso3 の
--18.2 dB `N1PJT` や qso2 の -17.9 / -18.0 dB (`OH3NIV`, `LZ1JZ`) も
-含む。phantom 無し。
+生ログ:
+`embedded-poc/m5stack-core2/logs/core2_q_sweep_2026-05-04.log`、
+`embedded-poc/m5stack-s3/logs/s3_workstealing_2026-05-04.log`。
 
-- **Stage 1** は `take_spec()` が返すだけ。実体は `stage1_inc.rs` の
-  APP_CPU worker が slot capture (15 s) の間に増分計算済み。
-  Per-pair FFT (~5 ms each) は audio chunk 到着のたびに発火、累計
-  ~1.0 s 分の compute が 15 s window に分散 (~6 % CPU 利用)。decode
-  latency budget からは実質ゼロコスト。
-- **Stage 2** は `coarse_sync_split` で carrier bin range を半分割
-  (worker が 1 550 Hz 以上、main が 下半。`score` 降順マージ→
-  PASS1_LIMIT 切り詰め)。`coarse_sync` は setup / sort / dedupe が
-  支配的なので gain は控えめ (-9 % 単独)。
-- **Pass 2** (sync_quality_block0 re-rank) と **Stage 3** (refine
-  + BP staircase) も per-cand で半分割。各 core が専用 60 KB の
-  Q15 BASIS scratch (内部 DRAM 常駐) を持つため、esp-dsp asm dot
-  product が両 core で 1 cycle/sample で走る。
+## Streaming RX pipeline アーキテクチャ
 
-生ログ: `embedded-poc/m5stack-core2/logs/rx_wavsim_phaseE_2026-05-03.log`。
+Phase E 後の pipeline (`embedded-poc/embedded-shared` 配下) は
+**queue ベース、slot 単位の単一所有権** — 共有 mutable state なし、
+notify と out-pointer の分離なし:
 
-Compute bench (`main.rs` sweep、streaming overlap 無し) の同時期
-スナップショットは dual-core only の数値 (qso3 3.22 s) を出します;
-log: `dual_core_phase_abcd_2026-05-03.log`。この 3.22 s と streaming
-版 1.98 s の 1.24 s 差が、まさに Phase E が capture window 下に
-隠した stage 1 の wall-clock です。
+```
+wav_sim (PRO_CPU, prio 4)
+  │
+  │  ChunkMsg = Samples(Vec<i16>) | SlotEnd { wav_idx, total_samples }
+  ▼
+chunk_q (depth 4)
+  │
+  ▼
+stage1_inc worker (APP_CPU, prio 3)
+  │  内部状態: per-slot WorkerCtx { audio, spec, allsum_head/tail,
+  │                                 next_pair, … }
+  │  pair 92 完成と同時 (SlotEnd の ~200 ms 前) に SpecBundle を発火 →
+  │  main は capture 末尾と並列で stage 2 を回せる
+  │
+  ├──▶ spec_q (depth 2): SpecBundle { spec, allsum_head, allsum_tail }
+  └──▶ slot_q (depth 2): Slot { audio, wav_idx, inc_total_us }
+       (SlotEnd ChunkMsg を受けてから)
+       │
+       ▼
+main / decode task (PRO_CPU, prio 6)
+       │  spec_q recv → stage 2 (coarse_sync_split_with_allsum, dual-core)
+       │  slot_q recv → pass 2 (refine_candidates, dual-core)
+       │              → stage 3 (per-cand work-stealing, dual-core)
+       ▼
+DecodeResult[]
+```
 
-### S3 LX7 (M5StickS3) — post-SlotEnd で sub-1 s
+`dual_core` が stage 2 / pass 2 / stage 3 用の dispatch queue を別途
+保持 (1 つの job queue + variant ごとの result queue)。所有権の移動は
+すべて `Box::into_raw` の生ポインタを queue item に乗せる方式 —
+host の `mpsc::sync_channel` と同等のセマンティクス。
 
-同じ pipeline を ESP32-S3 LX7 (stage 1/2 の dot product に PIE SIMD
-が効く以外は Core2 と同一) で動かすと、3 つの WAV 全てが
-**post-SlotEnd 1 秒以内** で復号完了します (relaxed-recall 不使用):
+Pipeline 不変条件:
+- wav_sim は 1 slot 内で Samples / SlotEnd を FIFO 順に送る。
+- stage1_inc は SpecBundle を 1 slot あたり最大 1 回だけ送る
+  (`next_pair == N_PAIRS` 到達直後、または `finalize_slot` 時の
+  fallback)。
+- main は SpecBundle と Slot を受信順 (FIFO) でペアリング。
+- main は `STAGE3_RESULT_Q` recv で block するので、worker 側の
+  生ポインタ (audio, cs scratch, work-stealing slot array) は
+  関数呼び出し時間内ずっと有効。
 
-| WAV | 結果 | post-SlotEnd | stage 2 (capture 中) | pass 2 | stage 3 |
-|---|---|---:|---:|---:|---:|
-| qso1 (mid-band, 3 局) | 3/3 ✓ | **0.574 s** | 0.18 s (隠蔽) | 0.12 s | 0.44 s |
-| qso2 (mid-band, 5 局) | 5/5 ✓ | **0.370 s** | 0.18 s (隠蔽) | 0.12 s | 0.24 s |
-| qso3 (busy band, 7 局) | 7/7 ✓ | **0.707 s** | 0.18 s (隠蔽) | 0.12 s | 0.58 s |
-
-Core2 の数値と比べた wall-clock 改善は 2 つ:
-
-1. **Stage 2 が capture 末尾と並列実行され隠蔽される。**
-   `stage1_inc` が pair 92 完成時 (SlotEnd の ~200 ms 前) に
-   `SpecBundle` (spec + per-half allsum) を `spec_q` queue で送出し、
-   main 側は audio capture 末尾と並列で `coarse_sync_split_with_allsum`
-   を実行。post-SlotEnd の budget には入らない。
-   `embedded_shared::pipeline::SpecBundle` と
-   `embedded_shared::stage1_inc::worker_main` の `emit_spec_bundle`
-   呼び出し参照。
-2. **Stage 3 work-stealing。** `dual_core::stage3_split` は
-   candidate を head / tail に事前分割しない。PRO_CPU と APP_CPU が
-   共有 `Vec<Option<RefinedCandidate>>` から `AtomicUsize::fetch_add(1)`
-   で動的に取り合う。失敗 cand が偏って一方が手待ちになる事態が
-   原理的に発生しない。qso3 (15 cand 中 7 が失敗、4 LLR variant
-   全部走る) で stage 3 単独 0.81 s → 0.58 s (-28 %)。
-
-生ログ: `embedded-poc/m5stack-s3/logs/s3_workstealing_2026-05-04.log`。
-
-Recall は完全保持 (decode メッセージ・SNR・hard error count が固定
-分割版と bit-identical)。MAX_CAND=15、PASS1_LIMIT=30、relaxed-recall
-は使用していない。
+参照: `embedded-poc/embedded-shared/src/pipeline.rs` (queue helper +
+`ChunkMsg`/`SpecBundle`/`Slot` 型) と
+`embedded-poc/embedded-shared/src/dual_core.rs` (work-stealing stage 3
+dispatch + Job enum)。
 
 ## バイナリフットプリント (Core2 リファレンス, ELF)
 

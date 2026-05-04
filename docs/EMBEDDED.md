@@ -513,123 +513,109 @@ of those (using esp-idf-svc) for one specific board — it is an
 should expect to write their own glue. Reference what's there as a
 template; copy what's useful.
 
-## Performance benchmark (Core2 LX6, `fixed-point`)
+## Performance benchmark
 
-Three on-air recordings baked into the m5stack-core2 binary as WAV
-assets, decoded back-to-back over three full sweeps. Per-stage
-breakdown from the first (cold-cache) iteration; total range is the
-min–max across three iterations.
+Three on-air recordings baked in as WAV assets (12 kHz / mono / i16
+PCM, ≈ 360 KB each), decoded by the `rx-wavsim` streaming bench which
+pumps them into the queue pipeline at real-time pace and decodes one
+slot per WAV-completion notify. **post-SlotEnd** = wall-clock from
+SlotEnd notify to "decode done" — i.e. user-perceivable RX latency
+(stage 2 runs during the tail of audio capture, hidden from this
+budget; see "Streaming RX pipeline architecture" below).
 
-| WAV | results | stage 1 (spec) | stage 2 (sync) | stage 3 (refine + BP) | **total range** |
-|---|---|---|---|---|---|
-| qso1 (mid-band, 3 stations) | 3/3 vs `decode_frame` | 1.01 s | 0.77 s | 0.69 s | **2.87 – 3.24 s** |
-| qso2 (mid-band, 5 stations) | 5/5 vs `decode_frame` | 1.01 s | 0.77 s | 0.92 s | **3.10 – 3.47 s** |
-| qso3 (busy band, ≥7 of 10 stations) | 7 incl. block-only | 1.01 s | 0.75 s | 1.83 s | **3.99 – 4.36 s** |
+`q_thresh = 12` (production default, full recall).
 
-- **Stage 1** = spectrogram, dominated by 92 × N=4096 i16 complex
-  FFTs via the two-for-one real-FFT trick (see `compute_spectrogram`
-  under `fixed-point`).
-- **Stage 2** = coarse Costas correlation across 991 carrier bins ×
-  27 lags. FPU-add bound on LX6/LX7 — the f32 allsum path overlaps
-  with integer index arithmetic on the ALU; an integer-only variant
-  (formerly the `fixed-point-coarse-i32` feature) was retired since
-  it serialised both onto the ALU and cost ~25 % stage-2 wall-clock.
-- **Stage 3** = per-candidate refine fill + LLR + BP staircase.
-  OSD off on Core2 (`OSD_ENABLED=false` in the example main.rs);
-  the spread between qso1 (3 results) and qso3 (7 results) is from
-  the per-result fill + Step-2 BP variant cost.
+| WAV | results | Core2 LX6 post-SlotEnd | S3 LX7 post-SlotEnd |
+|---|---|---:|---:|
+| qso1 (mid-band, 3 stations)        | 3/3 ✓ | **1.303 s** | **0.574 s** |
+| qso2 (mid-band, 5 stations)        | 5/5 ✓ | **0.632 s** | **0.370 s** |
+| qso3 (busy band, 7 stations)       | 7/7 ✓ | **1.434 s** | **0.707 s** |
 
-Recall is preserved across all three iterations. Iteration-to-
-iteration drift (~10 %) on later runs is allocator and PSRAM cache
-warm-up.
+Recall: 15/15 ground-truth callsigns on both chips, including weak
+signals down to -18.2 dB (`N1PJT`), -17.9 / -18.0 dB (`OH3NIV`,
+`LZ1JZ`). Phantom-free.
 
-Raw monitor logs:
-`embedded-poc/m5stack-core2/logs/release_0_5_0_2026-05-02.log`
-(latest 0.5.0 release sweep) plus per-commit perf-chain logs
-(`stage3_bp_pool`, `stage3_syncblocks12`, `stage3_lazy_llr`,
-`two_for_one`, `phase3_coarse_i32`).
+Per-stage breakdown (qso3 busy band):
 
-### Dual-core + Phase E (0.5.3)
+| stage | Core2 LX6 | S3 LX7 | notes |
+|---|---:|---:|---|
+| stage 1 (incremental, during capture) | ≈ 1.0 s of compute over 15 s | same | ~6 % capture CPU |
+| stage 2 `coarse_sync_split_with_allsum` (during capture) | 0.65 s | 0.18 s | hidden under SlotEnd notify latency |
+| pass 2 `pass2_split` (post-SlotEnd) | 0.19 s | 0.12 s | dual-core, head/tail split |
+| stage 3 `stage3_split` (post-SlotEnd) | 1.24 s | 0.58 s | dual-core, **work-stealing** per-cand |
 
-With the full A-through-E pipeline parallelism (FFT prewarm; per-core
-BASIS scratch; Pass 2 / Stage 3 / Stage 2 each split across PRO_CPU
-and APP_CPU; incremental stage 1 hidden under capture), the same
-three recordings drop into the **sub-2 s** range on the same Core2
-LX6 hardware. End-to-end via the `rx-wavsim` streaming bench, which
-pumps the baked WAVs into the `mfsk_ft8_stream_*` ring at real-time
-pace and decodes one slot per WAV-completion notify:
+The two wall-clock improvements that put both chips in this range:
 
-| WAV | results | stage 1 (take) | stage 2 | pass 2 | stage 3 | **total** |
-|---|---|---|---|---|---|---|
-| qso1 (mid-band, 3 stations) | 3/3 ✓ | 0.05 s | 0.68 s | 0.18 s | 0.92 s | **1.83 s** |
-| qso2 (mid-band, 5 stations) | 5/5 ✓ | 0.05 s | 0.68 s | 0.18 s | 0.54 s | **1.45 s** |
-| qso3 (busy band, 7 stations) | 7/7 ✓ | 0.05 s | 0.65 s | 0.18 s | 1.10 s | **1.98 s** |
-
-Recall: 15/15 ground-truth callsigns across all three WAVs, including
-weak signals down to -18.2 dB (`N1PJT`) on qso3 and -17.9 / -18.0 dB
-(`OH3NIV`, `LZ1JZ`) on qso2. Phantom-free.
-
-- **Stage 1** is now `take_spec()` returning the spectrogram that
-  `stage1_inc.rs`'s APP_CPU worker has been building incrementally
-  during the slot's 15 s capture window. Per-pair FFTs (~5 ms each)
-  fire as audio chunks arrive; ~1.0 s of cumulative compute is
-  distributed across the 15 s window (~6 % CPU utilisation),
-  leaving stage 1 effectively zero-cost in the post-slot decode
-  budget.
-- **Stage 2** halves across PRO_CPU and APP_CPU via
-  `coarse_sync_split` (worker handles upper-half carriers ≥ 1 550 Hz,
-  main runs the lower half; results merged by `score` descending and
-  truncated to PASS1_LIMIT). Modest gain (-9 % vs single core)
-  because `coarse_sync` is dominated by setup / sort / dedupe.
-- **Pass 2** (sync_quality_block0 re-rank) and **Stage 3** (refine +
-  BP staircase) likewise split per-candidate across cores. Each core
-  uses its own 60 KB Q15 BASIS scratch in internal DRAM so the esp-dsp
-  asm dot product runs at 1 cycle/sample on both halves.
-
-Raw log: `embedded-poc/m5stack-core2/logs/rx_wavsim_phaseE_2026-05-03.log`.
-
-The compute bench (`main.rs` sweep, no streaming overlap) at the same
-point in history produces the dual-core-only numbers (qso3 3.22 s);
-log: `dual_core_phase_abcd_2026-05-03.log`. The 1.24 s gap between
-that and the streaming `rx-wavsim` total is exactly what Phase E hides
-under capture.
-
-### S3 LX7 (M5StickS3) — sub-1 s post-SlotEnd
-
-The same pipeline on ESP32-S3 LX7 (PIE SIMD on stage 1/2 dot products,
-otherwise identical to Core2) decodes the same three WAVs in **under
-1 s of post-SlotEnd wall-clock**, no relaxed-recall:
-
-| WAV | results | post-SlotEnd | stage 2 (during cap) | pass 2 | stage 3 |
-|---|---|---:|---:|---:|---:|
-| qso1 (mid-band, 3 stations) | 3/3 ✓ | **0.574 s** | 0.18 s (hidden) | 0.12 s | 0.44 s |
-| qso2 (mid-band, 5 stations) | 5/5 ✓ | **0.370 s** | 0.18 s (hidden) | 0.12 s | 0.24 s |
-| qso3 (busy band, 7 stations) | 7/7 ✓ | **0.707 s** | 0.18 s (hidden) | 0.12 s | 0.58 s |
-
-Two wall-clock improvements vs the Core2 numbers above:
-
-1. **Stage 2 is hidden under capture.** `stage1_inc` ships its
+1. **Stage 2 hidden under capture.** `stage1_inc` ships its
    `SpecBundle` (spec + per-half allsums) on the spec_q queue as soon
    as pair 92 finalises (≈ 200 ms before SlotEnd), so main runs
    `coarse_sync_split_with_allsum` in parallel with the tail of audio
-   capture instead of inside the post-SlotEnd budget. See
-   `embedded_shared::pipeline::SpecBundle` and the
-   `embedded_shared::stage1_inc::worker_main` `emit_spec_bundle` call.
-2. **Stage 3 work-stealing.** `dual_core::stage3_split` no longer
-   pre-splits candidates into head / tail. Both PRO_CPU and APP_CPU
+   capture instead of inside the post-SlotEnd budget.
+2. **Stage 3 work-stealing.** `dual_core::stage3_split` does not
+   pre-split candidates into head / tail. Both PRO_CPU and APP_CPU
    pull the next candidate from a shared
-   `Vec<Option<RefinedCandidate>>` via `AtomicUsize::fetch_add(1)`;
-   the busier core can't stall on a slow / failing candidate that
-   landed on the other side. On qso3 (where ~7 of 15 cands fail
-   and run all four LLR variants), this knocked stage 3 from
-   0.81 s → 0.58 s on its own (-28 %).
+   `Vec<Option<RefinedCandidate>>` via `AtomicUsize::fetch_add(1)`,
+   so the busier core can't stall on a slow / failing candidate
+   that landed on the other side. On qso3 (where ~half of 15 cands
+   fail and run all four LLR variants), this absorbs the per-cand
+   BP wall-clock variance.
 
-Raw log:
+Raw logs:
+`embedded-poc/m5stack-core2/logs/core2_q_sweep_2026-05-04.log`,
 `embedded-poc/m5stack-s3/logs/s3_workstealing_2026-05-04.log`.
 
-Recall is fully preserved (decoded messages bit-identical to the
-prior fixed-split run; SNR / hard-error counts identical). MAX_CAND=15,
-PASS1_LIMIT=30, no relaxed-recall.
+## Streaming RX pipeline architecture
+
+The post-Phase-E pipeline (wired up in `embedded-poc/embedded-shared`)
+is **queue-based, single-ownership per slot** — no shared mutable
+state, no notify-and-out-pointer split:
+
+```
+wav_sim (PRO_CPU, prio 4)
+  │
+  │  ChunkMsg = Samples(Vec<i16>) | SlotEnd { wav_idx, total_samples }
+  ▼
+chunk_q (depth 4)
+  │
+  ▼
+stage1_inc worker (APP_CPU, prio 3)
+  │  internal: per-slot WorkerCtx { audio, spec, allsum_head/tail,
+  │                                 next_pair, … }
+  │  fires SpecBundle as soon as pair 92 lands (≈ 200 ms before
+  │  SlotEnd) so main can start stage 2 during the tail of capture
+  │
+  ├──▶ spec_q (depth 2): SpecBundle { spec, allsum_head, allsum_tail }
+  └──▶ slot_q (depth 2): Slot { audio, wav_idx, inc_total_us }
+       (after the SlotEnd ChunkMsg)
+       │
+       ▼
+main / decode task (PRO_CPU, prio 6)
+       │  recv spec_q → stage 2 (coarse_sync_split_with_allsum, dual-core)
+       │  recv slot_q → pass 2 (refine_candidates, dual-core)
+       │              → stage 3 (work-stealing per-cand, dual-core)
+       ▼
+DecodeResult[]
+```
+
+`dual_core` exposes a separate set of FreeRTOS Queues for stage 2 /
+pass 2 / stage 3 dispatch (one job queue + one per-variant result
+queue). All ownership transfers via `Box::into_raw` raw-pointer items
+on the queues — host-`mpsc::sync_channel`-equivalent semantics.
+
+Pipeline invariants:
+- wav_sim sends Samples / SlotEnd for one slot in FIFO order.
+- stage1_inc emits SpecBundle at most once per slot (first time
+  `next_pair == N_PAIRS`, or fallback in `finalize_slot` if pair 92
+  never landed).
+- main pairs SpecBundle ↔ Slot by FIFO order of receipt.
+- main blocks on `STAGE3_RESULT_Q` recv before returning, so
+  worker-side raw pointers (audio, cs scratch, work-stealing slot
+  array) outlive the worker's access for the duration of the call.
+
+See `embedded-poc/embedded-shared/src/pipeline.rs` (queue helpers +
+`ChunkMsg`/`SpecBundle`/`Slot` types) and
+`embedded-poc/embedded-shared/src/dual_core.rs` (the work-stealing
+stage 3 dispatch + Job enum).
 
 ## Binary footprint (Core2 reference, `xtensa-esp32-elf-size -A`)
 
