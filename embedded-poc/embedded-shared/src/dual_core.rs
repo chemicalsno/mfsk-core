@@ -28,6 +28,7 @@
 
 use core::cell::UnsafeCell;
 use core::ptr;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use esp_idf_svc::sys::{
     xQueueGenericCreate, xQueueGenericSend, xQueueReceive, xTaskCreatePinnedToCore,
@@ -35,6 +36,7 @@ use esp_idf_svc::sys::{
 };
 
 use alloc::boxed::Box;
+use alloc::vec;
 use alloc::vec::Vec;
 
 use mfsk_core::core::sync::SyncCandidate;
@@ -62,11 +64,19 @@ enum Job {
         cands: Vec<SyncCandidate>,
         max_cand: usize,
     },
-    Stage3 {
+    /// Work-stealing stage 3: both main and worker pull individual
+    /// candidates from a shared `Vec<Option<RefinedCandidate>>` via
+    /// `next_idx.fetch_add(1)`. Per-cand BP wall-clock varies a lot
+    /// (failed cands run all 4 LLR variants); a static head/tail split
+    /// stalls one core waiting for the other. Dynamic dispatch keeps
+    /// both cores busy until the queue drains.
+    Stage3WorkSteal {
         audio: *const i16,
         audio_len: usize,
-        cands: Vec<RefinedCandidate>,
         depth: DecodeDepth,
+        slots_ptr: *mut Option<RefinedCandidate>,
+        slots_len: usize,
+        next_idx: *const AtomicUsize,
     },
     CoarseSyncWithAllsum {
         spec: *const Spectrogram,
@@ -175,18 +185,22 @@ extern "C" fn worker_main(_arg: *mut core::ffi::c_void) {
                 let raw = Box::into_raw(Box::new(result));
                 unsafe { queue_send_ptr(PASS2_RESULT_Q.get(), raw) };
             }
-            Job::Stage3 {
+            Job::Stage3WorkSteal {
                 audio,
                 audio_len,
-                cands,
                 depth,
+                slots_ptr,
+                slots_len,
+                next_idx,
             } => {
                 let audio_slice = unsafe { core::slice::from_raw_parts(audio, audio_len) };
                 #[allow(static_mut_refs)]
                 let result = unsafe {
-                    process_candidates_into_with_cs_scratch(
+                    drain_stage3_queue(
                         audio_slice,
-                        cands,
+                        slots_ptr,
+                        slots_len,
+                        &*next_idx,
                         depth,
                         &mut BASIS_RE_C1,
                         &mut BASIS_IM_C1,
@@ -347,8 +361,13 @@ pub fn pass2_split(
     local
 }
 
-/// Stage 3 split across main + worker. Per-cand results are
-/// independent, so concatenated.
+/// Stage 3 across main + worker with **work-stealing** dispatch.
+///
+/// Both cores share the same `Vec<Option<RefinedCandidate>>` and pull
+/// candidates by `AtomicUsize::fetch_add(1)`, so a slow / failed cand
+/// on one core doesn't stall the other. Compared to the old
+/// fixed head/tail split, this absorbs the per-cand BP wall-clock
+/// variance (qso3 ~7 of 15 cands fail and run all 4 LLR variants).
 pub fn stage3_split(
     audio: &[i16],
     pass2: Vec<RefinedCandidate>,
@@ -356,23 +375,32 @@ pub fn stage3_split(
     basis_re_main: &mut [i16],
     basis_im_main: &mut [i16],
 ) -> Vec<DecodeResult> {
-    let mid = pass2.len() / 2;
-    let mut head = pass2;
-    let tail = head.split_off(mid);
+    let mut slots: Vec<Option<RefinedCandidate>> = pass2.into_iter().map(Some).collect();
+    let next_idx = AtomicUsize::new(0);
 
-    let job = Box::new(Job::Stage3 {
+    let slots_ptr = slots.as_mut_ptr();
+    let slots_len = slots.len();
+    let next_idx_ptr: *const AtomicUsize = &next_idx;
+
+    // Dispatch worker — it will drain the same queue from APP_CPU.
+    let job = Box::new(Job::Stage3WorkSteal {
         audio: audio.as_ptr(),
         audio_len: audio.len(),
-        cands: tail,
         depth,
+        slots_ptr,
+        slots_len,
+        next_idx: next_idx_ptr,
     });
     unsafe { queue_send_ptr(JOB_Q.get(), Box::into_raw(job)) };
 
+    // Main drains in parallel.
     #[allow(static_mut_refs)]
     let mut local = unsafe {
-        process_candidates_into_with_cs_scratch(
+        drain_stage3_queue(
             audio,
-            head,
+            slots_ptr,
+            slots_len,
+            &next_idx,
             depth,
             basis_re_main,
             basis_im_main,
@@ -383,6 +411,49 @@ pub fn stage3_split(
     let worker_ptr = unsafe { queue_recv_ptr::<Vec<DecodeResult>>(STAGE3_RESULT_Q.get()) };
     let worker = unsafe { *Box::from_raw(worker_ptr) };
 
+    // `slots` is now drained (all Options taken); drop is fine.
+    drop(slots);
+
     local.extend(worker);
     local
+}
+
+/// Pop candidates from a shared atomic-indexed slot array and process
+/// them one at a time, accumulating successful decodes.
+///
+/// SAFETY: `slots_ptr` must point to `slots_len` valid
+/// `Option<RefinedCandidate>` cells, and `next_idx` claims an exclusive
+/// index per `fetch_add` so the same slot is never read by two callers.
+unsafe fn drain_stage3_queue(
+    audio: &[i16],
+    slots_ptr: *mut Option<RefinedCandidate>,
+    slots_len: usize,
+    next_idx: &AtomicUsize,
+    depth: DecodeDepth,
+    basis_re: &mut [i16],
+    basis_im: &mut [i16],
+    cs_scratch: &mut [[mfsk_core::core::scalar::Cmplx<f32>; 8]; 79],
+) -> Vec<DecodeResult> {
+    let mut out: Vec<DecodeResult> = Vec::new();
+    loop {
+        let i = next_idx.fetch_add(1, Ordering::AcqRel);
+        if i >= slots_len {
+            break;
+        }
+        // SAFETY: the atomic fetch_add gives this caller exclusive
+        // ownership of slot `i` for the duration of this iteration.
+        let cand = unsafe { (*slots_ptr.add(i)).take() };
+        let Some(cand) = cand else { continue };
+        let mut single = vec![cand];
+        let mut results = process_candidates_into_with_cs_scratch(
+            audio,
+            core::mem::take(&mut single),
+            depth,
+            basis_re,
+            basis_im,
+            cs_scratch,
+        );
+        out.append(&mut results);
+    }
+    out
 }
