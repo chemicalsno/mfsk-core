@@ -531,16 +531,24 @@ verified bit-identical via `cmp` 2026-05-04). `qso1` / `qso2` are
 informational on-air captures — useful as breadth but not formal
 reference.
 
-| WAV | results | Core2 LX6 post-SlotEnd | S3 LX7 post-SlotEnd |
-|---|---|---:|---:|
-| qso1 (mid-band, 3 stations)            | 3/3 ✓ | **1.303 s** | **0.574 s** |
-| qso2 (mid-band, 5 stations)            | 5/5 ✓ | **0.632 s** | **0.370 s** |
-| **qso3 busy band (WSJT-X reference)**  | 7/7 ✓ | **1.434 s** | **0.707 s** |
+| WAV | S3 LX7 post-SlotEnd (0.5.5) | decoded |
+|---|---:|---:|
+| qso1 (mid-band)                        | **1.01 s** | 3 |
+| qso2 (mid-band)                        | **1.58 s** | 3 |
+| **qso3 busy band (WSJT-X reference)**  | **1.28 s** | **6 / 18 JTDX** |
 
-Recall on the embedded budget (PASS1=30, max_cand=15, BpAll, q=12,
-no OSD): 15/15 callsigns recovered including weak signals down to
--18.2 dB (`N1PJT`), -17.9 / -18.0 dB (`OH3NIV`, `LZ1JZ`).
-Phantom-free.
+Recall on the 0.5.5 LX7 ship config (`pass1=30 max_cand=15 q=6 BP=30`,
+`nstep-half` feature, rectangular pre-FFT window). qso3 set: F5RXL,
+W1FC F5BZB, A92EE F5PSR, WM3PEN EA6VQ, N1JFU EA6EE, K1JT HA0DU. The
+remaining JTDX-confirmed signals are bounded by the absence of
+`fine_refine_pass1`'s 192k-FFT cd0 chain on Xtensa (structural ceiling,
+not a tuning miss).
+
+Earlier 0.5.4-era figures here had qso3 = 7 callsigns on a 13-truth
+list at 0.707 s with Hann window + the now-fixed embedded path; the
+0.5.5 numbers above use the JTDX 18-entry golden as the recall axis
+and the corrected rectangular window. See `CHANGELOG.md` for the
+regression diagnosis.
 
 ### vs host wide-band on the WSJT-X reference
 

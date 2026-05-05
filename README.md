@@ -277,11 +277,15 @@ reference:
 cargo-style minor bumps (`0.4 → 0.5`). The 0.4.x line landed the
 embedded baseline (`no_std + alloc`, pluggable FFT backend,
 caller-buffer TX APIs); 0.5.0 ships the first end-to-end real-audio
-embedded port — M5Stack Core2 (Xtensa LX6) decoding 3-7 FT8 results
-per 14 s slot in ~3.0–4.0 s wall-clock. See
+embedded port. Latest M5StickS3 (Xtensa LX7) ship config decodes
+**6 / 18 JTDX-golden FT8 callsigns** on the WSJT-X-distributed busy-band
+reference (`samples/FT8/210703_133430.wav`) in **~1.3 s post-SlotEnd**
+via the streaming pipeline (FFT overlapped with capture). M5Stack
+Core2 (LX6) on the same WAV ~2.8 s. See
 [`docs/EMBEDDED.md`](https://github.com/jl1nie/mfsk-core/blob/main/docs/EMBEDDED.md)
-for the integration contract; `embedded-poc/m5stack-core2/` is the
-working example binary.
+for the integration contract and 0.5.5's runtime BP / `nstep-half`
+tuning knobs; `embedded-poc/m5stack-{s3,core2}/` are the working
+example binaries.
 
 Algorithm correctness is covered by the workspace test suite,
 including end-to-end synth → decode roundtrips for every protocol,
