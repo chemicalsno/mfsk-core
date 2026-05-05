@@ -54,6 +54,22 @@ pub struct Slot {
     pub inc_total_us: i64,
 }
 
+/// Streaming-waterfall tick — emitted by stage1_inc once per FFT pair
+/// (~80 ms at NSPS/2 step), if a WF queue was supplied to `spawn`.
+/// `row` is the pair's spectrogram column already decimated to the
+/// host's screen width (135) and palette-indexed (0..15) so the UI
+/// thread does no floating-point work in the redraw path.
+///
+/// Sent on a depth-8 queue so consumers can briefly fall behind
+/// without blocking stage1_inc; if the consumer never drains, the
+/// queue saturates and the next emit is dropped (no back-pressure on
+/// the audio path).
+pub const WF_ROW_LEN: usize = 135;
+pub struct WfTick {
+    pub pair_idx: u8,
+    pub row: [u8; WF_ROW_LEN],
+}
+
 /// Create a depth-N FreeRTOS queue carrying `*mut ChunkMsg` pointers.
 pub fn create_chunk_queue(depth: u32) -> QueueHandle_t {
     create_ptr_queue::<ChunkMsg>(depth)
@@ -67,6 +83,11 @@ pub fn create_slot_queue(depth: u32) -> QueueHandle_t {
 /// Create a depth-N FreeRTOS queue carrying `*mut SpecBundle` pointers.
 pub fn create_spec_queue(depth: u32) -> QueueHandle_t {
     create_ptr_queue::<SpecBundle>(depth)
+}
+
+/// Create a depth-N FreeRTOS queue carrying `*mut WfTick` pointers.
+pub fn create_wf_queue(depth: u32) -> QueueHandle_t {
+    create_ptr_queue::<WfTick>(depth)
 }
 
 fn create_ptr_queue<T>(depth: u32) -> QueueHandle_t {
@@ -94,6 +115,30 @@ pub fn send_box<T>(q: QueueHandle_t, boxed: Box<T>) {
         )
     };
     debug_assert_eq!(r, PD_PASS, "xQueueGenericSend failed: {r}");
+}
+
+/// Non-blocking send. Returns the boxed message back if the queue is
+/// full so the caller can drop it (= produce-and-drop pattern, used
+/// by stage1_inc for streaming `WfTick` so a slow UI consumer never
+/// stalls the audio path).
+pub fn try_send_box<T>(q: QueueHandle_t, boxed: Box<T>) -> Result<(), Box<T>> {
+    let raw: *mut T = Box::into_raw(boxed);
+    let r = unsafe {
+        xQueueGenericSend(
+            q,
+            (&raw as *const *mut T) as *const core::ffi::c_void,
+            0,
+            QUEUE_SEND_TO_BACK,
+        )
+    };
+    if r == PD_PASS {
+        Ok(())
+    } else {
+        // SAFETY: xQueueGenericSend with timeout=0 either takes the
+        // pointer or rejects without storing it; on rejection we still
+        // own `raw` and rebox to drop on the caller's side.
+        Err(unsafe { Box::from_raw(raw) })
+    }
 }
 
 /// Receive a boxed message from a queue, taking ownership. Blocks

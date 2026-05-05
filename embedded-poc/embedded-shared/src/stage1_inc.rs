@@ -73,6 +73,11 @@ struct WorkerCtx {
     chunk_q: QueueHandle_t,
     slot_q: QueueHandle_t,
     spec_q: QueueHandle_t,
+    /// Optional streaming-WF queue. When `Some`, the worker emits a
+    /// `WfTick` per FFT pair (≈ 80 ms cadence) so the UI can show a
+    /// flowing waterfall during capture. Non-blocking send: a slow
+    /// consumer just drops ticks instead of stalling stage1.
+    wf_q: Option<QueueHandle_t>,
     n_freq: usize,
     head_ia: usize,
     head_n_freq: usize,
@@ -133,6 +138,18 @@ impl SlotInProgress {
 ///     tail of capture
 ///   - `Slot` on `slot_q` at SlotEnd so main can run pass 2 / stage 3
 pub fn spawn(chunk_q: QueueHandle_t, slot_q: QueueHandle_t, spec_q: QueueHandle_t) {
+    spawn_with_wf(chunk_q, slot_q, spec_q, None)
+}
+
+/// Variant of [`spawn`] that wires up the optional streaming-WF
+/// queue. Emits one [`pipeline::WfTick`] per FFT pair (≈ 80 ms) for
+/// the UI thread to render a continuously-flowing waterfall.
+pub fn spawn_with_wf(
+    chunk_q: QueueHandle_t,
+    slot_q: QueueHandle_t,
+    spec_q: QueueHandle_t,
+    wf_q: Option<QueueHandle_t>,
+) {
     let n_freq = n_freq_for(3_000.0);
     let (head_ia, head_n_freq) = band_for(ALLSUM_FREQ_MIN, ALLSUM_FREQ_MID, n_freq);
     let (tail_ia, tail_n_freq) = band_for(ALLSUM_FREQ_MID, ALLSUM_FREQ_MAX, n_freq);
@@ -145,6 +162,7 @@ pub fn spawn(chunk_q: QueueHandle_t, slot_q: QueueHandle_t, spec_q: QueueHandle_
         chunk_q,
         slot_q,
         spec_q,
+        wf_q,
         n_freq,
         head_ia,
         head_n_freq,
@@ -344,6 +362,61 @@ fn compute_pair_into(ctx: &mut WorkerCtx, j_a: usize, j_b: usize) {
 
     update_allsum_columns_for_m(ctx, j_a);
     update_allsum_columns_for_m(ctx, j_b);
+
+    // Streaming WF tick — emit one row per pair if a queue is wired.
+    // We average the two new spec rows (j_a, j_b) per freq bin then
+    // decimate to the host's screen width via boxcar over the WF
+    // band [200, 2700] Hz; the result is 0..15 palette indices the
+    // UI redraw can blit verbatim.
+    if let Some(wf_q) = ctx.wf_q {
+        let row = decimate_pair_to_wf(j_a, j_b, ctx.n_freq, &ctx.cur.spec);
+        let tick = alloc::boxed::Box::new(crate::pipeline::WfTick {
+            pair_idx: j_b as u8,
+            row,
+        });
+        // Drop on full queue — never block stage1.
+        let _ = crate::pipeline::try_send_box(wf_q, tick);
+    }
+}
+
+/// Decimate the two newly-filled spec rows into a single WF row for
+/// the host's 135-px screen width over the FT8 audio band
+/// (200..2700 Hz). Cost: ~2 × 800 freq bins read + 135-cell average
+/// = ~3 µs at the WF cadence (12 ticks/s) — negligible vs FFT.
+fn decimate_pair_to_wf(
+    j_a: usize,
+    j_b: usize,
+    n_freq: usize,
+    spec: &[u16],
+) -> [u8; crate::pipeline::WF_ROW_LEN] {
+    const WF_FREQ_LO_HZ: f32 = 200.0;
+    const WF_FREQ_HI_HZ: f32 = 2_700.0;
+    let df = SAMPLE_RATE_HZ / NFFT_SPEC as f32;
+    let row_a = j_a * n_freq;
+    let row_b = j_b * n_freq;
+    let mut out = [0u8; crate::pipeline::WF_ROW_LEN];
+    for col in 0..crate::pipeline::WF_ROW_LEN {
+        let f0 = WF_FREQ_LO_HZ + (col as f32) * (WF_FREQ_HI_HZ - WF_FREQ_LO_HZ)
+            / crate::pipeline::WF_ROW_LEN as f32;
+        let f1 = WF_FREQ_LO_HZ + ((col + 1) as f32) * (WF_FREQ_HI_HZ - WF_FREQ_LO_HZ)
+            / crate::pipeline::WF_ROW_LEN as f32;
+        let bin_lo = (f0 / df).floor() as usize;
+        let bin_hi = ((f1 / df).ceil() as usize).min(n_freq);
+        if bin_hi <= bin_lo {
+            continue;
+        }
+        let mut sum: u32 = 0;
+        for f in bin_lo..bin_hi {
+            sum += spec[row_a + f] as u32;
+            sum += spec[row_b + f] as u32;
+        }
+        let cells = (2 * (bin_hi - bin_lo)) as u32;
+        let avg = (sum / cells.max(1)).max(1);
+        // log2 approx: bit-position of MSB → 0..15. u16 max → 16.
+        let log2 = (32u32 - avg.leading_zeros()).min(15) as u8;
+        out[col] = log2;
+    }
+    out
 }
 
 fn update_allsum_columns_for_m(ctx: &mut WorkerCtx, m: usize) {
