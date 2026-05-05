@@ -23,8 +23,14 @@ pub struct DecodedRow {
     pub hard_errors: u8,
     /// Decoded text. WSJT-X 77-bit packed messages fit in 22 chars.
     pub msg: String<22>,
-    /// Monotonic slot number (decode_pipeline tick), for sort + dedup.
+    /// Latest slot in which this message decoded (refreshed on every
+    /// re-detection — used to keep the row "alive" in the LRU dedupe).
     pub slot_seq: u32,
+    /// Slot in which the message **first** appeared. The renderer
+    /// highlights rows where `first_seq == max_visible_slot_seq` so
+    /// genuinely-new callsigns flash the highlight while a recurring
+    /// QSO (same callsigns each slot in a `wav_sim` loop) draws plain.
+    pub first_seq: u32,
 }
 
 /// Status-bar fields. All optional so the bar renders during boot
@@ -53,7 +59,10 @@ pub const WF_DEPTH: usize = 100;
 /// covers >2 slots of qso3-busy density (= 7 decodes/slot) without
 /// dropping; UI picks the trailing 7 to render.
 pub struct UiState {
-    decoded: heapless::Deque<DecodedRow, 16>,
+    /// LRU-ordered decode list — oldest at index 0, most-recently
+    /// updated at the back. Vec (not Deque) so `push_decode` can
+    /// search-and-remove existing entries in place to dedupe by msg.
+    decoded: heapless::Vec<DecodedRow, 16>,
     waterfall: heapless::Deque<WfLine, WF_DEPTH>,
     pub status: StatusInfo,
     /// Bumped by writers when state changes; readers compare against
@@ -70,7 +79,7 @@ pub struct UiState {
 impl UiState {
     pub const fn new() -> Self {
         Self {
-            decoded: heapless::Deque::new(),
+            decoded: heapless::Vec::new(),
             waterfall: heapless::Deque::new(),
             status: StatusInfo {
                 rig_freq_hz: None,
@@ -83,12 +92,25 @@ impl UiState {
         }
     }
 
-    /// Push a fresh decode. Drops the oldest row when full.
-    pub fn push_decode(&mut self, row: DecodedRow) {
-        if self.decoded.is_full() {
-            let _ = self.decoded.pop_front();
+    /// Push a fresh decode. Dedupes by `msg` — if the message text
+    /// already lives in the ring, the existing entry is removed and
+    /// the new copy appended at the back, preserving its original
+    /// `first_seq` (so a recurring callsign doesn't re-trigger the
+    /// "new" highlight). When the message is genuinely new, append
+    /// and stamp `first_seq = slot_seq`. Drops the front when full.
+    pub fn push_decode(&mut self, mut row: DecodedRow) {
+        if let Some(idx) = self.decoded.iter().position(|r| r.msg == row.msg) {
+            // Carry forward the first-seen seq from the existing
+            // entry — its highlight semantics belong to *that* slot,
+            // not this re-detection.
+            row.first_seq = self.decoded[idx].first_seq;
+            self.decoded.remove(idx);
+        } else if self.decoded.is_full() {
+            self.decoded.remove(0);
         }
-        let _ = self.decoded.push_back(row);
+        // `push` only fails on saturation; the branches above ensure
+        // there's room.
+        let _ = self.decoded.push(row);
         self.bump();
     }
 
@@ -112,9 +134,9 @@ impl UiState {
         self.wf_push_seq.load(Ordering::Acquire)
     }
 
-    /// Newest-last view of all retained rows.
+    /// Newest-last view of all retained rows. Vec → slice iter.
     pub fn decoded_iter(&self) -> impl Iterator<Item = &DecodedRow> {
-        self.decoded.iter()
+        self.decoded.as_slice().iter()
     }
 
     pub fn decoded_len(&self) -> usize {

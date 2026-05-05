@@ -127,12 +127,17 @@ pub fn run() -> ! {
                     let mut msg: heapless::String<22> = heapless::String::new();
                     let take = text.len().min(msg.capacity());
                     let _ = msg.push_str(&text[..take]);
+                    // `first_seq` is provisionally `slot_seq`; if the
+                    // msg is already in the ring `push_decode` will
+                    // overwrite this with the existing entry's seq so
+                    // recurring callsigns don't re-flash the highlight.
                     let row = DecodedRow {
                         df_hz: r.freq_hz.round().clamp(0.0, 65_535.0) as u16,
                         snr_db: r.snr_db.round().clamp(-128.0, 127.0) as i8,
                         hard_errors: r.hard_errors.min(255) as u8,
                         msg,
                         slot_seq,
+                        first_seq: slot_seq,
                     };
                     ui.push_decode(row);
                     log::info!("{:4.0}Hz {:+5.1}dB {}", r.freq_hz, r.snr_db, text);

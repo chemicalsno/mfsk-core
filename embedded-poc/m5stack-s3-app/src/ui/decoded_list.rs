@@ -34,10 +34,14 @@ pub const CHAR_W: u32 = 6;
 const ROW_CHARS: usize = (135 / CHAR_W) as usize;
 
 /// Clear + repaint the decoded list. Idempotent — caller gates by
-/// `UiState::dirty_seq`. Rows from the latest `slot_seq` get inverse
-/// video (= bright bg, dark text) so the user sees at a glance which
-/// callsigns just landed; older rows revert to plain white-on-black
-/// so the screen doesn't flash on every redraw.
+/// `UiState::dirty_seq`. Rows whose **first** observation lands in
+/// the latest visible slot (= genuinely new callsigns this slot)
+/// get inverse video (dim cyan bg); recurring callsigns from a
+/// `wav_sim` loop draw plain white-on-black, since their `first_seq`
+/// stays at the slot they were originally seen.
+///
+/// Render direction: top of region = **newest** decode (matches
+/// WSJT-X / JTDX UX). Older rows scroll downward as new ones arrive.
 ///
 /// Per-row painting only covers the row's vertical band (16 px ×
 /// 135 = 2 160 px), and each glyph cell carries `background_color`
@@ -50,24 +54,28 @@ where
     let bg = Rgb565::BLACK;
     let fg = Rgb565::WHITE;
     let warn = Rgb565::CSS_ORANGE;
-    // Newest-slot highlight: dim cyan band, dark text.
+    // First-seen-this-slot highlight: dim cyan band.
     let new_bg = Rgb565::new(2, 14, 12);
     let new_fg = Rgb565::WHITE;
 
     let n = rows.len();
     let take = n.min(ROWS);
     let start = n - take;
-    let visible = &rows[start..];
+    // Trailing `take` entries = most recently updated. Reverse so
+    // the most-recently-updated lands at the *top* of the region.
+    let visible: heapless::Vec<&DecodedRow, ROWS> = rows[start..].iter().rev().collect();
 
-    // Find the highest slot_seq among visible rows; rows matching it
-    // are "freshly arrived this slot" and get the highlight.
+    // Highlight rows whose first observation is the latest slot.
     let latest_seq = visible.iter().map(|r| r.slot_seq).max().unwrap_or(0);
 
     for (i, row) in visible.iter().enumerate() {
         let y = ORIGIN_Y + (i as i32) * ROW_PX as i32;
         let row_y_text = y + 3; // 3 px top padding inside the row band
 
-        let is_new = row.slot_seq == latest_seq;
+        // "New" = the row's *first* observation is in the current
+        // visible slot. Recurring callsigns (re-decoded each slot of
+        // a `wav_sim` loop) carry an older `first_seq` and stay plain.
+        let is_new = row.first_seq == latest_seq;
         let row_bg = if is_new { new_bg } else { bg };
         let style = MonoTextStyleBuilder::new()
             .font(&FONT_6X10)
