@@ -151,14 +151,15 @@ pub fn audio_thread(mut i2s: I2sDriver<'static, I2sTx>, wav: &'static [u8]) -> !
     const OUT_BYTES: usize = IN_SAMPLES * 4 /*upsample*/ * 4 /*stereo i16*/;
     let mut out = vec![0u8; OUT_BYTES];
 
-    // Per-output-sample envelope state, ramped towards the gate's
-    // target (1.0 = play, 0.0 = mute). 240-sample (= 5 ms at 48 kHz)
-    // ramp is fast enough that the user perceives the cue as instant
-    // but slow enough that the speaker cone doesn't see a step
-    // discontinuity — eliminates the click the user heard at the
-    // start of decode in the prior abrupt-mute version.
+    // Per-input-sample envelope, ramped towards the gate's target
+    // (1.0 = play, 0.0 = mute). 600-sample ramp at the 12 kHz input
+    // rate ≈ 50 ms — long enough that the I2S DMA buffer (~80 ms)
+    // can drain through the ramped tail without a step discontinuity
+    // even when the audio thread loses CPU to stage 3 BP for a
+    // moment. (5 ms was too short: the DMA queue carries enough
+    // pre-mute audio that the speaker still saw a step.)
     let mut env: f32 = 1.0;
-    const ENV_STEP: f32 = 1.0 / 240.0;
+    const ENV_STEP: f32 = 1.0 / 600.0;
 
     let mut byte_pos = 0usize;
     loop {

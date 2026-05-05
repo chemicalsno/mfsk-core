@@ -95,11 +95,15 @@ pub fn run() -> ! {
         let wav_idx = slot.wav_idx;
         let n_pass1 = pass1.len();
 
-        // Mute the speaker for the BP-heavy post-SlotEnd window.
-        // Pass-2 + Stage-3 saturate both LX7 cores enough that the
-        // I2S DMA underruns and the codec emits buzz; silence is
-        // less jarring than the glitch.
-        crate::audio::AUDIO_GATE.store(false, core::sync::atomic::Ordering::Release);
+        // The audio gate around pass2/stage3 was added to silence the
+        // DMA-underrun buzz the user heard during BP work, but the
+        // *resume* transition produced a much harsher click — the
+        // I2S driver / codec analog stage settles dirty after a
+        // 1.3 s starvation and pops on first non-zero sample. Net
+        // assessment: leave audio streaming the whole time. The
+        // residual buzz at -10 dB DAC volume is mild background
+        // texture; the click was an alarm.
+        // crate::audio::AUDIO_GATE.store(false, ...);  // intentionally not muted
 
         #[allow(static_mut_refs)]
         let pass2 = unsafe {
@@ -125,11 +129,6 @@ pub fn run() -> ! {
                 &mut BASIS_IM,
             )
         };
-
-        // Re-open the audio gate now that BP work is done. The audio
-        // thread resumes streaming from where its `byte_pos` left
-        // off, so the WAV stays time-aligned with the slot cadence.
-        crate::audio::AUDIO_GATE.store(true, core::sync::atomic::Ordering::Release);
 
         log::info!("WAV[{wav_idx}] p1={n_pass1} dec={}", results.len());
         slot_seq = slot_seq.wrapping_add(1);
