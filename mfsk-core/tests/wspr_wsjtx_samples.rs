@@ -1,0 +1,172 @@
+//! WSPR real-world signal validation against
+//! `WSJT-X/samples/WSPR/150426_0918.wav` (12 kHz mono, 120 s = 1
+//! WSPR slot).
+//!
+//! Skipped when the WSJT-X tree is absent.
+
+#![cfg(all(feature = "wspr", any(feature = "fft-rustfft", feature = "fft-extern")))]
+
+use std::fs::File;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+
+use mfsk_core::wspr::SearchParams;
+use mfsk_core::wspr::decode::decode_scan;
+
+fn read_wsjtx_wav_f32(path: &Path) -> Option<Vec<f32>> {
+    let mut file = File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    if bytes.len() < 44 || &bytes[..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return None;
+    }
+    if &bytes[12..16] != b"fmt " {
+        return None;
+    }
+    let channels = u16::from_le_bytes([bytes[22], bytes[23]]);
+    let sample_rate = u32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]);
+    let bits = u16::from_le_bytes([bytes[34], bytes[35]]);
+    if channels != 1 || sample_rate != 12_000 || bits != 16 {
+        return None;
+    }
+    if &bytes[36..40] != b"data" {
+        return None;
+    }
+    let data_len = u32::from_le_bytes([bytes[40], bytes[41], bytes[42], bytes[43]]) as usize;
+    let data = &bytes[44..44 + data_len.min(bytes.len() - 44)];
+    let mut out = Vec::with_capacity(data.len() / 2);
+    for chunk in data.chunks_exact(2) {
+        let s = i16::from_le_bytes([chunk[0], chunk[1]]);
+        out.push(s as f32 / 32_768.0);
+    }
+    Some(out)
+}
+
+fn sample_path() -> Option<PathBuf> {
+    let manifest = std::env::var("CARGO_MANIFEST_DIR").ok()?;
+    let p = Path::new(&manifest)
+        .join("../../WSJT-X/samples/WSPR/150426_0918.wav")
+        .canonicalize()
+        .ok()?;
+    if p.is_file() { Some(p) } else { None }
+}
+
+/// Each golden entry carries the WSPR Type-1 message string in its
+/// `Display` form ("call grid pwr") plus the audio carrier in Hz
+/// (= wsprd's `freq_MHz × 1e6`).
+struct Golden {
+    msg: &'static str,
+    freq_hz: f32,
+    dt_sec: f32,
+}
+
+const GOLDEN: &[Golden] = &[
+    Golden {
+        msg: "ND6P DM04 30",
+        freq_hz: 1446.0,
+        dt_sec: 1.1,
+    },
+    Golden {
+        msg: "W5BIT EL09 17",
+        freq_hz: 1460.0,
+        dt_sec: 0.1,
+    },
+    Golden {
+        msg: "WD4LHT EL89 30",
+        freq_hz: 1489.0,
+        dt_sec: 0.6,
+    },
+    Golden {
+        msg: "NM7J DM26 30",
+        freq_hz: 1503.0,
+        dt_sec: -0.8,
+    },
+    Golden {
+        msg: "KI7CI DM09 37",
+        freq_hz: 1517.0,
+        dt_sec: 0.5,
+    },
+    Golden {
+        msg: "DJ6OL JO52 37",
+        freq_hz: 1530.0,
+        dt_sec: -1.9,
+    },
+    Golden {
+        msg: "W3HH EL89 30",
+        freq_hz: 1587.0,
+        dt_sec: 0.8,
+    },
+    Golden {
+        msg: "W3BI FN20 30",
+        freq_hz: 1594.0,
+        dt_sec: 0.7,
+    },
+];
+
+const FREQ_TOL_HZ: f32 = 4.0;
+const DT_TOL_SEC: f32 = 0.5;
+
+#[test]
+#[ignore = "WSPR host path currently 3/8 against WSJT-X golden — \
+            run with `cargo test -- --ignored` to track repair progress"]
+fn wspr_wsjtx_sample_recall_vs_golden() {
+    let Some(path) = sample_path() else {
+        eprintln!(
+            "skipping: WSJT-X WSPR sample not found at ../../WSJT-X/samples/WSPR/150426_0918.wav"
+        );
+        return;
+    };
+    let audio = read_wsjtx_wav_f32(&path).expect("WAV must be 12 kHz mono PCM-16");
+
+    // Golden carriers span 1446..1594 Hz — widen well past the
+    // ±100-Hz default to keep edges in scope.
+    let params = SearchParams {
+        freq_min_hz: 1400.0,
+        freq_max_hz: 1620.0,
+        ..SearchParams::default()
+    };
+
+    let decodes = decode_scan(&audio, 12_000, 0, &params);
+
+    let decoded: Vec<(String, f32, f32)> = decodes
+        .iter()
+        .map(|d| {
+            // WSPR `start_sample` is symbol-0 start; WSPR slots open
+            // ~1 s into the slot, so `dt = start/12000 − 1.0` matches
+            // the wsprd "dt" column convention.
+            let dt = d.start_sample as f32 / 12_000.0 - 1.0;
+            (d.message.to_string(), d.freq_hz, dt)
+        })
+        .collect();
+
+    eprintln!("WSPR sample decoded {} message(s):", decoded.len());
+    for (m, f, dt) in &decoded {
+        eprintln!("  freq={:6.1} Hz dt={:+.2} s : {}", f, dt, m);
+    }
+
+    let mut hits = 0usize;
+    for g in GOLDEN {
+        let hit = decoded.iter().any(|(m, f, dt)| {
+            m == g.msg
+                && (f - g.freq_hz).abs() <= FREQ_TOL_HZ
+                && (dt - g.dt_sec).abs() <= DT_TOL_SEC
+        });
+        if hit {
+            hits += 1;
+        } else {
+            eprintln!(
+                "  MISSING: '{}' @ {:.1} Hz dt={:+.2}",
+                g.msg, g.freq_hz, g.dt_sec
+            );
+        }
+    }
+    eprintln!("recall: {}/{} golden WSPR decodes", hits, GOLDEN.len());
+
+    assert_eq!(
+        hits,
+        GOLDEN.len(),
+        "WSPR WSJT-X sample recall regressed: {}/{}",
+        hits,
+        GOLDEN.len()
+    );
+}
