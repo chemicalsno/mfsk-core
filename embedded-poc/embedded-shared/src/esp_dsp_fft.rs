@@ -210,6 +210,14 @@ impl Default for EspDspPlanner {
 
 impl FftPlanner for EspDspPlanner {
     fn plan_forward(&mut self, len: usize) -> Box<dyn Fft> {
+        // 3840 = 256 × 15 mixed-radix path: WSJT-X-faithful FT8 spectrogram
+        // FFT length. The inner 256-pt FFT uses esp-dsp's radix-2 asm kernel;
+        // the 15-pt PFA factor is hand-rolled in mfsk-core
+        // (`core::dsp::fft_15`).
+        if len == 3840 {
+            self.ensure_table(256);
+            return Box::new(MixedRadix3840Fft::new());
+        }
         assert!(
             len.is_power_of_two() && len >= 4,
             "esp-dsp FFT requires power-of-2 length ≥ 4 (got {len})"
@@ -219,6 +227,11 @@ impl FftPlanner for EspDspPlanner {
     }
 
     fn plan_inverse(&mut self, len: usize) -> Box<dyn Fft> {
+        if len == 3840 {
+            unimplemented!(
+                "inverse 3840-pt FFT not wired (current FT8 spectrogram path is forward only)"
+            );
+        }
         assert!(
             len.is_power_of_two() && len >= 4,
             "esp-dsp FFT requires power-of-2 length ≥ 4 (got {len})"
@@ -228,6 +241,51 @@ impl FftPlanner for EspDspPlanner {
             len,
             forward: false,
         })
+    }
+}
+
+/// 3840-pt forward FFT via Cooley-Tukey 256 × 15 mixed-radix.
+/// 256-pt: esp-dsp `dsps_fft2r_fc32_ae32_` (asm). 15-pt: see
+/// [`mfsk_core::core::dsp::fft_15`]. Inter-stage twiddles cached.
+struct MixedRadix3840Fft {
+    twiddles: Box<[Complex32; mfsk_core::core::dsp::fft_mixed_3840::N]>,
+}
+
+impl MixedRadix3840Fft {
+    fn new() -> Self {
+        Self {
+            twiddles: mfsk_core::core::dsp::fft_mixed_3840::build_twiddles(),
+        }
+    }
+}
+
+impl Fft for MixedRadix3840Fft {
+    fn process(&self, buf: &mut [Complex32]) {
+        const N: usize = mfsk_core::core::dsp::fft_mixed_3840::N;
+        assert_eq!(buf.len(), N, "3840 FFT input length mismatch");
+        let buf_arr: &mut [Complex32; N] = buf
+            .try_into()
+            .expect("buf.len() == N already asserted");
+
+        // Inner 256-pt forward FFT via esp-dsp asm path. Mirrors
+        // `EspDspFft::process` but specialised to len=256.
+        let mut esp_dsp_256 = |row: &mut [Complex32; 256]| {
+            let ptr = row.as_mut_ptr() as *mut f32;
+            unsafe {
+                dsps_fft2r_fc32_ae32_(ptr, 256, dsps_fft_w_table_fc32);
+                dsps_bit_rev_fc32_ansi(ptr, 256);
+            }
+        };
+
+        mfsk_core::core::dsp::fft_mixed_3840::fft_3840_with(
+            buf_arr,
+            &mut esp_dsp_256,
+            &self.twiddles,
+        );
+    }
+
+    fn len(&self) -> usize {
+        mfsk_core::core::dsp::fft_mixed_3840::N
     }
 }
 

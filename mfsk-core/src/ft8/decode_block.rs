@@ -93,13 +93,25 @@ impl AudioSample for i8 {
 /// - **sc16 (`fixed-point` feature)**: no cap up to 32768; sc16
 ///   has no rev-table dependency and generates twiddles on the fly.
 ///
-/// Using NFFT=4096 on both paths today. Tried NFFT=8192 on the
-/// sc16 path and saw host AWGN sweep regress ~0.5 dB at threshold —
-/// finer bins make rectangular-window leakage worse for single-bin
-/// extraction (main lobe widens from ±2.13 to ±4.27 bins). Hann
-/// windowing in Step 1 compensates and unlocks NFFT=8192 as a
-/// follow-on optimisation; revisit after Step 1.
-pub const NFFT_SPEC: usize = 4096;
+/// **NFFT=3840 = 2*NSPS**, matching WSJT-X `sync8.f90`'s `NFFT1`.
+///
+/// - `tone_step_bins = TONE_SPACING_HZ / df = 6.25 / (12000/3840) = 2.0`
+///   exactly (integer), so each FT8 tone falls on a single FFT bin and
+///   the rectangular-window sidelobes do not leak onto adjacent tones.
+/// - Numerically identical scale to WSJT-X — `savg`, `sbase`, `xsig`,
+///   `xsnr2` and the Costas-correlation score can be compared bin-for-bin
+///   against WSJT-X reference output when debugging false decodes / SNR
+///   reporting (no calibration constants required).
+/// - Rectangular window throughout (no Hann); the previously needed
+///   Hann compensation, multi-bin tone sum, and Hann-coherent-gain
+///   pre-shift have all been removed.
+///
+/// Embedded (Xtensa, `fixed-point` feature) gets the same NFFT via a
+/// 256 × 15 mixed-radix wrapper around esp-dsp's radix-2 256-pt FFT
+/// (see `embedded-shared::esp_dsp_fft::MixedRadix3840Fft`). The 15-pt
+/// PFA factor is in `mfsk-core/src/core/dsp/fft_15.rs` with hardcoded
+/// 3-pt and 5-pt twiddles.
+pub const NFFT_SPEC: usize = 3840;
 
 /// Coarse-sync slide step (samples). NSPS/2 = 960 samples (80 ms;
 /// 184 frames per slot). Halving to NSPS killed sensitivity in
@@ -286,33 +298,6 @@ impl Spectrogram {
     }
 }
 
-/// Hann window over `NSPS` samples (peak 1.0 at the middle, zero at
-/// the edges). Cuts rectangular sidelobes from −13 dB to ≈ −32 dB so
-/// strong stations stop masking weaker neighbours 60–100 Hz away on
-/// busy bands. Coherent gain is 0.5 (single-bin signal **amplitude**
-/// halved → bin **power** down 4×); fp `compute_spectrogram` adds one
-/// pre-shift to compensate, f32 needs no compensation (relative
-/// magnitudes only).
-fn hann_window_f32() -> [f32; NSPS] {
-    let mut w = [0.0f32; NSPS];
-    let denom = NSPS as f32;
-    for k in 0..NSPS {
-        w[k] = 0.5 * (1.0 - (core::f32::consts::TAU * k as f32 / denom).cos());
-    }
-    w
-}
-
-/// Q15 form of [`hann_window_f32`] for the fixed-point compute path.
-#[cfg(feature = "fixed-point")]
-fn hann_window_q15() -> [i16; NSPS] {
-    let f = hann_window_f32();
-    let mut q = [0i16; NSPS];
-    for k in 0..NSPS {
-        q[k] = (f[k] * 32767.0).round() as i16;
-    }
-    q
-}
-
 /// Build the per-symbol power spectrogram via NFFT_SPEC-pt FFTs.
 /// Each time slice is `NSPS = 1920` samples of Hann-windowed audio
 /// zero-padded to `NFFT_SPEC`.
@@ -337,7 +322,11 @@ pub fn compute_spectrogram<S: AudioSample>(audio: &[S], max_freq_hz: f32) -> Spe
     let mut planner = default_planner();
     let fft = planner.plan_forward(NFFT_SPEC);
 
-    let hann = hann_window_f32();
+    // Rectangular window — matches WSJT-X `sync8.f90`. With NFFT=3840,
+    // `tone_step_bins = 6.25 / (12000/3840) = 2.0` exactly, so the
+    // rectangular sidelobes do not bleed onto adjacent FT8 tones.
+    // (The fixed-point path keeps Hann to mitigate the wider sidelobes
+    // that come with NFFT=4096's fractional 2.13 bins/tone.)
     let mut data = vec![0.0f32; n_freq * n_time];
     let mut buf = vec![Complex::new(0.0f32, 0.0); NFFT_SPEC];
 
@@ -346,7 +335,7 @@ pub fn compute_spectrogram<S: AudioSample>(audio: &[S], max_freq_hz: f32) -> Spe
         for (k, c) in buf.iter_mut().enumerate() {
             *c = if k < NSPS {
                 let sample = if ia + k < audio.len() {
-                    audio[ia + k].to_f32() * scale * hann[k]
+                    audio[ia + k].to_f32() * scale
                 } else {
                     0.0
                 };
@@ -420,14 +409,15 @@ pub fn compute_spectrogram<S: AudioSample>(audio: &[S], max_freq_hz: f32) -> Spe
     // plan expected. Peak input samples near the window centre
     // (where Hann ≈ 1) may saturate to i16_MAX after this shift,
     // but the centre is also where CG is highest — clamping a few
-    // samples there costs less than the 6 dB amplitude loss the
-    // window otherwise imposes on every bin.
-    shift = (shift + 1).min(8);
+    // (Hann window and the +1 pre-shift that compensated its 0.5
+    // coherent gain were both removed when the spectrogram switched
+    // to NFFT=3840 — at integer tone alignment the rectangular-window
+    // sidelobes don't leak onto adjacent FT8 tones, so the window
+    // costs more than it saves.)
 
     let mut planner = default_planner_16();
     let fft = planner.plan_forward(NFFT_SPEC);
 
-    let hann = hann_window_q15();
     let mut data: Vec<u16> = vec![0u16; n_freq * n_time];
     let mut buf: Vec<Complex<i16>> = vec![Complex::new(0i16, 0i16); NFFT_SPEC];
 
@@ -457,16 +447,14 @@ pub fn compute_spectrogram<S: AudioSample>(audio: &[S], max_freq_hz: f32) -> Spe
         for (k, c) in buf.iter_mut().enumerate() {
             let re = if k < NSPS && ia_a + k < audio.len() {
                 let raw = audio[ia_a + k].to_i16() as i32;
-                let scaled = (raw << shift).clamp(i16::MIN as i32, i16::MAX as i32);
-                ((scaled * hann[k] as i32) >> 15) as i16
+                (raw << shift).clamp(i16::MIN as i32, i16::MAX as i32) as i16
             } else {
                 0
             };
             let im = match ia_b {
                 Some(ia_b) if k < NSPS && ia_b + k < audio.len() => {
                     let raw = audio[ia_b + k].to_i16() as i32;
-                    let scaled = (raw << shift).clamp(i16::MIN as i32, i16::MAX as i32);
-                    ((scaled * hann[k] as i32) >> 15) as i16
+                    (raw << shift).clamp(i16::MIN as i32, i16::MAX as i32) as i16
                 }
                 _ => 0,
             };
@@ -654,53 +642,29 @@ fn fill_coarse_allsum(
     spec: &Spectrogram,
     ia: usize,
     ib: usize,
-    n_freq: usize,
+    _n_freq: usize,
     dst: &mut [CoarseAcc],
 ) {
     let nh1 = spec.n_freq;
-    // tone_bin_lo = [0,2,4,6,...,14] for the standard FT8/NFFT_SPEC
-    // configuration. Verify and fall back to the generic gather if
-    // a future protocol setting breaks the assumption.
-    let df = SAMPLE_RATE_HZ / NFFT_SPEC as f32;
-    let tone_step_bins = TONE_SPACING_HZ / df;
-    let mut tone_bin_lo = [0usize; NTONES];
-    for k in 0..NTONES {
-        tone_bin_lo[k] = (k as f32 * tone_step_bins).floor() as usize;
-    }
-    let win = 2 * NTONES;
-    let contiguous = (0..NTONES).all(|k| tone_bin_lo[k] == 2 * k);
-    if contiguous {
-        let row0 = 0;
+    // NFFT=3840 → tone_step_bins = 6.25 / (12000/3840) = 2.0 exactly.
+    // Each FT8 tone falls on a single bin (no fractional leakage), so
+    // we sum **exactly 8 bins** per carrier — `tone_bin_lo[k] = 2*k` —
+    // matching WSJT-X `sync8.f90`'s `t0a` (`sum(s(i:i+nfos*6:nfos, m))`,
+    // 7 bins per Costas position × 3 positions = 21 single-bin gathers).
+    //
+    // The "contiguous 16-bin sliding window" optimisation that lived
+    // here for NFFT=4096 + Hann is removed: at integer alignment the
+    // signal does not bleed into bin `2k+1`, so summing 16 bins would
+    // double the noise contribution for nothing.
+    for (fi, i_carrier) in (ia..=ib).enumerate() {
+        let row_off = fi * spec.n_time;
         for m in 0..spec.n_time {
             let mut s: CoarseAcc = CoarseAcc::default();
-            for j in 0..win {
-                let bin = (ia + j).min(nh1 - 1);
+            for k in 0..NTONES {
+                let bin = (i_carrier + 2 * k).min(nh1 - 1);
                 s += spec.power_acc(bin, m);
             }
-            dst[row0 * spec.n_time + m] = s;
-        }
-        for fi in 1..n_freq {
-            let drop_bin = ia + fi - 1;
-            let add_bin = (ia + fi + win - 1).min(nh1 - 1);
-            let prev_off = (fi - 1) * spec.n_time;
-            let curr_off = fi * spec.n_time;
-            for m in 0..spec.n_time {
-                dst[curr_off + m] =
-                    dst[prev_off + m] - spec.power_acc(drop_bin, m) + spec.power_acc(add_bin, m);
-            }
-        }
-    } else {
-        for (fi, i_carrier) in (ia..=ib).enumerate() {
-            let row_off = fi * spec.n_time;
-            for m in 0..spec.n_time {
-                let mut s: CoarseAcc = CoarseAcc::default();
-                for k in 0..NTONES {
-                    let lo = (i_carrier + tone_bin_lo[k]).min(nh1 - 1);
-                    let hi = (lo + 1).min(nh1 - 1);
-                    s += spec.power_acc(lo, m) + spec.power_acc(hi, m);
-                }
-                dst[row_off + m] = s;
-            }
+            dst[row_off + m] = s;
         }
     }
 }
@@ -800,26 +764,15 @@ fn coarse_sync_inner(
         (0..spec.n_time).filter(|&m| mark[m]).collect()
     };
 
-    // Pre-compute Σ_k (spec[lo,m] + spec[lo+1,m]) for every
-    // (fi, m ∈ needed_m).
+    // Pre-compute `Σ_{k=0..NTONES-1} spec[i_carrier + 2*k, m]` for every
+    // (fi, m ∈ needed_m). NFFT=3840 → tone_step_bins=2.0 exactly →
+    // 8-bin every-other gather per carrier (matches WSJT-X `sync8.f90`'s
+    // single-bin `t0a` accumulator). No sliding-window reuse since
+    // adjacent fi share zero bins under this pattern.
     //
-    // **Sliding-window optimisation**: at NFFT_SPEC=4096, tone_step_bins
-    // ≈ 2.13 → tone_bin_lo = [0, 2, 4, 6, 8, 10, 12, 14], i.e. the 8
-    // tones plus the multi-bin neighbour cover the **16 contiguous
-    // bins** `[i_carrier, i_carrier + 15]`. So allsum reduces to a
-    // 16-bin sum that slides by one bin as fi advances:
-    //   `allsum[fi+1, m] = allsum[fi, m] − spec[i_carrier, m] + spec[i_carrier + 16, m]`
-    // — 2 reads/op per (fi, m) update vs the full 16. ~8× fewer spec
-    // reads in the precompute, big PSRAM-bandwidth win on Core2.
-    //
-    // The contiguous layout holds when tone_step_bins > 2 floors to
-    // even integer steps of 2; verify and fall back to the generic
-    // sum if a future NFFT_SPEC breaks the assumption.
-    let win = 2 * NTONES; // 16 contiguous bins
-    let contiguous = (0..NTONES).all(|k| tone_bin_lo[k] == 2 * k);
     // Phase-E2: caller can pass a pre-built allsum (built incrementally
     // during slot capture by stage1_inc). When provided, skip the
-    // precompute entirely. Otherwise build it inline as before.
+    // precompute entirely. Otherwise build it inline.
     let owned_allsum: Vec<CoarseAcc>;
     let allsum: &[CoarseAcc] = if let Some(ext) = external_allsum {
         debug_assert_eq!(
@@ -831,47 +784,21 @@ fn coarse_sync_inner(
     } else {
         owned_allsum = {
             let mut buf = vec![CoarseAcc::default(); n_freq * spec.n_time];
-            if contiguous {
-                let row0 = 0;
+            for (fi, i_carrier) in (ia..=ib).enumerate() {
+                let row_off = fi * spec.n_time;
                 for &m in &needed_m {
                     let mut s: CoarseAcc = CoarseAcc::default();
-                    for j in 0..win {
-                        let bin = (ia + j).min(nh1 - 1);
+                    for k in 0..NTONES {
+                        let bin = (i_carrier + 2 * k).min(nh1 - 1);
                         s += spec.power_acc(bin, m);
                     }
-                    buf[row0 * spec.n_time + m] = s;
-                }
-                for fi in 1..n_freq {
-                    let drop_bin = ia + fi - 1;
-                    let add_bin = (ia + fi + win - 1).min(nh1 - 1);
-                    let prev_off = (fi - 1) * spec.n_time;
-                    let curr_off = fi * spec.n_time;
-                    for &m in &needed_m {
-                        buf[curr_off + m] = buf[prev_off + m] - spec.power_acc(drop_bin, m)
-                            + spec.power_acc(add_bin, m);
-                    }
-                }
-            } else {
-                for (fi, i_carrier) in (ia..=ib).enumerate() {
-                    let row_off = fi * spec.n_time;
-                    for &m in &needed_m {
-                        let mut s: CoarseAcc = CoarseAcc::default();
-                        for k in 0..NTONES {
-                            let lo = (i_carrier + tone_bin_lo[k]).min(nh1 - 1);
-                            let hi = (lo + 1).min(nh1 - 1);
-                            s += spec.power_acc(lo, m) + spec.power_acc(hi, m);
-                        }
-                        buf[row_off + m] = s;
-                    }
+                    buf[row_off + m] = s;
                 }
             }
             buf
         };
         &owned_allsum
     };
-    // Suppress unused-variable warnings for the contiguous/win locals
-    // when the external path is taken.
-    let _ = (contiguous, win);
     #[cfg(feature = "std")]
     let t_allsum = std::time::Instant::now();
 
@@ -915,10 +842,15 @@ fn coarse_sync_inner(
                     ((needed + NSSY - 1) / NSSY).min(COSTAS.len() as i32) as usize
                 }
             };
+            // NFFT=3840 → tone_step_bins = 2.0 exactly, signal at bin
+            // `tbin_lo` only (single bin gather, matching WSJT-X's
+            // `s(i+nfos*icos7(n), m)`). The legacy `+ spec[tbin_lo + 1]`
+            // half was a fractional-alignment compensation for NFFT=4096
+            // and is removed.
             for n in bk0_n_start..COSTAS.len() {
                 let m_u = (m_base[0][n] + lag) as usize;
                 let tbin_lo = tbin_lo_arr[n];
-                t_blocks[0] += spec.power_acc(tbin_lo, m_u) + spec.power_acc(tbin_lo + 1, m_u);
+                t_blocks[0] += spec.power_acc(tbin_lo, m_u);
                 t0_blocks[0] += allsum_row[m_u];
             }
             // Blocks 1, 2: always fully in range — no per-iter check.
@@ -926,7 +858,7 @@ fn coarse_sync_inner(
                 for n in 0..COSTAS.len() {
                     let m_u = (m_base[bk][n] + lag) as usize;
                     let tbin_lo = tbin_lo_arr[n];
-                    t_blocks[bk] += spec.power_acc(tbin_lo, m_u) + spec.power_acc(tbin_lo + 1, m_u);
+                    t_blocks[bk] += spec.power_acc(tbin_lo, m_u);
                     t0_blocks[bk] += allsum_row[m_u];
                 }
             }
@@ -2178,24 +2110,21 @@ mod tests {
         let ib_unbounded = (fmax / df).round() as usize;
         let ib = ib_unbounded.min(nh1.saturating_sub(max_tone_off));
         let n_freq = ib - ia + 1;
-        let win = 2 * NTONES;
         let n_time = spec.n_time;
 
         // Column-by-column: simulate incremental fill, walking m
-        // outer, fi inner with sliding window. This is exactly what
-        // stage1_inc::update_one_half does per pair.
+        // outer, fi inner. NFFT=3840 → 8-bin every-other gather per
+        // carrier (no sliding-window reuse since the pattern has zero
+        // overlap between adjacent fi). Mirrors stage1_inc.
         let mut col: Vec<f32> = vec![0.0; n_freq * n_time];
         for m in 0..n_time {
-            let mut s = 0.0_f32;
-            for j in 0..win {
-                let bin = (ia + j).min(nh1 - 1);
-                s += spec.power_acc(bin, m);
-            }
-            col[m] = s;
-            for fi in 1..n_freq {
-                let drop_bin = ia + fi - 1;
-                let add_bin = (ia + fi + win - 1).min(nh1 - 1);
-                s = s - spec.power_acc(drop_bin, m) + spec.power_acc(add_bin, m);
+            for fi in 0..n_freq {
+                let i_carrier = ia + fi;
+                let mut s = 0.0_f32;
+                for k in 0..NTONES {
+                    let bin = (i_carrier + 2 * k).min(nh1 - 1);
+                    s += spec.power_acc(bin, m);
+                }
                 col[fi * n_time + m] = s;
             }
         }
@@ -2298,20 +2227,13 @@ mod tests {
 
     /// **Documents a known limitation, not a regression**: building a
     /// full-band allsum and slicing it for sub-band consumption
-    /// drifts in f32 over hundreds of sliding-window steps, breaking
-    /// score-loop ordering on busy bands. The embedded port uses
-    /// per-half precompute (`coarse_sync_split_with_allsum_per_half_busy_band`
-    /// is the supported path) so this test is `#[ignore]`.
-    /// Locks in the documented divergence: precomputing a full-band
-    /// allsum once and slicing it for each half does NOT match the
-    /// per-half-from-scratch precompute that `coarse_sync_with_allsum`
-    /// ships with. Marked `#[should_panic]` so CI captures the
-    /// expected mismatch — if this test ever stops panicking, the
-    /// f32 sliding-window drift has been fixed and the embedded
-    /// `stage1_inc::emit_spec_bundle` could potentially share an
-    /// allsum across halves.
+    /// Full-band allsum sliced for each half MUST match per-half
+    /// precompute. With NFFT=3840 the 8-bin every-other gather (no
+    /// sliding window) is f32-stable, so slicing a full-band allsum
+    /// reproduces the per-half result bit-for-bit. The previous
+    /// `#[should_panic]` documented an f32 sliding-window drift that
+    /// existed at NFFT=4096 + 16-bin sliding sum and is now gone.
     #[test]
-    #[should_panic(expected = "mismatch")]
     fn coarse_sync_split_with_allsum_busy_band() {
         let msg = pack_cq();
         // 5 signals across [100, 3000] Hz band — 2 in head [100, 1550]

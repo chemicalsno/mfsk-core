@@ -173,39 +173,6 @@ fn polyfit_5term(xs: &[f64], ys: &[f64]) -> [f64; NTERMS] {
     a
 }
 
-/// WSJT-X-style `xsnr2`: signal-tone power vs spectrum-baseline noise
-/// floor at the carrier frequency. Returns SNR in dB.
-///
-/// `cs_norm_sqr[k]` should be `|cs[k][itone[k]]|^2` for `k = 0..n_sym`,
-/// i.e. the power at the message's expected tone at each symbol.
-/// `baseline_db_at_carrier` is the baseline polynomial value at the
-/// carrier bin (output of [`fit_baseline`], indexed at the right offset).
-///
-/// Mirrors WSJT-X `ft8b.f90`:
-/// ```text
-///     arg = xsig / xbase / 3.0e6 - 1.0
-///     xsnr2 = 10 * log10(arg) - 27.0
-/// ```
-/// The `3.0e6` factor is WSJT-X-specific to its NFFT and windowing,
-/// and the `-27 dB` offset normalises to the 2.5 kHz noise reference.
-/// This Rust port computes the equivalent ratio in dB:
-///   `xsnr2_db = signal_db - baseline_db - calibration_db`
-/// where `calibration_db` is a constant capturing both the bandwidth
-/// reference and the FFT-scaling difference. Run the diagnostic on a
-/// known WAV to fit the calibration.
-pub fn compute_xsnr2_db(
-    cs_norm_sqr: &[f32],
-    baseline_db_at_carrier: f32,
-    calibration_db: f32,
-) -> f32 {
-    let xsig: f32 = cs_norm_sqr.iter().copied().sum();
-    if xsig <= 0.0 {
-        return -100.0;
-    }
-    let xsig_db = 10.0 * xsig.log10();
-    xsig_db - baseline_db_at_carrier - calibration_db
-}
-
 /// Compute the average linear power per FFT bin from a [`Spectrogram`].
 /// `out.len()` must equal `spec.n_freq`.
 pub fn avg_spectrum(spec: &crate::ft8::decode_block::Spectrogram, out: &mut [f32]) {

@@ -10,6 +10,8 @@
 // once we have alloc.
 #[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub mod downsample;
+pub mod fft_15;
+pub mod fft_mixed_3840;
 pub mod gfsk;
 pub mod resample;
 pub mod subtract;
