@@ -9,8 +9,6 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use core::fmt::Write as _;
-
 use mfsk_core::core::sync::SyncCandidate;
 use mfsk_core::ft8::decode::DecodeDepth;
 use mfsk_core::ft8::decode_block::{BASIS_SCRATCH_LEN, DEFAULT_Q_THRESH, NFFT_SPEC};

@@ -34,9 +34,13 @@ where
     let bg = Rgb565::new(0, 8, 0); // very dark green for the bar
     let fg = Rgb565::WHITE;
 
-    Rectangle::new(Point::new(0, ORIGIN_Y), Size::new(135, HEIGHT))
-        .into_styled(PrimitiveStyle::with_fill(bg))
-        .draw(display)?;
+    // **No leading full-rectangle wipe.** The MonoTextStyle below
+    // carries `background_color`, so each glyph cell repaints both
+    // foreground and background atomically — a separate wipe would
+    // briefly clear the bar before the text lands and produces the
+    // 100 ms-cadence flicker the user sees. The 22-char fixed-width
+    // line covers 132 px of the 135 px panel; we paint the trailing
+    // 3 px below as a single tiny rectangle (negligible flicker).
 
     let style = MonoTextStyleBuilder::new()
         .font(&FONT_6X10)
@@ -77,6 +81,11 @@ where
     let visible = &visible[..visible.len().min(22)];
 
     Text::with_baseline(visible, Point::new(1, 2), style, Baseline::Top)
+        .draw(display)?;
+    // Tail-paint the 3 px right margin so the bar background covers
+    // the full panel width (132..135).
+    Rectangle::new(Point::new(132, ORIGIN_Y), Size::new(3, HEIGHT))
+        .into_styled(PrimitiveStyle::with_fill(bg))
         .draw(display)?;
     Ok(())
 }

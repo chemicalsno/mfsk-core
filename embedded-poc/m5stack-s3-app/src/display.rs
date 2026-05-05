@@ -115,8 +115,33 @@ pub fn run_log_panel(peripherals: Peripherals, fanout: &'static LogFanout) -> ! 
     // Paint the TX placeholder strip once (refreshed per redraw cycle).
     let tx_bg = Rgb565::new(0, 0, 8);
 
+    // Paint the TX placeholder strip once at boot. Phase 4 (QSO FSM)
+    // will repaint it from a dedicated dirty-seq when there's actual
+    // TX intent text to show; for Phase 3 it's a static "TX: ---"
+    // and full-frame repainting it every 100 ms was just adding load.
+    Rectangle::new(
+        Point::new(0, TX_REGION_Y),
+        Size::new(crate::board::LCD_WIDTH as u32, TX_REGION_H),
+    )
+    .into_styled(PrimitiveStyle::with_fill(tx_bg))
+    .draw(&mut display)
+    .ok();
+    Text::with_baseline(
+        "TX: ---",
+        Point::new(2, TX_REGION_Y + 2),
+        tx_style,
+        Baseline::Top,
+    )
+    .draw(&mut display)
+    .ok();
+
     let mut tick: u32 = 0;
-    let mut last_ui_seq: u32 = u32::MAX; // force first paint
+    // Separate dirty fingerprints for the two regions. WF advances
+    // every ~80 ms (per-pair WfTick) while decoded-list advances
+    // once per slot (~15 s); sharing one dirty_seq would cause the
+    // decoded list to re-render at WF cadence and flicker visibly.
+    let mut last_wf_len: usize = usize::MAX;
+    let mut last_decoded_fp: (usize, u32) = (usize::MAX, u32::MAX);
     loop {
         let heap = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() };
         log::info!("alive tick={tick} free_heap={heap}");
@@ -124,62 +149,54 @@ pub fn run_log_panel(peripherals: Peripherals, fanout: &'static LogFanout) -> ! 
         // ── status bar + heap update from UI state. We refresh the
         //    status struct here so the UTC / heap stay current even
         //    when no new decodes land.
-        let ui_seq;
         let status_snapshot;
         let decoded_snapshot;
         let wf_snapshot: heapless::Vec<crate::ui::state::WfLine, { crate::ui::state::WF_DEPTH }>;
+        let decoded_fp;
         {
             let mut ui = UI.lock().expect("UI mutex poisoned");
             ui.status.free_heap_kb = (heap / 1024) as u32;
-            ui_seq = ui.dirty_seq();
             status_snapshot = ui.status.clone();
-            // Take snapshots so we don't hold the lock while drawing.
             decoded_snapshot = ui
                 .decoded_iter()
                 .cloned()
                 .collect::<heapless::Vec<_, 16>>();
             wf_snapshot = ui.waterfall_iter().cloned().collect();
+            // Fingerprint the decoded ring by (count, max_slot_seq) so
+            // we re-render only when a slot completes — not on every
+            // per-pair WF tick that bumped the global dirty_seq.
+            let max_seq = decoded_snapshot
+                .iter()
+                .map(|r| r.slot_seq)
+                .max()
+                .unwrap_or(0);
+            decoded_fp = (decoded_snapshot.len(), max_seq);
         }
 
-        // Always repaint status bar (cheap, 14 px tall).
+        // Status bar refreshes every loop tick (cheap; no leading
+        // wipe in the renderer so it doesn't flicker).
         status_bar::render(&mut display, &status_snapshot).ok();
 
-        // Waterfall + decoded list — repaint only when state changed.
-        // Both are gated by the same `dirty_seq` since the decoder
-        // writes a WF row + N decode rows under one lock per slot.
-        if ui_seq != last_ui_seq {
-            // `waterfall::render` wants `&[&WfLine]` — borrow each.
+        // Waterfall: streams at per-pair cadence; redraw whenever the
+        // ring grew (length changed) — content only ever appends, so
+        // length is a sufficient fingerprint.
+        if wf_snapshot.len() != last_wf_len {
             let wf_refs: heapless::Vec<&crate::ui::state::WfLine, { crate::ui::state::WF_DEPTH }> =
                 wf_snapshot.iter().collect();
             waterfall::render(&mut display, &wf_refs).ok();
-            decoded_list::render(&mut display, &decoded_snapshot).ok();
-            last_ui_seq = ui_seq;
+            last_wf_len = wf_snapshot.len();
         }
 
-        // Boot-time log scroll has been retired now that the WF region
-        // is live. C-side ESP_LOG output and Rust `log::info!` still
-        // reach UART via the FanoutLogger; the on-LCD panel is only
-        // useful when the cable is unplugged from the host.
-        let _ = fanout;
+        // Decoded list: redraw only when a new slot's results landed.
+        if decoded_fp != last_decoded_fp {
+            decoded_list::render(&mut display, &decoded_snapshot).ok();
+            last_decoded_fp = decoded_fp;
+        }
 
-        // ── TX placeholder strip — Phase 4 (QSO FSM) will replace
-        //    this with live `TxIntent` text. For now it shows a
-        //    ‐ marker so the bottom of the screen isn't black.
-        Rectangle::new(
-            Point::new(0, TX_REGION_Y),
-            Size::new(crate::board::LCD_WIDTH as u32, TX_REGION_H),
-        )
-        .into_styled(PrimitiveStyle::with_fill(tx_bg))
-        .draw(&mut display)
-        .ok();
-        Text::with_baseline(
-            "TX: ---",
-            Point::new(2, TX_REGION_Y + 2),
-            tx_style,
-            Baseline::Top,
-        )
-        .draw(&mut display)
-        .ok();
+        // Phase 0.5 boot-time log scroll has been retired now that
+        // the WF region is live. UART log path stays via FanoutLogger.
+        let _ = fanout;
+        let _ = (tx_bg, tx_style); // painted once at boot above
 
         std::thread::sleep(std::time::Duration::from_millis(100));
         tick = tick.wrapping_add(1);
