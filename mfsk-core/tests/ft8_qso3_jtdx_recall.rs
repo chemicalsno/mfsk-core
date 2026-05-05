@@ -177,14 +177,13 @@ fn load_wav_i16(path: &Path) -> Vec<i16> {
 #[test]
 fn qso3_apoff_meets_jtdx_recall_floor() {
     let slot = load_wav_i16(Path::new(QSO3_PATH));
-    // BpAllOsd + max_cand=30 + sync_min=1.0 to match JTDX's
-    // aggressive recovery. OSD fallback handles BP-failures and
-    // sync_min=1.0 lets weaker coarse_sync candidates (e.g. K1BZM
-    // DK8NE -19 dB) reach the BP/OSD staircase. The OSD path now
-    // also enforces the WSJT-X-faithful `nharderrors > 36` gate
-    // (decode_block.rs:2433+) so spurious low-confidence OSD
-    // codewords don't leak as extras.
-    let decoded: Vec<_> = decode_block(&slot, 100.0, 3000.0, 1.0, DecodeDepth::BpAllOsd, 30);
+    // BpAllOsd + max_cand=60 + sync_min=0.8 — most aggressive setting
+    // to chase JTDX. OSD fallback handles BP-failures, sync_min=0.8
+    // lets weaker coarse_sync candidates (K1BZM DK8NE @-19 dB,
+    // WA2FZW @-15 busy) reach BP/OSD. The OSD path enforces the
+    // WSJT-X-faithful `nharderrors > 36` gate so spurious
+    // low-confidence OSD codewords don't leak as extras.
+    let decoded: Vec<_> = decode_block(&slot, 100.0, 3000.0, 0.8, DecodeDepth::BpAllOsd, 60);
 
     let mut by_msg: std::collections::HashMap<String, &mfsk_core::ft8::decode::DecodeResult> =
         std::collections::HashMap::new();
