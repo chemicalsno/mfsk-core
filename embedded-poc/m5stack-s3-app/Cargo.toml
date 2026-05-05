@@ -1,0 +1,70 @@
+[package]
+name = "mfsk-core-m5stack-s3-app"
+version = "0.1.0"
+authors = ["Minoru Tomobe <minoru.tomobe@gmail.com>"]
+edition = "2021"
+resolver = "2"
+rust-version = "1.82"
+
+# M5StickS3 (ESP32-S3, LX7) で動く IC-705 FT8 コントローラ本体。
+# 兄弟クレート `m5stack-s3` (compute bench) とは独立に動かす。
+# 共通ロジックは `embedded-shared` (streaming wrapper / esp_dsp_fft /
+# dual_core dispatch / Q3i8 LLR) を path dep で共有。
+
+[[bin]]
+name = "mfsk-core-m5stack-s3-app"
+harness = false
+
+[profile.release]
+# 兄弟クレートと同じ理由で opt-level=1 (LX7 LLVM の f32-select regression
+# 回避 + ELF debug 容易性)。後で "s" を試す価値はある。
+opt-level = 1
+
+[profile.dev]
+debug = true
+opt-level = 1
+
+[patch.crates-io]
+esp-idf-sys = { git = "https://github.com/esp-rs/esp-idf-sys.git" }
+esp-idf-hal = { git = "https://github.com/esp-rs/esp-idf-hal.git" }
+esp-idf-svc = { git = "https://github.com/esp-rs/esp-idf-svc.git" }
+
+[dependencies]
+log = "0.4"
+anyhow = "1"
+esp-idf-svc = { version = "0.52.1", features = ["critical-section", "embassy-time-driver", "embassy-sync"] }
+esp-idf-hal = "0.46"
+embassy-time = { version = "0.5", features = ["generic-queue-8"] }
+embassy-sync = "0.7"
+embassy-futures = "0.1"
+heapless = "0.8"
+num-complex = { version = "0.4", default-features = false }
+
+# mfsk-core / FFI: 兄弟クレートと同じ feature 構成。
+mfsk-core = { path = "../../mfsk-core", default-features = false, features = ["alloc", "std", "ft8", "fft-extern", "fixed-point", "profile-coarse", "nstep-half"] }
+mfsk-ffi-ft8 = { path = "../../mfsk-ffi-ft8", default-features = false, features = ["embedded-fixed-point"] }
+
+# 共有 embedded glue (streaming buffer / esp_dsp_fft / dual_core / Q3i8 LLR)
+embedded-shared = { path = "../embedded-shared" }
+
+# UI 描画。Slint / LVGL は依存サイズと整数性能の点で見送り。
+embedded-graphics = "0.8"
+mipidsi = "0.8"
+display-interface-spi = "0.5"
+
+# BLE central — Phase 2 で wire-up。Phase 0 の cargo check 段階では
+# クレートを依存に入れるだけ。実際の使用は src/civ.rs で。
+# esp32-nimble は esp-idf-svc 0.52 系と組み合わせる際のバージョン整合
+# がやや狭い。インストール時に lock 解決が失敗するようなら一時的に
+# コメントアウトして Phase 2 着手時に再評価。
+# esp32-nimble = "0.10"
+
+[build-dependencies]
+embuild = "0.33"
+
+# esp-dsp は decode 経路 (`embedded_shared::esp_dsp_fft`) が前提とする。
+# 兄弟クレートと同じ component 取り込み。
+[[package.metadata.esp-idf-sys.extra_components]]
+remote_component = { name = "espressif/esp-dsp", version = "^1.4" }
+bindings_header = "../bindings.h"
+bindings_module = "esp_dsp"

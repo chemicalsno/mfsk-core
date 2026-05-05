@@ -1,0 +1,9 @@
+# M5StickS3 = ESP32-S3-PICO-1-N8R8 (8 MB flash). Layout uses 4 MB total
+# so the same image boots on a 4 MB variant or with a stale 4 MB
+# bootloader; the trailing 4 MB of an 8 MB part is simply unused for now.
+# Phase 5 (ADIF logger) can grow `littlefs` later.
+# Name,     Type, SubType, Offset,  Size
+nvs,        data, nvs,     0x9000,  0x6000
+phy_init,   data, phy,     0xf000,  0x1000
+factory,    app,  factory, 0x10000, 0x330000
+littlefs,   data, spiffs,  0x340000, 0xC0000
