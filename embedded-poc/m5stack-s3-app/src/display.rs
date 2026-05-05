@@ -88,9 +88,13 @@ pub fn run_log_panel(peripherals: Peripherals, fanout: &'static LogFanout) -> ! 
                 },
                 I2sDriver,
             };
+            // 48 kHz stereo so the qso3 mono 12 kHz source upsamples
+            // by an integer 4× (zero-order hold) without resample
+            // artefacts. ES8311 sits in MCLK=BCLK mode (reg 0x01=0xB5)
+            // and follows whatever rate the I2S master generates.
             let i2s_cfg = StdConfig::new(
                 I2sConfig::default(),
-                StdClkConfig::new(44_100, ClockSource::Pll160M, MclkMultiple::M256),
+                StdClkConfig::new(48_000, ClockSource::Pll160M, MclkMultiple::M256),
                 StdSlotConfig::philips_slot_default(DataBitWidth::Bits16, SlotMode::Stereo),
                 StdGpioConfig::default(),
             );

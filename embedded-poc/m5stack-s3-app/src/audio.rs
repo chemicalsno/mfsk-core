@@ -16,12 +16,24 @@
 //! speaker sounding correct at 12 kHz / 16-bit / mono. Full register
 //! map at <https://docs.m5stack.com> ES8311 datasheet.
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use anyhow::{Context, Result};
 use esp_idf_hal::{
     delay::TickType,
     i2c::I2cDriver,
     i2s::{I2sDriver, I2sTx},
 };
+
+/// Audio playback gate. `true` (default) = stream WAV samples,
+/// `false` = emit silence. The decode pipeline flips this off
+/// around `pass2_split`+`stage3_split` because the BP stage
+/// sequesters both LX7 cores hard enough that the I2S DMA buffer
+/// underruns and the speaker emits buzz/clicks (user reported as
+/// "ぶつぶつ"). Silence avoids the audible glitch without disabling
+/// the I2S channel itself (which would re-introduce a transient
+/// pop on enable/disable).
+pub static AUDIO_GATE: AtomicBool = AtomicBool::new(true);
 
 const ES8311_ADDR: u8 = 0x18;
 /// PMIC (M5PM1) at I2C 0x6E. GPIO3 (bit 3 of reg 0x11) drives the
@@ -108,39 +120,68 @@ fn pmic_bit_off(i2c: &mut I2cDriver, reg: u8, mask: u8) -> Result<()> {
         .with_context(|| format!("PMIC write 0x{reg:02X}"))
 }
 
-/// Sine-wave test source for the audio path. 1 kHz at 44.1 kHz
-/// stereo, ±0x4000 amplitude (= -6 dBFS). Use this to confirm the
-/// ES8311 init + PA enable chain before plugging in real WAV data
-/// — if a tone is audible the codec / amplifier / speaker chain is
-/// good and any silence on real WAV is purely a sample-rate /
-/// resample issue.
+/// Loop the supplied 12 kHz mono 16-bit WAV out the I2S TX driver,
+/// upsampling 4× to 48 kHz stereo on the fly (zero-order hold).
+/// The codec is in `MCLK=BCLK` mode so the actual sample rate is
+/// whatever I2S generates — caller has set the I2S driver to 48 kHz.
 ///
-/// `wav` arg is currently unused — kept so the call site doesn't
-/// need to change when we switch back to `qso3_busy.wav` playback
-/// after the path is proven.
-pub fn audio_thread(mut i2s: I2sDriver<'static, I2sTx>, _wav: &'static [u8]) -> ! {
+/// 4× ZOH is audibly fine for a band-monitor demo (the FT8 audio
+/// already sits below 3 kHz, so the 6 kHz Nyquist of the source
+/// doesn't fold any spectral content into a problematic region).
+/// Switch to a polyphase filter later if a follow-up needs better
+/// transient response.
+///
+/// Digital attenuation of -18 dBFS (shift right by 3) sits the
+/// playback at the same listening level the user OK'd in the sine
+/// test (ES8311 DAC at 0x80 = -32 dB analog).
+pub fn audio_thread(mut i2s: I2sDriver<'static, I2sTx>, wav: &'static [u8]) -> ! {
     i2s.tx_enable().expect("I2S tx_enable");
-    log::info!("audio: I2S TX enabled, streaming 1 kHz sine @ 44.1 kHz stereo");
+    log::info!("audio: streaming WAV (12 kHz mono → 48 kHz stereo, 4× ZOH)");
 
-    // Pre-generate one full cycle so the loop is just a memcpy.
-    // 44100 / 1000 = 44.1 samples per cycle — round to 441 samples
-    // = exactly 10 cycles, repeats seamlessly.
-    const SR: usize = 44_100;
-    const CYCLE: usize = 441; // 10 cycles
-    const TWO_PI: f32 = 2.0 * core::f32::consts::PI;
-    let mut buf = vec![0u8; CYCLE * 4]; // 4 bytes per stereo sample
-    for n in 0..CYCLE {
-        let phase = (n as f32) * TWO_PI * 1000.0 / SR as f32;
-        let s = (phase.sin() * 4_096.0) as i16; // -18 dBFS digital
-        let bytes = s.to_le_bytes();
-        // Stereo: L, R, L, R, ... — same sample on both channels.
-        buf[n * 4..n * 4 + 2].copy_from_slice(&bytes);
-        buf[n * 4 + 2..n * 4 + 4].copy_from_slice(&bytes);
-    }
+    // Skip the 44-byte RIFF/fmt/data header. qso3_busy.wav is
+    // canonical 12 kHz mono i16 LE.
+    let pcm = if wav.len() > 44 { &wav[44..] } else { wav };
 
+    // Output chunk = 80 ms of 48 kHz stereo i16 = 48000 × 0.08 × 4 bytes.
+    // Input  chunk = 80 ms of 12 kHz mono i16 = 12000 × 0.08 × 2 = 1920 B
+    //                                             = 960 samples.
+    const IN_SAMPLES: usize = 960;
+    const OUT_BYTES: usize = IN_SAMPLES * 4 /*upsample*/ * 4 /*stereo i16*/;
+    let mut out = vec![0u8; OUT_BYTES];
+
+    let mut byte_pos = 0usize;
     loop {
+        let gate = AUDIO_GATE.load(Ordering::Acquire);
+        if gate {
+            let mut o = 0usize;
+            for _ in 0..IN_SAMPLES {
+                if byte_pos + 2 > pcm.len() {
+                    byte_pos = 0; // loop the WAV
+                }
+                let s = i16::from_le_bytes([pcm[byte_pos], pcm[byte_pos + 1]]);
+                byte_pos += 2;
+                // -18 dBFS digital attenuation. Combined with the
+                // codec's -32 dB analog DAC volume this lands at the
+                // listening level the user OK'd in the sine test.
+                let attn = (s >> 3).to_le_bytes();
+                for _ in 0..4 {
+                    out[o] = attn[0];
+                    out[o + 1] = attn[1];
+                    out[o + 2] = attn[0];
+                    out[o + 3] = attn[1];
+                    o += 4;
+                }
+            }
+        } else {
+            // Decode in flight — emit silence so the DMA buffer
+            // doesn't underrun (which produces audible buzz).
+            // Don't reset `byte_pos`; we resume from where we paused
+            // when the gate flips back on, so the WAV stays
+            // time-aligned with the decoder's view of the slot.
+            out.fill(0);
+        }
         if let Err(e) =
-            i2s.write_all(&buf, TickType::new_millis(500).ticks())
+            i2s.write_all(&out, TickType::new_millis(500).ticks())
         {
             log::warn!("audio: i2s write err {e:?}");
         }
