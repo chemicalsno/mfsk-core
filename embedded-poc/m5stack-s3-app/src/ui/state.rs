@@ -60,6 +60,11 @@ pub struct UiState {
     /// their last-rendered seq to skip the LCD push when nothing new.
     /// `AtomicU32` so the dirty check itself doesn't need the mutex.
     dirty_seq: AtomicU32,
+    /// Monotonic count of `push_waterfall` calls. Used by the
+    /// display loop as a fingerprint that *keeps advancing* once the
+    /// 100-row ring is full — `Deque::len()` plateaus at WF_DEPTH and
+    /// is therefore not a usable trigger after the first ~8 seconds.
+    wf_push_seq: AtomicU32,
 }
 
 impl UiState {
@@ -74,6 +79,7 @@ impl UiState {
                 free_heap_kb: 0,
             },
             dirty_seq: AtomicU32::new(0),
+            wf_push_seq: AtomicU32::new(0),
         }
     }
 
@@ -86,14 +92,24 @@ impl UiState {
         self.bump();
     }
 
-    /// Push one fresh waterfall row (= one slot's averaged spectrum).
-    /// Drops the oldest row when full.
+    /// Push one fresh waterfall row (= one stage1_inc pair's
+    /// decimated spectrum). Drops the oldest row when full and bumps
+    /// `wf_push_seq` so the display loop's fingerprint check fires
+    /// even after the ring saturates at `WF_DEPTH`.
     pub fn push_waterfall(&mut self, row: WfLine) {
         if self.waterfall.is_full() {
             let _ = self.waterfall.pop_front();
         }
         let _ = self.waterfall.push_back(row);
+        self.wf_push_seq.fetch_add(1, Ordering::AcqRel);
         self.bump();
+    }
+
+    /// Monotonic count of `push_waterfall` calls. Display loop uses
+    /// this to detect new WF rows after the ring saturates at
+    /// `WF_DEPTH`; a `len()` comparison alone plateaus at full ring.
+    pub fn wf_push_seq(&self) -> u32 {
+        self.wf_push_seq.load(Ordering::Acquire)
     }
 
     /// Newest-last view of all retained rows.

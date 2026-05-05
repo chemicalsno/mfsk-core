@@ -140,7 +140,12 @@ pub fn run_log_panel(peripherals: Peripherals, fanout: &'static LogFanout) -> ! 
     // every ~80 ms (per-pair WfTick) while decoded-list advances
     // once per slot (~15 s); sharing one dirty_seq would cause the
     // decoded list to re-render at WF cadence and flicker visibly.
-    let mut last_wf_len: usize = usize::MAX;
+    //
+    // **WF fingerprint = push count, NOT ring length** — the deque
+    // saturates at `WF_DEPTH = 100` after ~8 s, so `len()` plateaus
+    // and a `len()`-based check would freeze the WF redraw exactly
+    // when the user expects continuous flow.
+    let mut last_wf_seq: u32 = u32::MAX;
     let mut last_decoded_fp: (usize, u32) = (usize::MAX, u32::MAX);
     loop {
         let heap = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() };
@@ -153,6 +158,7 @@ pub fn run_log_panel(peripherals: Peripherals, fanout: &'static LogFanout) -> ! 
         let decoded_snapshot;
         let wf_snapshot: heapless::Vec<crate::ui::state::WfLine, { crate::ui::state::WF_DEPTH }>;
         let decoded_fp;
+        let wf_seq;
         {
             let mut ui = UI.lock().expect("UI mutex poisoned");
             ui.status.free_heap_kb = (heap / 1024) as u32;
@@ -162,6 +168,7 @@ pub fn run_log_panel(peripherals: Peripherals, fanout: &'static LogFanout) -> ! 
                 .cloned()
                 .collect::<heapless::Vec<_, 16>>();
             wf_snapshot = ui.waterfall_iter().cloned().collect();
+            wf_seq = ui.wf_push_seq();
             // Fingerprint the decoded ring by (count, max_slot_seq) so
             // we re-render only when a slot completes — not on every
             // per-pair WF tick that bumped the global dirty_seq.
@@ -177,14 +184,14 @@ pub fn run_log_panel(peripherals: Peripherals, fanout: &'static LogFanout) -> ! 
         // wipe in the renderer so it doesn't flicker).
         status_bar::render(&mut display, &status_snapshot).ok();
 
-        // Waterfall: streams at per-pair cadence; redraw whenever the
-        // ring grew (length changed) — content only ever appends, so
-        // length is a sufficient fingerprint.
-        if wf_snapshot.len() != last_wf_len {
+        // Waterfall: streams at per-pair cadence. Trigger on
+        // `wf_push_seq` so the redraw still fires after the ring
+        // saturates at WF_DEPTH (= ~8 s into runtime).
+        if wf_seq != last_wf_seq {
             let wf_refs: heapless::Vec<&crate::ui::state::WfLine, { crate::ui::state::WF_DEPTH }> =
                 wf_snapshot.iter().collect();
             waterfall::render(&mut display, &wf_refs).ok();
-            last_wf_len = wf_snapshot.len();
+            last_wf_seq = wf_seq;
         }
 
         // Decoded list: redraw only when a new slot's results landed.
