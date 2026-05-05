@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.5.6 — post-0.5.5 quick-fix: no_std math imports + allsum 7-tone alignment
+
+Two follow-up fixes to issues uncovered after the 0.5.5 publish:
+
+1. **no_std `f32::cos / sin / round` errors** in the Xtensa cross-build
+   (`mfsk-ffi-ft8 — Xtensa ESP32 / S3` CD jobs). `refine_fine.rs` and
+   `core/dsp/fft_mixed_3840.rs` were using inherent `f32` math methods
+   (std-only); under `no_std` (Xtensa, embedded targets) those methods
+   don't exist on bare `f32` and require the `num_traits::Float` trait
+   via `libm`. Added the standard `#[cfg(not(feature = "std"))] use
+   num_traits::Float;` import these two modules were missing. Host
+   build unaffected.
+
+2. **5 internal-consistency unit-test failures** inherited from a
+   v0.5.4-to-v0.5.5 intermediate commit (`48b1f37`, "WSJT-X-faithful
+   decode pipeline"). `coarse_sync_inner`'s inline `owned_allsum`
+   summed 8 tones (`for k in 0..NTONES`) while the public helper
+   `fill_coarse_allsum` summed 7 (matching WSJT-X `sync8.f90:66`,
+   where tone 7 is data-only and never a Costas position). The score
+   formula's divisor `(NTONES - 2) = 6` is calibrated to the 7-tone
+   sum — the 8-tone version was the bug. Aligned `owned_allsum` to
+   7 tones; updated the column-by-column reference helper in the
+   test suite that mirrored the 8-tone version. All 314 tests pass.
+
+Recall regression numbers (host f32 / qso3_busy) unchanged at floor —
+WSJT-X golden 7/8, JTDX 16/18 — verified post-fix.
+
 ## 0.5.5 — embedded recall fix (Hann→Rect window) + runtime BP iter + nstep-half feature
 
 A targeted patch addressing two latent embedded-side bugs uncovered while

@@ -800,12 +800,22 @@ fn coarse_sync_inner(
         ext
     } else {
         owned_allsum = {
+            // Sum 7 Costas-tone bins (k=0..NTONES-1; tone 7 is data-only,
+            // never a Costas position). Matches WSJT-X `sync8.f90:66` and
+            // the public `fill_coarse_allsum` helper, so the score
+            // formula's `(t0 - t) / (NTONES - 2)` divisor is calibrated:
+            // t0 sums 7 tones, t = 1 Costas-tone bin energy, t0-t = 6
+            // non-Costas tones, divisor = 6 ✓. Pre-fix this loop ran
+            // `0..NTONES` (= 8 tones), which made owned_allsum and
+            // fill_coarse_allsum disagree numerically and broke the
+            // `coarse_sync_with_allsum_matches_internal` /
+            // `coarse_sync_split_with_allsum_*` consistency tests.
             let mut buf = vec![CoarseAcc::default(); n_freq * spec.n_time];
             for (fi, i_carrier) in (ia..=ib).enumerate() {
                 let row_off = fi * spec.n_time;
                 for &m in &needed_m {
                     let mut s: CoarseAcc = CoarseAcc::default();
-                    for k in 0..NTONES {
+                    for k in 0..(NTONES - 1) {
                         let bin = (i_carrier + 2 * k).min(nh1 - 1);
                         s += spec.power_acc(bin, m);
                     }
@@ -2743,15 +2753,16 @@ mod tests {
         let n_time = spec.n_time;
 
         // Column-by-column: simulate incremental fill, walking m
-        // outer, fi inner. NFFT=3840 → 8-bin every-other gather per
-        // carrier (no sliding-window reuse since the pattern has zero
-        // overlap between adjacent fi). Mirrors stage1_inc.
+        // outer, fi inner. NFFT=3840 → 7-tone every-other gather per
+        // carrier (k=0..NTONES-1; tone 7 is data-only, never a Costas
+        // position — matches WSJT-X sync8.f90:66 and stage1_inc's
+        // `update_one_half`).
         let mut col: Vec<f32> = vec![0.0; n_freq * n_time];
         for m in 0..n_time {
             for fi in 0..n_freq {
                 let i_carrier = ia + fi;
                 let mut s = 0.0_f32;
-                for k in 0..NTONES {
+                for k in 0..(NTONES - 1) {
                     let bin = (i_carrier + 2 * k).min(nh1 - 1);
                     s += spec.power_acc(bin, m);
                 }

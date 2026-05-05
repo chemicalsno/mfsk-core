@@ -39,6 +39,8 @@ use alloc::vec::Vec;
 use core::f32::consts::TAU;
 
 use num_complex::Complex32;
+#[cfg(not(feature = "std"))]
+use num_traits::Float;
 
 use super::fft_15::fft_15;
 

@@ -26,6 +26,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use num_complex::Complex;
+#[cfg(not(feature = "std"))]
+use num_traits::Float;
 
 /// Signed-`i` analogue of WSJT-X `sync8d`. Mirrors WSJT-X
 /// `sync8d.f90:43-45`: each Costas block contributes 0 when its
