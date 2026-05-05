@@ -151,40 +151,53 @@ pub fn audio_thread(mut i2s: I2sDriver<'static, I2sTx>, wav: &'static [u8]) -> !
     const OUT_BYTES: usize = IN_SAMPLES * 4 /*upsample*/ * 4 /*stereo i16*/;
     let mut out = vec![0u8; OUT_BYTES];
 
+    // Per-output-sample envelope state, ramped towards the gate's
+    // target (1.0 = play, 0.0 = mute). 240-sample (= 5 ms at 48 kHz)
+    // ramp is fast enough that the user perceives the cue as instant
+    // but slow enough that the speaker cone doesn't see a step
+    // discontinuity — eliminates the click the user heard at the
+    // start of decode in the prior abrupt-mute version.
+    let mut env: f32 = 1.0;
+    const ENV_STEP: f32 = 1.0 / 240.0;
+
     let mut byte_pos = 0usize;
     loop {
-        let gate = AUDIO_GATE.load(Ordering::Acquire);
-        if gate {
-            let mut o = 0usize;
-            for _ in 0..IN_SAMPLES {
-                if byte_pos + 2 > pcm.len() {
-                    byte_pos = 0; // loop the WAV
-                }
-                let s = i16::from_le_bytes([pcm[byte_pos], pcm[byte_pos + 1]]);
-                byte_pos += 2;
-                // -18 dBFS digital attenuation. Combined with the
-                // codec's -32 dB analog DAC volume this lands at the
-                // listening level the user OK'd in the sine test.
-                let attn = (s >> 3).to_le_bytes();
-                for _ in 0..4 {
-                    out[o] = attn[0];
-                    out[o + 1] = attn[1];
-                    out[o + 2] = attn[0];
-                    out[o + 3] = attn[1];
-                    o += 4;
-                }
-            }
+        let target_env: f32 = if AUDIO_GATE.load(Ordering::Acquire) {
+            1.0
         } else {
-            // Decode in flight — emit silence so the DMA buffer
-            // doesn't underrun (which produces audible buzz).
-            // Don't reset `byte_pos`; we resume from where we paused
-            // when the gate flips back on, so the WAV stays
-            // time-aligned with the decoder's view of the slot.
-            out.fill(0);
+            0.0
+        };
+        let mut o = 0usize;
+        for _ in 0..IN_SAMPLES {
+            if byte_pos + 2 > pcm.len() {
+                byte_pos = 0; // loop the WAV
+            }
+            let s = i16::from_le_bytes([pcm[byte_pos], pcm[byte_pos + 1]]);
+            byte_pos += 2;
+
+            // Walk the envelope towards the gate target — 1 step per
+            // OUTPUT sample (= every 4× upsample tick). The 4× repeat
+            // below shares the same envelope value across the upsample
+            // group so the ramp is sample-rate accurate.
+            if env < target_env {
+                env = (env + ENV_STEP).min(target_env);
+            } else if env > target_env {
+                env = (env - ENV_STEP).max(target_env);
+            }
+
+            // -18 dBFS digital attenuation × envelope. Use f32 multiply
+            // since envelope is fractional; cast back to i16 LE.
+            let attenuated = ((s >> 3) as f32 * env) as i16;
+            let attn = attenuated.to_le_bytes();
+            for _ in 0..4 {
+                out[o] = attn[0];
+                out[o + 1] = attn[1];
+                out[o + 2] = attn[0];
+                out[o + 3] = attn[1];
+                o += 4;
+            }
         }
-        if let Err(e) =
-            i2s.write_all(&out, TickType::new_millis(500).ticks())
-        {
+        if let Err(e) = i2s.write_all(&out, TickType::new_millis(500).ticks()) {
             log::warn!("audio: i2s write err {e:?}");
         }
     }

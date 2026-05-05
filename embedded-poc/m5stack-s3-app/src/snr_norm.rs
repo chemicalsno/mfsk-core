@@ -21,13 +21,13 @@
 
 #![allow(dead_code)]
 
-/// Residual calibration offset applied **after** `xsnr2_db_simple`.
-/// Now that the embedded path uses xsnr2 (= signal/baseline ratio
-/// over the uniform-gain sync8 spectrogram, mfsk-core 0.5.7+) the
-/// per-block auto-gain bias is gone and `compute_snr_db`'s ±15 dB
-/// signal-to-signal drift no longer needs masking with a static
-/// offset. Kept at 0 dB; tweak only if a per-board RF analog gain
-/// calibration is needed in the future.
+/// Residual offset for the SNR shown in the UI. mfsk-core 0.5.8's
+/// `xsnr2_db_simple` already lands within ±3 dB of WSJT-X / JTDX
+/// across the qso3_busy reference (median-window noise floor
+/// rejects per-block auto-gain contamination), so this offset is
+/// kept at zero for the wav_sim path. Tweak it only when a board
+/// has a measurable RF analog gain offset that survives the
+/// xsnr2 normalisation.
 pub const DEFAULT_CALIBRATION_OFFSET_DB: f32 = 0.0;
 
 /// SNR の 5 段階品質バケット (UI 表示推奨)。

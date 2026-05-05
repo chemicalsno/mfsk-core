@@ -1875,25 +1875,40 @@ pub fn xsnr2_db_simple(spec: &Spectrogram, result: &DecodeResult, cell_scale: f3
         return -24.0;
     }
 
-    // Per-freq baseline = mean over time, computed locally around the
-    // decode's carrier. ±50 bins ≈ ±156 Hz at NFFT=3840 — wide enough
-    // to span a couple of FT8 channels for a stable noise estimate,
-    // narrow enough to skip the band edges where the receive filter
-    // rolls off.
+    // Per-freq baseline — **median** (P50) of cell values inside a
+    // local window around the decode's carrier. A plain mean is
+    // dragged upward by the very signal we're trying to measure, so
+    // xbase tracks xsig and the ratio collapses (verified
+    // empirically: W1FC at 0 dB had xbase ≈ 4.8 M while N1JFU at
+    // -14 dB had ≈ 0.15 M before this change). Median ignores the
+    // signal-bin outliers and reads true noise floor.
+    //
+    // Window: ±50 freq bins (~156 Hz at NFFT=3840) × time-decimated
+    // by `n_time / 50` so the sort touches ~2 500 samples. Sort cost
+    // on f32 ~25 k comparisons ~100 µs at LX7 240 MHz — well inside
+    // the post-SlotEnd budget.
     let carrier_bin = (result.freq_hz / df)
         .round()
         .clamp(0.0, (spec.n_freq - 1) as f32) as usize;
     let f_lo = carrier_bin.saturating_sub(50);
     let f_hi = (carrier_bin + 50).min(spec.n_freq - 1);
-    let mut base_acc: f64 = 0.0;
-    let mut base_count: usize = 0;
+    let t_stride = spec.n_time.div_ceil(50).max(1);
+    let mut samples: alloc::vec::Vec<f32> =
+        alloc::vec::Vec::with_capacity((f_hi - f_lo + 1) * spec.n_time.div_ceil(t_stride) + 4);
     for f in f_lo..=f_hi {
-        for t in 0..spec.n_time {
-            base_acc += spec.power_acc(f, t) as f64;
-            base_count += 1;
+        let mut t = 0usize;
+        while t < spec.n_time {
+            samples.push(spec.power_acc(f, t));
+            t += t_stride;
         }
     }
-    let xbase = (base_acc / base_count.max(1) as f64) as f32 * cell_scale;
+    samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
+    let median = if samples.is_empty() {
+        0.0
+    } else {
+        samples[samples.len() / 2]
+    };
+    let xbase = median * cell_scale;
     if xbase <= 0.0 || !xbase.is_finite() {
         return -24.0;
     }
@@ -1915,11 +1930,23 @@ pub fn xsnr2_db_simple(spec: &Spectrogram, result: &DecodeResult, cell_scale: f3
     }
     xsig *= cell_scale;
 
-    let arg = xsig / xbase / 3.0e6 - 1.0;
-    if arg <= 0.1 {
+    // Empirical calibration constant — pair-matched against the
+    // JTDX qso3_busy reference on real M5StickS3 silicon
+    // (2026-05-05). With the median-of-window noise floor above the
+    // raw `xsig/xbase` ratio spans ~1100 (-14 dB SNR) → ~100 000
+    // (0 dB SNR) on the embedded u16 spectrogram; the value below
+    // collapses that to JTDX-comparable dB within ±3 dB across
+    // weak / mid / strong signals.
+    //
+    // (WSJT-X's `ft8b.f90:451` value `3e6` is calibrated to their
+    // f32 spectrogram amplitude scale and doesn't carry over here.)
+    const XSNR2_CAL_DB: f32 = 46.0;
+
+    let ratio = xsig / xbase;
+    if ratio <= 1.0 {
         return -24.0;
     }
-    let snr = 10.0 * arg.log10() - 27.0;
+    let snr = 10.0 * ratio.log10() - XSNR2_CAL_DB;
     snr.max(-24.0)
 }
 

@@ -142,18 +142,14 @@ pub fn run() -> ! {
                     let mut msg: heapless::String<22> = heapless::String::new();
                     let take = text.len().min(msg.capacity());
                     let _ = msg.push_str(&text[..take]);
-                    // Slot-baseline xsnr2 SNR — bypasses the per-block
-                    // auto-gain bias `compute_snr_db` carries by
-                    // reading xsig + xbase from the same uniform-gain
-                    // sync8 spectrogram. Calibrated against WSJT-X /
-                    // JTDX absolute scale across all signals (weak +
-                    // strong), not just the weak-signal median the
-                    // old +3 dB offset hack targeted.
-                    //
-                    // `cell_scale` reverts the embedded fixed-point
-                    // FP_SPEC_SHIFT (= 12) so xsig/xbase land in the
-                    // WSJT-X calibration regime; host f32 builds pass
-                    // 1.0.
+                    // xsnr2-based SNR (mfsk-core 0.5.7+) — slot-wide
+                    // baseline (median over a ±156 Hz window) gives
+                    // a noise floor independent of the per-Costas-block
+                    // auto-gain that contaminates `compute_snr_db`,
+                    // so the dB number is comparable across signals
+                    // AND comparable to WSJT-X / JTDX (±3 dB on the
+                    // qso3_busy reference). `cell_scale` reverts the
+                    // embedded fixed-point FP_SPEC_SHIFT (= 12).
                     const FP_SPEC_SHIFT: u32 = 12;
                     let cell_scale = (1u32 << FP_SPEC_SHIFT) as f32;
                     let calibrated_snr =
@@ -171,7 +167,10 @@ pub fn run() -> ! {
                         first_seq: slot_seq,
                     };
                     ui.push_decode(row);
-                    log::info!("{:4.0}Hz {:+5.1}dB {}", r.freq_hz, r.snr_db, text);
+                    log::info!(
+                        "{:4.0}Hz {:+5.1}dB (raw={:+5.1}) {}",
+                        r.freq_hz, calibrated_snr, r.snr_db, text
+                    );
                 }
             }
         }

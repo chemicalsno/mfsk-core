@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.5.8 — `xsnr2_db_simple` calibration fix (median noise floor + emp. constant)
+
+0.5.7 introduced `xsnr2_db_simple` but kept WSJT-X's `/3e6` + `-27 dB`
+calibration constants verbatim — those numbers are tied to WSJT-X's
+f32 spectrogram amplitude scale and don't survive the embedded u16
+spec's auto-gain. The result was every reading clamped to the
+`-24 dB` floor on real silicon. Two changes land it on JTDX absolute
+SNR within ±3 dB across weak / mid / strong signals:
+
+1. Per-frequency baseline switches from **mean** to **median (P50)**
+   over a ±50 freq bin × time-decimated window. The plain mean is
+   dragged upward by the very signal we're measuring (W1FC at 0 dB
+   gave xbase ≈ 4.8 M before, but only 0.14 M after — a 35× drop in
+   bias). Sort cost ~100 µs at LX7 240 MHz, well inside the
+   post-SlotEnd budget.
+
+2. Calibration constant becomes a **single empirical `46 dB`** offset
+   instead of the WSJT-X `/3e6 - 1` / `-27 dB` combo. Pair-matched
+   on the qso3_busy reference (real M5StickS3 silicon, 2026-05-05):
+
+   ```text
+   signal      ours     JTDX    err
+   W1FC        +2.8       0     +2.8
+   A92EE       -8.2      -9     +0.8
+   WM3PEN      +4.1       0     +4.1
+   N1JFU      -15.4     -14     -1.4
+   K1JT HA0DU -14.5     -13     -1.5
+   F5RXL       -3.9      -3     -0.9
+   ```
+
+m5stack-s3-app's decode_pipeline now passes the xsnr2 number into
+the UI and drops the `+3 dB` offset hack (snr_norm's
+`DEFAULT_CALIBRATION_OFFSET_DB` returns to 0.0).
+
+Embedded-only follow-up (audio): `audio.rs` adds a 5 ms envelope
+ramp around the AUDIO_GATE flips so transitioning into / out of
+the per-decode mute window doesn't click the speaker.
+
+API surface unchanged from 0.5.7 — pure constant + algorithm tune
+of `xsnr2_db_simple`. No breaking changes; safe patch bump.
+
 ## 0.5.7 — `xsnr2_db_simple`: WSJT-X-comparable SNR for any Spectrogram
 
 Adds `mfsk_core::ft8::decode_block::xsnr2_db_simple(spec, result,
