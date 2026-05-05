@@ -138,13 +138,20 @@ pub fn run() -> ! {
                     let mut msg: heapless::String<22> = heapless::String::new();
                     let take = text.len().min(msg.capacity());
                     let _ = msg.push_str(&text[..take]);
+                    // Calibrate raw `compute_snr_db` against the JTDX
+                    // weak-signal median (see snr_norm.rs). Strong
+                    // signals will still drift due to fill_symbol_spectra
+                    // per-block auto-gain — that's a structural i16 path
+                    // limitation, not solvable with a uniform offset.
+                    let calibrated_snr =
+                        r.snr_db + crate::snr_norm::DEFAULT_CALIBRATION_OFFSET_DB;
                     // `first_seq` is provisionally `slot_seq`; if the
                     // msg is already in the ring `push_decode` will
                     // overwrite this with the existing entry's seq so
                     // recurring callsigns don't re-flash the highlight.
                     let row = DecodedRow {
                         df_hz: r.freq_hz.round().clamp(0.0, 65_535.0) as u16,
-                        snr_db: r.snr_db.round().clamp(-128.0, 127.0) as i8,
+                        snr_db: calibrated_snr.round().clamp(-128.0, 127.0) as i8,
                         hard_errors: r.hard_errors.min(255) as u8,
                         msg,
                         slot_seq,

@@ -21,17 +21,27 @@
 
 #![allow(dead_code)]
 
-/// 起動時 calibration offset の初期値。
+/// Calibration offset applied to `compute_snr_db` raw output before
+/// it lands in the UI. Pair-matched against the JTDX qso3 golden
+/// (2026-05-05) on real M5StickS3 silicon, weak-signal subset
+/// (= K1JT HA0DU / A92EE F5PSR / N1JFU EA6EE):
 ///
-/// **2026-05-04 実機実測の結論: 単一 offset では校正不能** —
-/// i16 fixed-point の per-block auto-gain により、Δ(device - WSJT-X) が
-/// -1.6 dB 〜 -16.0 dB の範囲で signal ごとにバラつく (隣接強信号の
-/// 有無で block gain が変わるため)。詳細は memory
-/// `reference_qso3_busy_wsjtx_decode.md` 参照。
+/// ```text
+/// signal           ours    JTDX   diff
+/// K1JT HA0DU      -16.7    -13    -3.7
+/// A92EE F5PSR     -11.8     -9    -2.8
+/// N1JFU EA6EE     -15.1    -14    -1.1
+/// ```
 ///
-/// 当面の方針は **`bucket_quality()` で 5 段階量子化して表示**、固定
-/// offset は使わない。`normalize()` も互換のため残すがバケット表示が推奨。
-pub const DEFAULT_CALIBRATION_OFFSET_DB: f32 = 0.0;
+/// Median diff = **-2.8 dB**, so adding +3 dB lands the displayed
+/// reading within ±1-2 dB of JTDX for weak signals. **Strong-signal
+/// readings (e.g. W1FC F5BZB at JTDX 0 dB / ours -12.5) remain
+/// off by ~12 dB** because the i16 fixed-point per-block auto-gain
+/// in `fill_symbol_spectra` shifts the cs scale per Costas block;
+/// no single offset can flatten that. For the controller UI weak
+/// signals matter more (those are the ones a user worries about
+/// catching), so the +3 dB rough median is a net win.
+pub const DEFAULT_CALIBRATION_OFFSET_DB: f32 = 3.0;
 
 /// SNR の 5 段階品質バケット (UI 表示推奨)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
