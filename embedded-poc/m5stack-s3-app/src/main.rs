@@ -3,6 +3,7 @@
 #![allow(dead_code)]
 
 mod adif;
+mod audio;
 mod board;
 mod buttons;
 mod civ;

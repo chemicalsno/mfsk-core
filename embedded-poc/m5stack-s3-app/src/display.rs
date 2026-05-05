@@ -49,7 +49,7 @@ const TX_REGION_H: u32 = 14;
 pub fn run_log_panel(peripherals: Peripherals, fanout: &'static LogFanout) -> ! {
     // ── PMIC: M5PM1 経由で LCD 電源 ON。これを欠くと SPI/GPIO が完璧でも
     //   panel は永久に黒。M5GFX board_M5StickS3 と同シーケンス。
-    let _i2c = match crate::pmic::init_lcd_power(
+    let mut i2c = match crate::pmic::init_lcd_power(
         peripherals.i2c1,
         peripherals.pins.gpio47,
         peripherals.pins.gpio48,
@@ -65,6 +65,61 @@ pub fn run_log_panel(peripherals: Peripherals, fanout: &'static LogFanout) -> ! 
     let mut bl = PinDriver::output(peripherals.pins.gpio38).expect("BL gpio38");
     bl.set_high().ok();
     core::mem::forget(bl);
+
+    // ── ES8311 codec init via the same I2C bus, then drop the I2C
+    //    handle (codec keeps its config; we won't touch its registers
+    //    again at runtime). I2S setup follows.
+    if let Some(i2c_drv) = i2c.as_mut() {
+        if let Err(e) = crate::audio::init_es8311(i2c_drv) {
+            log::warn!("ES8311 init failed (audio disabled): {e:#}");
+        } else {
+            // Build the I2S TX channel. Pin assignment matches
+            // M5Unified's `_speaker_enabled_cb_sticks3` board config:
+            //   MCK = 18, BCK = 17, WS = 15, DATA OUT = 14.
+            //   (`reference_m5stick_s3_pinout.md` had 14 / 16 swapped
+            //    before — M5Unified is canonical.)
+            // Stereo at 44.1 kHz to match the upstream board init —
+            // the codec is in `MCLK=BCLK` mode (see audio.rs reg 0x01),
+            // so it derives all internal clocks from BCLK regardless.
+            use esp_idf_hal::i2s::{
+                config::{
+                    ClockSource, Config as I2sConfig, DataBitWidth, MclkMultiple, SlotMode,
+                    StdClkConfig, StdConfig, StdGpioConfig, StdSlotConfig,
+                },
+                I2sDriver,
+            };
+            let i2s_cfg = StdConfig::new(
+                I2sConfig::default(),
+                StdClkConfig::new(44_100, ClockSource::Pll160M, MclkMultiple::M256),
+                StdSlotConfig::philips_slot_default(DataBitWidth::Bits16, SlotMode::Stereo),
+                StdGpioConfig::default(),
+            );
+            match I2sDriver::new_std_tx(
+                peripherals.i2s0,
+                &i2s_cfg,
+                peripherals.pins.gpio17,         // BCLK
+                peripherals.pins.gpio14,         // DOUT (S3 → codec)
+                Some(peripherals.pins.gpio18),   // MCLK
+                peripherals.pins.gpio15,         // WS / LRCK
+            ) {
+                Ok(i2s) => {
+                    // Lift the PMIC PA enable line *before* the audio
+                    // thread starts streaming so the first samples
+                    // hit a powered amp.
+                    if let Err(e) = crate::audio::pa_enable(i2c_drv) {
+                        log::warn!("PA enable failed: {e:#}");
+                    }
+                    static QSO3: &[u8] = include_bytes!("../../assets/qso3_busy.wav");
+                    std::thread::Builder::new()
+                        .stack_size(8 * 1024)
+                        .spawn(move || crate::audio::audio_thread(i2s, QSO3))
+                        .expect("spawn audio thread");
+                }
+                Err(e) => log::warn!("I2S TX init failed: {e:?}"),
+            }
+        }
+    }
+    drop(i2c);
 
     // ── SPI3 host (M5GFX が SPI3_HOST を使用)。SPI2 ではない。
     let driver = SpiDriver::new(
