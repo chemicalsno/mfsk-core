@@ -32,7 +32,12 @@ const NSPS: usize = 1_920;
 const NSTEP: usize = NSPS / 2; // 960
 const NMAX: usize = 180_000;
 const NTONES: usize = 8;
-const NFFT_SPEC: usize = 4_096;
+// Pulled from mfsk_core so the spec layout stays in lockstep with the
+// downstream pass2/stage3 expectations. If this drifts, coarse_sync
+// candidates land in the wrong frequency bins and the entire slot
+// silently produces zero results (recall=0). Keep `assert!` below.
+const NFFT_SPEC: usize = mfsk_core::ft8::decode_block::NFFT_SPEC;
+const _: () = assert!(NFFT_SPEC == 3_840, "stage1_inc NFFT_SPEC must match mfsk_core (3840)");
 const FP_SPEC_SHIFT: u32 = 12;
 const TONE_SPACING_HZ: f32 = 6.25;
 const SAMPLE_RATE_HZ: f32 = 12_000.0;
@@ -287,7 +292,9 @@ fn compute_pair_into(ctx: &mut WorkerCtx, j_a: usize, j_b: usize) {
     let ia_a = j_a * NSTEP;
     let ia_b = j_b * NSTEP;
     let n_freq = ctx.n_freq;
-    let mask = NFFT_SPEC - 1;
+    // Modular wrap (NFFT_SPEC=3840 isn't a power of two so bitmask
+    // would alias the high bins). `kn = (NFFT - k) mod NFFT` collapses
+    // k=0 to 0 (DC bin is real), as the demux formula expects.
 
     // Pack audio[ia_a..+NSPS] real, audio[ia_b..+NSPS] imag, both
     // through the Hann window with auto-gain shift applied.
@@ -322,7 +329,7 @@ fn compute_pair_into(ctx: &mut WorkerCtx, j_a: usize, j_b: usize) {
         let buf = &ctx.fft_buf;
         let spec = &mut ctx.cur.spec;
         for k in 0..n_freq {
-            let kn = (NFFT_SPEC - k) & mask;
+            let kn = if k == 0 { 0 } else { NFFT_SPEC - k };
             let yk_re = buf[k].re as i32;
             let yk_im = buf[k].im as i32;
             let yn_re = buf[kn].re as i32;

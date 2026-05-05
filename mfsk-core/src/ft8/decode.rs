@@ -372,15 +372,42 @@ fn process_candidate(
     ap_hint: Option<&ApHint>,
 ) -> Option<DecodeResult> {
     let osd_score_min = strictness.osd_score_min();
-    let (cd0, _) = downsample(audio, cand.freq_hz, Some(fft_cache));
+    let (mut cd0, _) = downsample(audio, cand.freq_hz, Some(fft_cache));
 
-    let refined = refine_candidate(&cd0, cand, 10);
+    // WSJT-X 3-stage fine refinement (ft8b.f90:104-150). Validates
+    // freq snap to ±0.5 Hz grid + dt to integer 200 Hz step before
+    // computing symbol spectra. Without this, busy-band birdies that
+    // sit ±1-2 Hz off the real FT8 carrier still produce coherent
+    // Costas correlation at the candidate's initial freq, leak into
+    // BP, and emit phantom CRC-pass decodes (e.g. qso3_busy W1FC /
+    // WM3PEN / XE2X at f > 2 kHz).
+    let refine_result = crate::ft8::refine_fine::fine_refine_3stage(&cd0, cand.dt_sec);
+    let refined = SyncCandidate {
+        freq_hz: cand.freq_hz + refine_result.delf_hz,
+        dt_sec: refine_result.dt_sec,
+        score: refine_result.score,
+    };
+    if refine_result.delf_hz.abs() > f32::EPSILON {
+        // Apply the freq shift in place so symbol_spectra / BP see
+        // the refined baseband.
+        let dt2 = 1.0_f32 / 200.0;
+        for (k, c) in cd0.iter_mut().enumerate() {
+            let phi = -core::f32::consts::TAU * refine_result.delf_hz * (k as f32) * dt2;
+            let rot = num_complex::Complex::new(phi.cos(), phi.sin());
+            *c *= rot;
+        }
+    }
+    let cand_owned = refined.clone();
+    let cand: &SyncCandidate = &cand_owned;
+
     let i_start = ((refined.dt_sec + 0.5) * 200.0).round() as usize;
     let cs_raw = symbol_spectra(&cd0, i_start);
     let nsync = sync_quality(&cs_raw);
     if nsync <= 6 {
         return None;
     }
+    // Drop the now-unused single-stage refine helper.
+    let _ = refine_candidate;
 
     let sync_cv = {
         let (sa, sb, sc) = fine_sync_power_split(&cd0, i_start);
@@ -408,9 +435,17 @@ fn process_candidate(
             ],
         };
 
-        // BP decode (no AP)
+        // BP decode (no AP). WSJT-X ft8b.f90:422 gates `nharderrors > 36`
+        // before accepting — high-hard-error CRC passes are the dominant
+        // phantom source on busy bands. Match the threshold faithfully
+        // so qso3_busy phantoms (W1FC / WM3PEN / XE2X at f > 2 kHz) get
+        // dropped instead of leaking through.
+        const WSJTX_NHARDERRORS_MAX: u32 = 36;
         for &(llr, pass_id) in llr_variants {
             if let Some(bp) = bp_decode(llr, None, BP_MAX_ITER, Some(check_crc14)) {
+                if bp.hard_errors > WSJTX_NHARDERRORS_MAX {
+                    continue;
+                }
                 let itone = message_to_tones(&bp.message77);
                 let snr_db = compute_snr_db(cs, &itone);
                 return Some(DecodeResult {

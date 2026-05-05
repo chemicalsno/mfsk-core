@@ -43,14 +43,23 @@ pub extern "Rust" fn mfsk_core_make_default_fft_planner() -> Box<dyn FftPlanner>
 /// `len` must be a power of two; pass the largest size the pipeline
 /// will use (NFFT_SPEC = 4096 for FT8 decode_block).
 pub fn prewarm(len: usize) {
-    assert!(len.is_power_of_two(), "prewarm len must be power of two");
+    // The mixed-radix 3840 path (FT8 NFFT_SPEC) uses a 256-pt esp-dsp
+    // sub-kernel; non-power-of-two sizes are routed through it. Map
+    // them to the inner radix-2 size before initialising the table.
+    let radix2_len = if len.is_power_of_two() {
+        len
+    } else if len == 3840 {
+        256
+    } else {
+        panic!("prewarm: unsupported len {len}");
+    };
     unsafe {
         assert_eq!(
-            dsps_fft2r_init_fc32(core::ptr::null_mut(), len as i32),
+            dsps_fft2r_init_fc32(core::ptr::null_mut(), radix2_len as i32),
             ESP_OK
         );
         assert_eq!(
-            dsps_fft2r_init_sc16(core::ptr::null_mut(), len as i32),
+            dsps_fft2r_init_sc16(core::ptr::null_mut(), radix2_len as i32),
             ESP_OK
         );
     }
@@ -361,24 +370,113 @@ impl Default for EspDspPlanner16 {
 
 impl FftPlanner16 for EspDspPlanner16 {
     fn plan_forward(&mut self, len: usize) -> Box<dyn Fft16> {
+        // 3840 = 256 × 15 mixed-radix (FT8 NFFT_SPEC). The 256-pt sc16
+        // FFT runs on esp-dsp asm; the 15-pt PFA + twiddle multiply
+        // happens in f32 (one-shot scratch alloc in `process`).
+        if len == 3840 {
+            self.ensure_table(256);
+            return Box::new(MixedRadix3840Sc16Fft::new());
+        }
         assert!(
             len.is_power_of_two() && len >= 4,
-            "esp-dsp i16 FFT requires power-of-2 length ≥ 4 (got {len})"
+            "esp-dsp i16 FFT: unsupported length {len} (need power-of-2 ≥ 4 or 3840)"
         );
         self.ensure_table(len);
         Box::new(EspDspFft16 { len, forward: true })
     }
 
     fn plan_inverse(&mut self, len: usize) -> Box<dyn Fft16> {
+        if len == 3840 {
+            unimplemented!("inverse 3840-pt sc16 FFT not wired (FT8 spectrogram is forward-only)");
+        }
         assert!(
             len.is_power_of_two() && len >= 4,
-            "esp-dsp i16 FFT requires power-of-2 length ≥ 4 (got {len})"
+            "esp-dsp i16 FFT: unsupported length {len} (need power-of-2 ≥ 4)"
         );
         self.ensure_table(len);
         Box::new(EspDspFft16 {
             len,
             forward: false,
         })
+    }
+}
+
+/// 3840-pt sc16 forward FFT via Cooley-Tukey 256 × 15 mixed-radix.
+///
+/// The 256-pt sub-kernel uses esp-dsp's sc16 asm path. The 15-pt PFA
+/// runs in f32 because Q15 i16 cos/sin twiddles at 5-pt Winograd
+/// granularity lose ~3 effective bits per stage, which collapses
+/// realistic FT8 SNR margins. The f32 detour costs ~1 ms over the
+/// 184-frame slot — invisible vs the ~3 ms/FFT mixed-radix budget.
+struct MixedRadix3840Sc16Fft {
+    twiddles: alloc::boxed::Box<[Complex32; mfsk_core::core::dsp::fft_mixed_3840::N]>,
+}
+
+impl MixedRadix3840Sc16Fft {
+    fn new() -> Self {
+        Self {
+            twiddles: mfsk_core::core::dsp::fft_mixed_3840::build_twiddles(),
+        }
+    }
+}
+
+impl Fft16 for MixedRadix3840Sc16Fft {
+    fn process(&self, buf: &mut [Complex<i16>]) {
+        const N: usize = mfsk_core::core::dsp::fft_mixed_3840::N;
+        const N1: usize = 256;
+        const N2: usize = 15;
+        assert_eq!(buf.len(), N, "3840 sc16 FFT input length mismatch");
+
+        // ── Step 1+2: reshape to 15 rows × 256 cols (i16) and run a
+        //              256-pt sc16 esp-dsp FFT on each row.
+        // We allocate the row buffer on the heap to avoid a 2 KB stack
+        // bump; this path runs once per 184-frame slot tail so the alloc
+        // cost is negligible.
+        let mut rows: alloc::vec::Vec<Complex<i16>> =
+            alloc::vec![Complex::new(0i16, 0i16); N];
+        for n1 in 0..N1 {
+            for n2 in 0..N2 {
+                rows[n2 * N1 + n1] = buf[15 * n1 + n2];
+            }
+        }
+        for n2 in 0..N2 {
+            let row_ptr = rows[n2 * N1..(n2 + 1) * N1].as_mut_ptr() as *mut i16;
+            unsafe {
+                dsps_fft2r_sc16_ae32_(row_ptr, N1 as i32, dsps_fft_w_table_sc16);
+                dsps_bit_rev_sc16_ansi(row_ptr, N1 as i32);
+            }
+        }
+
+        // ── Step 3+4: convert to f32, twiddle, run 15-pt PFA per column.
+        let mut m: alloc::vec::Vec<Complex32> =
+            alloc::vec![Complex32::new(0.0, 0.0); N];
+        for (i, c) in rows.iter().enumerate() {
+            m[i] = Complex32::new(c.re as f32, c.im as f32) * self.twiddles[i];
+        }
+        let mut col = [Complex32::new(0.0, 0.0); N2];
+        for k1 in 0..N1 {
+            for k2 in 0..N2 {
+                col[k2] = m[k2 * N1 + k1];
+            }
+            mfsk_core::core::dsp::fft_15::fft_15(&mut col);
+            for k2 in 0..N2 {
+                m[k2 * N1 + k1] = col[k2];
+            }
+        }
+
+        // ── Step 5: clamp to i16 and write back in natural index order.
+        for k2 in 0..N2 {
+            for k1 in 0..N1 {
+                let c = m[k2 * N1 + k1];
+                let re = c.re.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+                let im = c.im.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+                buf[N1 * k2 + k1] = Complex::new(re, im);
+            }
+        }
+    }
+
+    fn len(&self) -> usize {
+        mfsk_core::core::dsp::fft_mixed_3840::N
     }
 }
 

@@ -53,7 +53,11 @@ pub fn run(
 ) -> ! {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
-    log::info!("rx-wavsim starting (mfsk-core {})", mfsk_core::VERSION);
+    log::info!(
+        "rx-wavsim starting (mfsk-core {}, NFFT_SPEC={})",
+        mfsk_core::VERSION,
+        mfsk_core::ft8::decode_block::NFFT_SPEC
+    );
 
     let need = mfsk_ft8_basis_scratch_len();
     assert!(BASIS_SCRATCH_LEN >= need, "BASIS_SCRATCH_LEN too small");

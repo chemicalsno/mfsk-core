@@ -70,8 +70,9 @@ pub mod llr;
 pub mod message;
 pub mod params;
 #[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
-pub mod resample;
+pub mod refine_fine;
 #[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
+pub mod resample;
 pub mod subtract;
 #[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub mod sync;

@@ -364,13 +364,18 @@ where
         let start = block.start_symbol as usize;
         for (t, &expected) in block.pattern.iter().enumerate() {
             let sym = start + t;
-            let best = (0..ntones)
-                .max_by(|&a, &b| {
-                    let na = cs[sym * ntones + a].norm_sqr_wide();
-                    let nb = cs[sym * ntones + b].norm_sqr_wide();
-                    na.partial_cmp(&nb).unwrap()
-                })
-                .unwrap_or(0);
+            // Fortran `maxloc(s8(:,k))` returns the FIRST index of the
+            // maximum on ties. `Iterator::max_by` returns the LAST.
+            // Use a manual loop with strict `>` to match WSJT-X.
+            let mut best = 0usize;
+            let mut best_val = cs[sym * ntones].norm_sqr_wide();
+            for a in 1..ntones {
+                let v = cs[sym * ntones + a].norm_sqr_wide();
+                if v > best_val {
+                    best_val = v;
+                    best = a;
+                }
+            }
             if best == expected as usize {
                 count += 1;
             }
