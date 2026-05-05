@@ -80,7 +80,7 @@ pub fn init_es8311(i2c: &mut I2cDriver) -> Result<()> {
         // 0xB5 = 0xBF − 10 = ~ -10 dB ≈ 1/3 linear of M5Unified's
         // 0 dB reference (user's preferred listening level on the
         // tiny built-in speaker after the qso3 WAV bring-up).
-        (0x32, 0xB5), // DAC volume: ~ -10 dB (≈ 1/3 of 0xBF)
+        (0x32, 0xA9), // DAC volume: ~ -22 dB (= 0xB5 −12 dB, two halvings)
         (0x37, 0x08), // DAC: bypass equalizer
     ];
     for &(reg, val) in seq {
@@ -137,8 +137,17 @@ fn pmic_bit_off(i2c: &mut I2cDriver, reg: u8, mask: u8) -> Result<()> {
 /// playback at the same listening level the user OK'd in the sine
 /// test (ES8311 DAC at 0x80 = -32 dB analog).
 pub fn audio_thread(mut i2s: I2sDriver<'static, I2sTx>, wav: &'static [u8]) -> ! {
+    // Bump our FreeRTOS priority above the dual_core worker (= 5)
+    // and stage1_inc (= 3) so stage 3 BP can't starve the I2S DMA
+    // refill — that starvation drains the DMA buffer to underrun
+    // and the codec emits a click when audio resumes. Priority 8
+    // lands between the dual_core worker and the watchdog.
+    unsafe {
+        esp_idf_svc::sys::vTaskPrioritySet(core::ptr::null_mut(), 8);
+    }
+
     i2s.tx_enable().expect("I2S tx_enable");
-    log::info!("audio: streaming WAV (12 kHz mono → 48 kHz stereo, 4× ZOH)");
+    log::info!("audio: streaming WAV (12 kHz mono → 48 kHz stereo, 4× ZOH, prio 8)");
 
     // Skip the 44-byte RIFF/fmt/data header. qso3_busy.wav is
     // canonical 12 kHz mono i16 LE.

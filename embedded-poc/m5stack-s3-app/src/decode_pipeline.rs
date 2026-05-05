@@ -132,6 +132,22 @@ pub fn run() -> ! {
 
         log::info!("WAV[{wav_idx}] p1={n_pass1} dec={}", results.len());
         slot_seq = slot_seq.wrapping_add(1);
+
+        // Feed every result's DT into the slot's median estimator,
+        // then finalise. The estimate is the device's local-clock
+        // offset relative to the band consensus — used by Phase 4
+        // QSO FSM as a fallback time source when no GPS is wired.
+        for r in results.iter() {
+            crate::time_sync::record_decode_dt(r.dt_sec);
+        }
+        crate::time_sync::finalize_slot();
+        if let Some(off) = crate::time_sync::slot_dt_offset() {
+            log::info!(
+                "  median DT = {:+.3} s ({} slots)",
+                off,
+                crate::time_sync::slots_finalised()
+            );
+        }
         // Push every CRC-passing decode to the UI ring. WF rows are
         // streamed separately by the `wf_drain` task at per-pair
         // cadence (~80 ms) so this loop only handles decode results.
