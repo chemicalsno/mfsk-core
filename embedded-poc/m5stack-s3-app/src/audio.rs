@@ -74,11 +74,13 @@ pub fn init_es8311(i2c: &mut I2cDriver) -> Result<()> {
         (0x0D, 0x01), // SYSTEM: power up analog
         (0x12, 0x00), // SYSTEM: power up DAC
         (0x13, 0x10), // SYSTEM: enable output to HP drive
-        // DAC volume — ES8311 reg 0x32 is unsigned 0..0xFF, each
-        // step = 0.5 dB, with 0xBF ≈ 0 dBFS. Knock 32 dB off so the
-        // sine test (and subsequent qso3 playback) sit at a polite
-        // listening level on the M5StickS3's tiny speaker.
-        (0x32, 0x80), // DAC volume: −32 dB (0x80)
+        // DAC volume — ES8311 reg 0x32. M5Unified board init uses
+        // 0xBF and labels it "0 dB"; the M5PaperColor board's
+        // `+16 dB` value 0xCF gives a 1 dB/step calibration.
+        // 0xB5 = 0xBF − 10 = ~ -10 dB ≈ 1/3 linear of M5Unified's
+        // 0 dB reference (user's preferred listening level on the
+        // tiny built-in speaker after the qso3 WAV bring-up).
+        (0x32, 0xB5), // DAC volume: ~ -10 dB (≈ 1/3 of 0xBF)
         (0x37, 0x08), // DAC: bypass equalizer
     ];
     for &(reg, val) in seq {

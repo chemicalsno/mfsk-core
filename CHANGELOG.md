@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.5.7 — `xsnr2_db_simple`: WSJT-X-comparable SNR for any Spectrogram
+
+Adds `mfsk_core::ft8::decode_block::xsnr2_db_simple(spec, result,
+cell_scale)` — a `std`-free port of the WSJT-X `ft8b.f90:449-454`
+xsnr2 SNR formula that runs on *any* `Spectrogram`, host f32 or
+embedded u16. Closes the long-standing per-block-auto-gain bias on
+the embedded `compute_snr_db` path: same callsign now decodes with
+±1-2 dB of WSJT-X / JTDX absolute SNR for both weak and strong
+signals, where the old per-Costas-block adjacent-tone ratio drifted
+~0–15 dB depending on which block's gain factor it landed on.
+
+Internally it computes a localised per-frequency baseline (= mean
+over time, ±50 bins around the decode's carrier — `~150 Hz`) so the
+embedded path doesn't depend on `baseline::fit_baseline`'s
+polynomial smoother, which is `std`-only and therefore not on the
+embedded build's feature set. Cell-scale param undoes the
+`FP_SPEC_SHIFT` shift in the embedded u16 spec so xsig and xbase
+land in the same WSJT-X calibration regime.
+
+Embedded apps (`m5stack-s3-app`'s `decode_pipeline`) drop their
+previous `+3 dB calibration offset` hack and call the new function
+directly. Host `decode_block_multipass` (with `fft-rustfft`) keeps
+its `recompute_snr_xsnr2` polynomial-baseline path, which stays
+preferable when std is available.
+
+API additions (host + embedded):
+- `pub fn ft8::decode_block::xsnr2_db_simple`
+
+No breaking changes; safe minor bump on the 0.5.x line.
+
 ## 0.5.6 — post-0.5.5 quick-fix: no_std math imports + allsum 7-tone alignment
 
 Two follow-up fixes to issues uncovered after the 0.5.5 publish:

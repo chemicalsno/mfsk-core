@@ -21,27 +21,14 @@
 
 #![allow(dead_code)]
 
-/// Calibration offset applied to `compute_snr_db` raw output before
-/// it lands in the UI. Pair-matched against the JTDX qso3 golden
-/// (2026-05-05) on real M5StickS3 silicon, weak-signal subset
-/// (= K1JT HA0DU / A92EE F5PSR / N1JFU EA6EE):
-///
-/// ```text
-/// signal           ours    JTDX   diff
-/// K1JT HA0DU      -16.7    -13    -3.7
-/// A92EE F5PSR     -11.8     -9    -2.8
-/// N1JFU EA6EE     -15.1    -14    -1.1
-/// ```
-///
-/// Median diff = **-2.8 dB**, so adding +3 dB lands the displayed
-/// reading within ±1-2 dB of JTDX for weak signals. **Strong-signal
-/// readings (e.g. W1FC F5BZB at JTDX 0 dB / ours -12.5) remain
-/// off by ~12 dB** because the i16 fixed-point per-block auto-gain
-/// in `fill_symbol_spectra` shifts the cs scale per Costas block;
-/// no single offset can flatten that. For the controller UI weak
-/// signals matter more (those are the ones a user worries about
-/// catching), so the +3 dB rough median is a net win.
-pub const DEFAULT_CALIBRATION_OFFSET_DB: f32 = 3.0;
+/// Residual calibration offset applied **after** `xsnr2_db_simple`.
+/// Now that the embedded path uses xsnr2 (= signal/baseline ratio
+/// over the uniform-gain sync8 spectrogram, mfsk-core 0.5.7+) the
+/// per-block auto-gain bias is gone and `compute_snr_db`'s ±15 dB
+/// signal-to-signal drift no longer needs masking with a static
+/// offset. Kept at 0 dB; tweak only if a per-board RF analog gain
+/// calibration is needed in the future.
+pub const DEFAULT_CALIBRATION_OFFSET_DB: f32 = 0.0;
 
 /// SNR の 5 段階品質バケット (UI 表示推奨)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

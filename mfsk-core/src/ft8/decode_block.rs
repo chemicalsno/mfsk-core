@@ -1830,6 +1830,99 @@ fn recompute_nsync(
     count
 }
 
+/// Slot-baseline xsnr2 SNR for any [`Spectrogram`] — `std`-free
+/// alternative to `recompute_snr_xsnr2` for callers that haven't
+/// run `baseline::fit_baseline`'s polynomial smoother (= the
+/// embedded path: `mfsk-core` is built `default-features = false`
+/// + `alloc` only there, so the polynomial fit is unavailable).
+///
+/// Computes the per-frequency baseline as the mean across time over
+/// a ±50-bin window centred on the decode's carrier — same idea as
+/// `avg_spectrum` but localised so it works incrementally and stays
+/// cheap on Xtensa LX6/LX7. Then evaluates WSJT-X `ft8b.f90:449-454`:
+///
+/// ```text
+///   xbase = mean_over_time(spec[carrier_window]) * cell_scale
+///   xsig  = sum_over_79_decoded_tones(spec[tone_bin, m]) * cell_scale
+///   xsnr2 = xsig / xbase / 3e6 - 1
+///   snr_db = 10·log10(xsnr2) - 27        (clamped at -24 dB on degeneracy)
+/// ```
+///
+/// `cell_scale = 1.0` for an `f32` spectrogram, `2^FP_SPEC_SHIFT`
+/// (`= 4096.0` with the default fixed-point shift) for an embedded
+/// u16 spectrogram so xsig and xbase land in the same WSJT-X
+/// calibration regime.
+///
+/// Vs the per-Costas-block adjacent-tone SNR `compute_snr_db` returns
+/// from `process_candidates*`: that ratio is preserved under the
+/// `fill_symbol_spectra` per-block auto-gain so it's *internally*
+/// consistent, but its absolute number drifts ~0–15 dB between
+/// signals because each block's gain factor is signal-dependent.
+/// This function reads `xsig`/`xbase` from the *single* sync8
+/// spectrogram (uniform `FP_SPEC_SHIFT` auto-gain across the slot),
+/// so the result is comparable across signals AND comparable to
+/// WSJT-X / JTDX SNR reports.
+pub fn xsnr2_db_simple(spec: &Spectrogram, result: &DecodeResult, cell_scale: f32) -> f32 {
+    use crate::ft8::params::NN;
+    use crate::ft8::wave_gen::message_to_tones;
+
+    let df = SAMPLE_RATE_HZ / NFFT_SPEC as f32;
+    let tstep = NSTEP as f32 / SAMPLE_RATE_HZ;
+    let nsps_steps = (NSPS / NSTEP) as f32;
+    let tone_step = TONE_SPACING_HZ / df;
+
+    if spec.n_freq == 0 || spec.n_time == 0 {
+        return -24.0;
+    }
+
+    // Per-freq baseline = mean over time, computed locally around the
+    // decode's carrier. ±50 bins ≈ ±156 Hz at NFFT=3840 — wide enough
+    // to span a couple of FT8 channels for a stable noise estimate,
+    // narrow enough to skip the band edges where the receive filter
+    // rolls off.
+    let carrier_bin = (result.freq_hz / df)
+        .round()
+        .clamp(0.0, (spec.n_freq - 1) as f32) as usize;
+    let f_lo = carrier_bin.saturating_sub(50);
+    let f_hi = (carrier_bin + 50).min(spec.n_freq - 1);
+    let mut base_acc: f64 = 0.0;
+    let mut base_count: usize = 0;
+    for f in f_lo..=f_hi {
+        for t in 0..spec.n_time {
+            base_acc += spec.power_acc(f, t) as f64;
+            base_count += 1;
+        }
+    }
+    let xbase = (base_acc / base_count.max(1) as f64) as f32 * cell_scale;
+    if xbase <= 0.0 || !xbase.is_finite() {
+        return -24.0;
+    }
+
+    // xsig at the 79 decoded-tone (freq, m) positions.
+    let itone = message_to_tones(&result.message77);
+    let carrier_bin_f = result.freq_hz / df;
+    let t0 = (TX_START_OFFSET_S + result.dt_sec) / tstep;
+    let mut xsig: f32 = 0.0;
+    for k in 0..NN {
+        let t = itone[k] as f32;
+        let f_bin = (carrier_bin_f + t * tone_step).round() as i32;
+        let m_bin = (t0 + (k as f32) * nsps_steps).round() as i32;
+        if f_bin < 0 || f_bin as usize >= spec.n_freq || m_bin < 0 || m_bin as usize >= spec.n_time
+        {
+            continue;
+        }
+        xsig += spec.power_acc(f_bin as usize, m_bin as usize);
+    }
+    xsig *= cell_scale;
+
+    let arg = xsig / xbase / 3.0e6 - 1.0;
+    if arg <= 0.1 {
+        return -24.0;
+    }
+    let snr = 10.0 * arg.log10() - 27.0;
+    snr.max(-24.0)
+}
+
 /// WSJT-X `ft8b.f90:449-454` xsnr2 SNR formula. Reads the signal's
 /// per-symbol power from the pass-1 spectrogram (= pre-subtract,
 /// matching WSJT-X's sync8 spectrogram convention) at each of the

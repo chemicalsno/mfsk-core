@@ -85,7 +85,11 @@ pub fn run() -> ! {
             &spec.allsum_head,
             &spec.allsum_tail,
         );
-        drop(spec);
+        // Don't drop the spec yet — `xsnr2_db_simple` reads it after
+        // stage 3 completes to recompute SNR free of the per-block
+        // auto-gain bias `compute_snr_db` carries. Spec is ~360 KB
+        // for the slot, lives in PSRAM, dropped at the end of this
+        // loop iteration.
 
         let slot = pipeline::recv_box::<pipeline::Slot>(slot_q);
         let wav_idx = slot.wav_idx;
@@ -138,13 +142,22 @@ pub fn run() -> ! {
                     let mut msg: heapless::String<22> = heapless::String::new();
                     let take = text.len().min(msg.capacity());
                     let _ = msg.push_str(&text[..take]);
-                    // Calibrate raw `compute_snr_db` against the JTDX
-                    // weak-signal median (see snr_norm.rs). Strong
-                    // signals will still drift due to fill_symbol_spectra
-                    // per-block auto-gain — that's a structural i16 path
-                    // limitation, not solvable with a uniform offset.
+                    // Slot-baseline xsnr2 SNR — bypasses the per-block
+                    // auto-gain bias `compute_snr_db` carries by
+                    // reading xsig + xbase from the same uniform-gain
+                    // sync8 spectrogram. Calibrated against WSJT-X /
+                    // JTDX absolute scale across all signals (weak +
+                    // strong), not just the weak-signal median the
+                    // old +3 dB offset hack targeted.
+                    //
+                    // `cell_scale` reverts the embedded fixed-point
+                    // FP_SPEC_SHIFT (= 12) so xsig/xbase land in the
+                    // WSJT-X calibration regime; host f32 builds pass
+                    // 1.0.
+                    const FP_SPEC_SHIFT: u32 = 12;
+                    let cell_scale = (1u32 << FP_SPEC_SHIFT) as f32;
                     let calibrated_snr =
-                        r.snr_db + crate::snr_norm::DEFAULT_CALIBRATION_OFFSET_DB;
+                        mfsk_core::ft8::decode_block::xsnr2_db_simple(&spec.spec, r, cell_scale);
                     // `first_seq` is provisionally `slot_seq`; if the
                     // msg is already in the ring `push_decode` will
                     // overwrite this with the existing entry's seq so
