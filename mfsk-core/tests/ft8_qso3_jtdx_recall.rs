@@ -131,14 +131,18 @@ const JTDX_GOLDEN: &[GoldenEntry] = &[
     },
 ];
 
-/// Recall floor against JTDX 18. With BpAllOsd + max_cand=30:
-/// host f32 = **16/18 hit**, host fixed-point (Q3i8 LLR, embedded
-/// bit-identical) = **10/18 hit** (LLR quantisation drops 6
-/// borderline-weak decodes that f32 OSD enumeration recovers).
+/// Recall floor against JTDX 18.
+/// - host f32 (research config: BpAllOsd + max_cand=60 + sync_min=0.8):
+///   **16/18 hit**.
+/// - host fixed-point (embedded ship config: BpAll + max_cand=15 +
+///   sync_min=1.3, **no OSD** because OSD's genmrb + Gauss
+///   elimination + thousand-codeword enumeration is not realistic
+///   on Xtensa LX7): **8/18 hit**. The 10 missing are -13..-19 dB
+///   weak signals where NMS Q3i8 BP can't converge in BP_MAX_ITER=30.
 #[cfg(not(feature = "fixed-point"))]
 const MIN_JTDX_HITS: usize = 16;
 #[cfg(feature = "fixed-point")]
-const MIN_JTDX_HITS: usize = 10;
+const MIN_JTDX_HITS: usize = 8;
 
 /// Tolerance. host f32 SNR (xsnr2/xbase) sits ~3-7 dB below JTDX,
 /// fixed-point uses adjacent-tone SNR with no xsnr2 post-process
@@ -177,13 +181,16 @@ fn load_wav_i16(path: &Path) -> Vec<i16> {
 #[test]
 fn qso3_apoff_meets_jtdx_recall_floor() {
     let slot = load_wav_i16(Path::new(QSO3_PATH));
-    // BpAllOsd + max_cand=60 + sync_min=0.8 — most aggressive setting
-    // to chase JTDX. OSD fallback handles BP-failures, sync_min=0.8
-    // lets weaker coarse_sync candidates (K1BZM DK8NE @-19 dB,
-    // WA2FZW @-15 busy) reach BP/OSD. The OSD path enforces the
-    // WSJT-X-faithful `nharderrors > 36` gate so spurious
-    // low-confidence OSD codewords don't leak as extras.
+    // Host f32 keeps OSD on (host has compute headroom — used for
+    // researching the recall ceiling). Host fixed-point mirrors the
+    // **embedded ship config**: BpAll only, OSD disabled (OSD's
+    // genmrb + Gauss elimination + multi-thousand codeword
+    // enumeration is not realistic on Xtensa LX7), max_cand=15,
+    // sync_min=1.3 = ndepth=3 default. Real-on-hardware regression.
+    #[cfg(not(feature = "fixed-point"))]
     let decoded: Vec<_> = decode_block(&slot, 100.0, 3000.0, 0.8, DecodeDepth::BpAllOsd, 60);
+    #[cfg(feature = "fixed-point")]
+    let decoded: Vec<_> = decode_block(&slot, 100.0, 3000.0, 1.3, DecodeDepth::BpAll, 15);
 
     let mut by_msg: std::collections::HashMap<String, &mfsk_core::ft8::decode::DecodeResult> =
         std::collections::HashMap::new();
