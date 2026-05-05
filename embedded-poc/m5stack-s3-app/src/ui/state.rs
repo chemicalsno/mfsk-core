@@ -41,12 +41,20 @@ pub struct StatusInfo {
     pub free_heap_kb: u32,
 }
 
+/// Single waterfall row — 135 palette indices (0..15) covering the
+/// FT8 audio band 200..2700 Hz at ~18.5 Hz/screen-column.
+pub type WfLine = [u8; 135];
+
+/// Waterfall depth — 100 rows fits the on-screen 100 px region; with
+/// 1 row per FT8 slot that's ~25 min of band history.
+pub const WF_DEPTH: usize = 100;
+
 /// Bounded ring of decoded rows. Newest at the back. Capacity 16
 /// covers >2 slots of qso3-busy density (= 7 decodes/slot) without
 /// dropping; UI picks the trailing 7 to render.
-#[derive(Default)]
 pub struct UiState {
     decoded: heapless::Deque<DecodedRow, 16>,
+    waterfall: heapless::Deque<WfLine, WF_DEPTH>,
     pub status: StatusInfo,
     /// Bumped by writers when state changes; readers compare against
     /// their last-rendered seq to skip the LCD push when nothing new.
@@ -58,6 +66,7 @@ impl UiState {
     pub const fn new() -> Self {
         Self {
             decoded: heapless::Deque::new(),
+            waterfall: heapless::Deque::new(),
             status: StatusInfo {
                 rig_freq_hz: None,
                 rig_mode: None,
@@ -77,6 +86,16 @@ impl UiState {
         self.bump();
     }
 
+    /// Push one fresh waterfall row (= one slot's averaged spectrum).
+    /// Drops the oldest row when full.
+    pub fn push_waterfall(&mut self, row: WfLine) {
+        if self.waterfall.is_full() {
+            let _ = self.waterfall.pop_front();
+        }
+        let _ = self.waterfall.push_back(row);
+        self.bump();
+    }
+
     /// Newest-last view of all retained rows.
     pub fn decoded_iter(&self) -> impl Iterator<Item = &DecodedRow> {
         self.decoded.iter()
@@ -84,6 +103,15 @@ impl UiState {
 
     pub fn decoded_len(&self) -> usize {
         self.decoded.len()
+    }
+
+    /// Waterfall iterator — oldest first, newest last.
+    pub fn waterfall_iter(&self) -> impl Iterator<Item = &WfLine> {
+        self.waterfall.iter()
+    }
+
+    pub fn waterfall_len(&self) -> usize {
+        self.waterfall.len()
     }
 
     /// Render-side dirty check. Returns the current dirty seq;

@@ -19,7 +19,10 @@ use mfsk_ft8::mfsk_ft8_basis_scratch_len;
 
 use embedded_shared::{dual_core, esp_dsp_fft, pipeline, stage1_inc, wav_sim};
 
-use crate::ui::state::{DecodedRow, UI};
+use crate::ui::{
+    state::{DecodedRow, WfLine, UI},
+    waterfall,
+};
 
 /// 開発用 WAV (qso3_busy のみ単独ループ — UI 構築用に最も多くのデコード結果を出す)。
 static QSO_WAVS: &[&[u8]] = &[
@@ -72,6 +75,10 @@ pub fn run() -> ! {
             &spec.allsum_head,
             &spec.allsum_tail,
         );
+        // Build the waterfall row from the same spec before drop.
+        // Per-slot averaging across `n_time` time bins; freq bins
+        // 200..2700 Hz decimated to the screen's 135 columns.
+        let wf_row = build_wf_row(&spec.spec);
         drop(spec);
 
         let slot = pipeline::recv_box::<pipeline::Slot>(slot_q);
@@ -105,10 +112,11 @@ pub fn run() -> ! {
 
         log::info!("WAV[{wav_idx}] p1={n_pass1} dec={}", results.len());
         slot_seq = slot_seq.wrapping_add(1);
-        // Push every CRC-passing decode to the UI ring. The UI side
-        // gates re-render on `dirty_seq` so this is one lock per
-        // result + zero LCD redraws if nothing changed.
+        // Push waterfall row + every CRC-passing decode to the UI
+        // under one lock. UI side gates re-render on `dirty_seq` so
+        // this is one lock + zero LCD redraws when nothing changed.
         if let Ok(mut ui) = UI.lock() {
+            ui.push_waterfall(wf_row);
             for r in results.iter() {
                 if let Some(text) = unpack77(&r.message77) {
                     let mut msg: heapless::String<22> = heapless::String::new();
@@ -127,4 +135,49 @@ pub fn run() -> ! {
             }
         }
     }
+}
+
+/// Build one waterfall row from a slot's full spectrogram. Averages
+/// power over time within each freq bin, decimates to the screen
+/// width (135 cols) over the visible band 200..2700 Hz, then maps
+/// per-column average to a 16-step palette index via a coarse log2
+/// approximation.
+///
+/// Cost: 977 freq bins × 184 time bins ≈ 180 k u16 reads + 135-step
+/// boxcar = ~1 ms on LX7. Runs once per slot in the decode-pipeline
+/// thread (not the LCD render path), so it never blocks UI redraws.
+fn build_wf_row(spec: &mfsk_core::ft8::decode_block::Spectrogram) -> WfLine {
+    const SAMPLE_RATE_HZ: f32 = 12_000.0;
+    let n_freq = spec.n_freq;
+    let n_time = spec.n_time;
+    let nfft = mfsk_core::ft8::decode_block::NFFT_SPEC as f32;
+    let df = SAMPLE_RATE_HZ / nfft;
+    let mut row = [0u8; 135];
+    let lo = waterfall::WF_FREQ_LO_HZ;
+    let hi = waterfall::WF_FREQ_HI_HZ;
+    for col in 0..135 {
+        let f0 = lo + (col as f32) * (hi - lo) / 135.0;
+        let f1 = lo + ((col + 1) as f32) * (hi - lo) / 135.0;
+        let bin_lo = (f0 / df).floor() as usize;
+        let bin_hi = ((f1 / df).ceil() as usize).min(n_freq);
+        if bin_hi <= bin_lo {
+            continue;
+        }
+        // Sum across (time × freq) within this column's bin span.
+        let mut sum: u64 = 0;
+        for t in 0..n_time {
+            let row_off = t * n_freq;
+            for f in bin_lo..bin_hi {
+                sum += spec.data[row_off + f] as u64;
+            }
+        }
+        // Average per (t, f) cell.
+        let cells = (n_time * (bin_hi - bin_lo)) as u64;
+        let avg = (sum / cells.max(1)).max(1);
+        // log2 approximation: position of MSB → 0..15. u64::leading_zeros
+        // is 64 - log2(avg). Range u16 → 0..16.
+        let log2 = (64u32 - avg.leading_zeros()).min(15) as u8;
+        row[col] = log2;
+    }
+    row
 }

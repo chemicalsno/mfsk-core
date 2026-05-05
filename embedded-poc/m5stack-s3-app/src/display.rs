@@ -25,18 +25,11 @@ use esp_idf_hal::{
 };
 use mipidsi::{models::ST7789, options::ColorInversion, Builder};
 
-use crate::log_sink::{LogFanout, LINE_MAX};
-use crate::ui::{decoded_list, state::UI, status_bar};
+use crate::log_sink::LogFanout;
+use crate::ui::{decoded_list, state::UI, status_bar, waterfall};
 
 /// 1 行高 (FONT_6X10)。
 pub const LINE_H: u16 = 10;
-
-/// Debug log scroll region — middle of the screen between status
-/// bar and decoded list. Keeps boot-time log lines visible during
-/// Phase 3 dev; will be replaced by the waterfall in a follow-up.
-const LOG_REGION_Y: i32 = 14;
-const LOG_REGION_H: u32 = 100;
-const LOG_VISIBLE_LINES: usize = (LOG_REGION_H as usize) / (LINE_H as usize);
 
 /// TX-line placeholder (Phase 4 will fill with QSO FSM state).
 const TX_REGION_Y: i32 = 226;
@@ -113,11 +106,6 @@ pub fn run_log_panel(peripherals: Peripherals, fanout: &'static LogFanout) -> ! 
     log::info!("LCD init OK (ST7789 135x240 offset 52,40 invert)");
     display.clear(Rgb565::BLACK).ok();
 
-    let log_style = MonoTextStyleBuilder::new()
-        .font(&FONT_6X10)
-        .text_color(Rgb565::CSS_DIM_GRAY)
-        .background_color(Rgb565::BLACK)
-        .build();
     let tx_style = MonoTextStyleBuilder::new()
         .font(&FONT_6X10)
         .text_color(Rgb565::WHITE)
@@ -139,59 +127,40 @@ pub fn run_log_panel(peripherals: Peripherals, fanout: &'static LogFanout) -> ! 
         let ui_seq;
         let status_snapshot;
         let decoded_snapshot;
+        let wf_snapshot: heapless::Vec<crate::ui::state::WfLine, { crate::ui::state::WF_DEPTH }>;
         {
             let mut ui = UI.lock().expect("UI mutex poisoned");
             ui.status.free_heap_kb = (heap / 1024) as u32;
             ui_seq = ui.dirty_seq();
             status_snapshot = ui.status.clone();
-            // Take a snapshot so we don't hold the lock while drawing.
+            // Take snapshots so we don't hold the lock while drawing.
             decoded_snapshot = ui
                 .decoded_iter()
                 .cloned()
                 .collect::<heapless::Vec<_, 16>>();
+            wf_snapshot = ui.waterfall_iter().cloned().collect();
         }
 
         // Always repaint status bar (cheap, 14 px tall).
         status_bar::render(&mut display, &status_snapshot).ok();
 
-        // Decoded list — repaint only when state changed.
+        // Waterfall + decoded list — repaint only when state changed.
+        // Both are gated by the same `dirty_seq` since the decoder
+        // writes a WF row + N decode rows under one lock per slot.
         if ui_seq != last_ui_seq {
+            // `waterfall::render` wants `&[&WfLine]` — borrow each.
+            let wf_refs: heapless::Vec<&crate::ui::state::WfLine, { crate::ui::state::WF_DEPTH }> =
+                wf_snapshot.iter().collect();
+            waterfall::render(&mut display, &wf_refs).ok();
             decoded_list::render(&mut display, &decoded_snapshot).ok();
             last_ui_seq = ui_seq;
         }
 
-        // ── log scroll in the debug region (y 14..114). 10 lines
-        //    visible at FONT_6X10. Tail of the LcdPanel ring.
-        let lines: Option<heapless::Vec<heapless::String<LINE_MAX>, 24>> =
-            if let Ok(mut panel) = fanout.lcd.try_lock() {
-                if panel.drain_dirty().is_some() {
-                    Some(panel.iter_chronological().cloned().collect())
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-        if let Some(lines) = lines {
-            // Wipe the debug region (cheap — 100 px of black).
-            Rectangle::new(
-                Point::new(0, LOG_REGION_Y),
-                Size::new(crate::board::LCD_WIDTH as u32, LOG_REGION_H),
-            )
-            .into_styled(PrimitiveStyle::with_fill(Rgb565::BLACK))
-            .draw(&mut display)
-            .ok();
-            // Render the trailing LOG_VISIBLE_LINES.
-            let n = lines.len();
-            let take = n.min(LOG_VISIBLE_LINES);
-            let start = n - take;
-            for (i, line) in lines[start..].iter().enumerate() {
-                let y = LOG_REGION_Y + (i as i32) * LINE_H as i32;
-                Text::with_baseline(line.as_str(), Point::new(0, y), log_style, Baseline::Top)
-                    .draw(&mut display)
-                    .ok();
-            }
-        }
+        // Boot-time log scroll has been retired now that the WF region
+        // is live. C-side ESP_LOG output and Rust `log::info!` still
+        // reach UART via the FanoutLogger; the on-LCD panel is only
+        // useful when the cable is unplugged from the host.
+        let _ = fanout;
 
         // ── TX placeholder strip — Phase 4 (QSO FSM) will replace
         //    this with live `TxIntent` text. For now it shows a
