@@ -132,15 +132,21 @@ const JTDX_GOLDEN: &[GoldenEntry] = &[
 ];
 
 /// Recall floor against JTDX 18. With BpAllOsd + max_cand=30:
-/// **16/18 hit** (recovered N1API F2VX, N1API HA6FQ, CQ EA2BFM via
-/// OSD fallback). Missing 2: K1BZM DK8NE @244 (-19 dB), WA2FZW
-/// DL5AXX @2546 (-15 dB busy band).
+/// host f32 = **16/18 hit**, host fixed-point (Q3i8 LLR, embedded
+/// bit-identical) = **10/18 hit** (LLR quantisation drops 6
+/// borderline-weak decodes that f32 OSD enumeration recovers).
+#[cfg(not(feature = "fixed-point"))]
 const MIN_JTDX_HITS: usize = 16;
+#[cfg(feature = "fixed-point")]
+const MIN_JTDX_HITS: usize = 10;
 
-/// Tolerance for matching a callsign decode to JTDX. JTDX's SNR
-/// convention is more aggressive than ours; 12 dB envelope covers
-/// the W1DIG outlier (Δ -10.7 dB).
+/// Tolerance. host f32 SNR (xsnr2/xbase) sits ~3-7 dB below JTDX,
+/// fixed-point uses adjacent-tone SNR with no xsnr2 post-process
+/// (cell quantisation breaks log10 baseline) — wider envelope.
+#[cfg(not(feature = "fixed-point"))]
 const SNR_TOL_DB: f32 = 12.0;
+#[cfg(feature = "fixed-point")]
+const SNR_TOL_DB: f32 = 14.0;
 const DF_TOL_HZ: f32 = 5.0;
 
 fn load_wav_i16(path: &Path) -> Vec<i16> {

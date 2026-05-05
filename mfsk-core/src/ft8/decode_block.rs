@@ -1111,15 +1111,16 @@ fn sym_in_mask(sym: usize, mask: SymMask) -> bool {
 
 /// **Pub for benchmarking only — do not depend on it.**
 ///
-/// f32 wrapper. **WSJT-X-faithful** (host fft-rustfft only): routes through
-/// the `ft8_downsample` chain (192k FFT → tapered LPF → 200 sps cd0) +
-/// per-symbol 32-pt FFT, matching `lib/ft8/ft8b.f90:154-161` exactly.
-/// Out-of-band signals (e.g. broadband birdies in the busy band) are
-/// suppressed by the downsample's edge-tapered filter, instead of leaking
-/// into per-tone DFT sidelobes as they would in a rectangular-window
-/// per-tone DFT.
+/// f32 wrapper. **WSJT-X-faithful** when `fft-rustfft` is enabled:
+/// routes through the `ft8_downsample` chain (192k FFT → tapered LPF
+/// → 200 sps cd0) + per-symbol 32-pt FFT, matching
+/// `lib/ft8/ft8b.f90:154-161` exactly. Out-of-band signals (broadband
+/// birdies, sidelobes) are suppressed by the downsample's
+/// edge-tapered filter, instead of leaking into per-tone DFT
+/// sidelobes as they would in a rectangular-window per-tone DFT.
+/// Used by both host f32 and host fixed-point builds.
 #[doc(hidden)]
-#[cfg(all(feature = "fft-rustfft", not(feature = "fixed-point")))]
+#[cfg(feature = "fft-rustfft")]
 pub fn fill_symbol_spectra<S: AudioSample>(
     out: &mut [[Cmplx<f32>; 8]; 79],
     audio: &[S],
@@ -1130,8 +1131,10 @@ pub fn fill_symbol_spectra<S: AudioSample>(
     fill_symbol_spectra_via_cd0(out, audio, freq_hz, dt_sec, mask);
 }
 
-/// Fallback for the (unusual) host build without `fft-rustfft` —
-/// falls back to the rectangular-window per-tone DFT.
+/// Embedded fallback (no `fft-rustfft` available — Xtensa cannot run
+/// the 192k cd0 FFT). Reverts to the rectangular-window per-tone DFT
+/// for non-fixed-point builds; the fixed-point variant has its own
+/// basis-precompute path in `fill_symbol_spectra_into`.
 #[doc(hidden)]
 #[cfg(all(not(feature = "fft-rustfft"), not(feature = "fixed-point")))]
 pub fn fill_symbol_spectra<S: AudioSample>(
@@ -1158,7 +1161,7 @@ pub fn fill_symbol_spectra<S: AudioSample>(
 /// FFT + 79 × 32-pt FFT. Optimisation (cache the 192k FFT across
 /// candidates of the same slot) is left to the caller pipeline; for now
 /// the simple version is built per call.
-#[cfg(all(feature = "fft-rustfft", not(feature = "fixed-point")))]
+#[cfg(feature = "fft-rustfft")]
 fn fill_symbol_spectra_via_cd0<S: AudioSample>(
     out: &mut [[Cmplx<f32>; 8]; 79],
     audio: &[S],
@@ -1353,8 +1356,14 @@ pub const BASIS_SCRATCH_LEN: usize = NTONES * NSPS;
 /// (`static [i16; BASIS_SCRATCH_LEN]` in `.bss`, or
 /// `heap_caps_malloc(MALLOC_CAP_INTERNAL)`) and call
 /// [`fill_symbol_spectra_into`] directly.
+// Fixed-point host with `fft-rustfft` uses the cd0-based
+// `fill_symbol_spectra` defined above. Pure embedded fixed-point
+// (no fft-rustfft) goes through `fill_symbol_spectra_into` instead
+// — this short heap-allocating wrapper is only kept for the
+// `(fixed-point, !fft-rustfft)` build, which is the only one that
+// would have called this entry.
 #[doc(hidden)]
-#[cfg(feature = "fixed-point")]
+#[cfg(all(feature = "fixed-point", not(feature = "fft-rustfft")))]
 pub fn fill_symbol_spectra<S: AudioSample>(
     out: &mut [[Cmplx<f32>; 8]; 79],
     audio: &[S],
@@ -1693,18 +1702,27 @@ fn decode_block_multipass<S: AudioSample>(
     // sync8 spectrogram). This is critical: feeding xsig from a
     // different chain (e.g. cd0 downsampled per-symbol DFT) loses
     // the calibration.
+    // xsnr2/xbase post-process is f32-only. Fixed-point Spectrogram
+    // cells are quantised post `>> FP_SPEC_SHIFT`, putting many noise
+    // cells at u16 zero — `fit_baseline`'s `log10(p.max(1e-30))` then
+    // produces sbase ≈ -250 dB and xsnr2 explodes. The original
+    // adjacent-tone SNR from `process_candidates_into` (compute_snr_db)
+    // is already on a sensible scale, so leave it untouched on the
+    // fixed-point path. late bail (`xsnr<-24 && nsync≤10`) likewise
+    // f32-only here; on qso3_busy it had no effect in any case.
+    #[cfg(not(feature = "fixed-point"))]
     if let Some((sbase, spec)) = sbase_and_spec {
         let df = SAMPLE_RATE_HZ / NFFT_SPEC as f32;
         let tstep = NSTEP as f32 / SAMPLE_RATE_HZ;
-        let nsps_steps = (NSPS / NSTEP) as f32; // = 4 with NSTEP=NSPS/4
-        // Recompute SNR + post-refine nsync, drop results that fail
-        // WSJT-X ft8b.f90:456-459 late bail (`nsync ≤ 10 && xsnr < -24`).
+        let nsps_steps = (NSPS / NSTEP) as f32;
         all.retain_mut(|r| {
-            r.snr_db = recompute_snr_xsnr2(r, &spec, &sbase, df, tstep, nsps_steps);
+            r.snr_db = recompute_snr_xsnr2(r, &spec, &sbase, df, tstep, nsps_steps, 1.0);
             let nsync = recompute_nsync(r, &spec, df, tstep, nsps_steps);
             !(nsync <= 10 && r.snr_db < -24.0)
         });
     }
+    #[cfg(feature = "fixed-point")]
+    let _ = sbase_and_spec;
     all
 }
 
@@ -1780,13 +1798,11 @@ fn recompute_snr_xsnr2(
     df: f32,
     tstep: f32,
     nsps_steps: f32,
+    cell_scale: f32,
 ) -> f32 {
     let itone = crate::ft8::wave_gen::message_to_tones(&result.message77);
     let carrier_bin_f = result.freq_hz / df;
-    // tone_step_bins = TONE_SPACING_HZ / df = 6.25 / 3.125 = 2.0 exactly.
     let tone_step = TONE_SPACING_HZ / df;
-    // First sample index of symbol 0 within the spectrogram time grid:
-    //   nominal_t0 = (TX_START_OFFSET_S + dt_sec) / tstep.
     let t0 = (TX_START_OFFSET_S + result.dt_sec) / tstep;
 
     let mut xsig = 0.0_f32;
@@ -1800,11 +1816,17 @@ fn recompute_snr_xsnr2(
         }
         xsig += spec.power_acc(f_bin as usize, m_bin as usize);
     }
+    // `cell_scale` reverts the fixed-point spectrogram's
+    // `>> FP_SPEC_SHIFT` so xsig and xbase live in WSJT-X's calibration
+    // regime. For the f32 spectrogram cell_scale=1.0 (no-op).
+    xsig *= cell_scale;
 
     let bin = carrier_bin_f.round() as i32;
     let bin = bin.clamp(0, sbase.len() as i32 - 1) as usize;
-    let sbase_db = sbase[bin];
-    let xbase = 10f32.powf(0.1 * (sbase_db - 40.0));
+    // Same compensation on xbase: sbase_db came from `fit_baseline` of
+    // post-shift cells, so its log10 reads ~36 dB low in fixed-point.
+    let sbase_db_compensated = sbase[bin] + 10.0 * cell_scale.log10();
+    let xbase = 10f32.powf(0.1 * (sbase_db_compensated - 40.0));
     let arg = xsig / xbase / 3.0e6 - 1.0;
     if arg <= 0.1 {
         return -24.0;
@@ -2240,6 +2262,19 @@ pub fn process_candidates_into_with_cs_scratch<S: AudioSample>(
         q_thresh,
         cs_scratch,
         |cs, cand, mask| {
+            // Host fft-rustfft: use the cd0-based 32-pt FFT cs builder
+            // (= ft8b.f90:154-161). Same path as host f32. fixed-point
+            // with rustfft (= host) gets WSJT-X-faithful cs construction
+            // identical to the f32 build.
+            #[cfg(feature = "fft-rustfft")]
+            {
+                // basis_{re,im} unused on this path — borrow nothing.
+                fill_symbol_spectra(cs, audio, cand.freq_hz, cand.dt_sec, mask);
+            }
+            // Embedded fixed-point (no fft-rustfft): keep the
+            // basis-precompute + dot-product path — no 192k FFT
+            // available on Xtensa.
+            #[cfg(not(feature = "fft-rustfft"))]
             fill_symbol_spectra_into(
                 cs,
                 audio,
