@@ -1,6 +1,6 @@
 [package]
 name        = "mfsk-core"
-version     = "0.5.4"
+version     = "0.5.5"
 edition     = "2024"
 license     = "GPL-3.0-or-later"
 description = "Pure-Rust WSJT-family decoders and synthesisers (FT8 FT4 FST4 WSPR JT9 JT65 Q65) behind a zero-cost Protocol trait. Host (rustfft) or no_std embedded targets (ESP32-S3, RP2350, Cortex-M) via a pluggable FFT backend; optional fixed-point hot path for FPU-less MCUs."
@@ -48,6 +48,14 @@ fft-extern   = ["alloc"]
 # decode hot loop anymore.
 fixed-point  = []
 
+# Halve coarse_sync time-axis resolution (NSTEP = NSPS/2 instead of
+# NSPS/4 = WSJT-X reference). Embedded targets enable this — at NSPS/4
+# the spec memory and stage-1 FFT count both double, which exceeds
+# the LX7 post-SlotEnd budget. NSPS/2 was the embedded baseline up
+# through 0.5.4 and is what `embedded-shared/stage1_inc` already
+# emits. host stays on the WSJT-faithful NSPS/4 default.
+nstep-half   = []
+
 # Always-on coarse_sync sub-stage profiling. Same output as setting
 # `MFSK_PROFILE_COARSE=1` on host, but works on embedded targets where
 # the env var is not reachable. Only useful when investigating stage-2
@@ -94,7 +102,7 @@ rayon       = { version = "1", optional = true }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = [
-    'cfg(feature, values("std","alloc","ft8","ft4","fst4","wspr","jt9","jt65","q65","packet-bytes","uvpacket","parallel","full","fft-rustfft","fft-extern","fixed-point","profile-coarse"))',
+    'cfg(feature, values("std","alloc","ft8","ft4","fst4","wspr","jt9","jt65","q65","packet-bytes","uvpacket","parallel","full","fft-rustfft","fft-extern","fixed-point","profile-coarse","nstep-half"))',
 ] }
 
 # Build docs.rs with every protocol feature enabled so users browsing

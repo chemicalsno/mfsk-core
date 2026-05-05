@@ -45,12 +45,43 @@ fn now_us() -> i64 {
 /// * `q_thresh` — stage-3 `sync_quality` early-reject threshold; pass
 ///   [`mfsk_core::ft8::decode_block::DEFAULT_Q_THRESH`] (= 12) for
 ///   full recall.
+/// * `bp_max_iter` — stage-3 BP iteration cap per LLR variant. Pass
+///   [`mfsk_core::ft8::params::DEFAULT_BP_MAX_ITER`] (= 30, WSJT-X
+///   reference) for full recall; lower (e.g. 20 / 15) trades weak-
+///   signal recall for post-SlotEnd time. Stage 3 wall-clock scales
+///   roughly linearly with this on cands that exhaust all 4 LLR
+///   variants (≈ half of `max_cand` on busy bands).
+/// One sweep config — applied per-slot when `run_sweep` is used.
+#[derive(Clone, Copy, Debug)]
+pub struct RxSweepCfg {
+    pub pass1_limit: usize,
+    pub max_cand: usize,
+    pub q_thresh: u32,
+    pub bp_max_iter: u32,
+}
+
+/// Single-config wrapper around [`run_sweep`] for the simple case.
 pub fn run(
     wavs: &'static [&'static [u8]],
     pass1_limit: usize,
     max_cand: usize,
     q_thresh: u32,
+    bp_max_iter: u32,
 ) -> ! {
+    let cfg = alloc::boxed::Box::leak(alloc::boxed::Box::new([RxSweepCfg {
+        pass1_limit,
+        max_cand,
+        q_thresh,
+        bp_max_iter,
+    }]));
+    run_sweep(wavs, cfg)
+}
+
+/// Sweep variant: rotate through `cfgs` per slot. Slot index `i` uses
+/// cfg `i % cfgs.len()`. Each cfg gets a header banner so log readers
+/// can group results by config.
+pub fn run_sweep(wavs: &'static [&'static [u8]], cfgs: &'static [RxSweepCfg]) -> ! {
+    assert!(!cfgs.is_empty(), "cfgs empty");
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
     log::info!(
@@ -77,19 +108,31 @@ pub fn run(
     wav_sim::spawn(wavs, chunk_q);
 
     log::info!(
-        "rx-wavsim: decode loop ready (q_thresh={q_thresh}); awaiting spec/slot from stage1_inc"
+        "rx-wavsim: decode loop ready (sweep n_cfgs={}); awaiting spec/slot from stage1_inc",
+        cfgs.len(),
     );
+    let mut slot_i: usize = 0;
     loop {
+        let cfg = cfgs[slot_i % cfgs.len()];
+        slot_i = slot_i.wrapping_add(1);
         // SpecBundle arrives ≈ 200 ms before SlotEnd, so stage 2 runs
         // in parallel with the tail of capture.
         let spec = pipeline::recv_box::<pipeline::SpecBundle>(spec_q);
+        log::info!(
+            "─── slot {} cfg pass1={} max_cand={} q={} BP={}",
+            slot_i,
+            cfg.pass1_limit,
+            cfg.max_cand,
+            cfg.q_thresh,
+            cfg.bp_max_iter,
+        );
         let t_s2_start = now_us();
         let pass1 = dual_core::coarse_sync_split_with_allsum(
             &spec.spec,
             100.0,
             3_000.0,
             1.0,
-            pass1_limit,
+            cfg.pass1_limit,
             &spec.allsum_head,
             &spec.allsum_tail,
         );
@@ -101,8 +144,9 @@ pub fn run(
             *slot,
             pass1,
             t_s2_end - t_s2_start,
-            max_cand,
-            q_thresh,
+            cfg.max_cand,
+            cfg.q_thresh,
+            cfg.bp_max_iter,
         );
     }
 }
@@ -113,6 +157,7 @@ fn decode_one_slot(
     stage2_us: i64,
     max_cand: usize,
     q_thresh: u32,
+    bp_max_iter: u32,
 ) {
     let wav_idx = slot.wav_idx;
     let inc_us = slot.inc_total_us;
@@ -149,6 +194,7 @@ fn decode_one_slot(
             pass2,
             depth,
             q_thresh,
+            bp_max_iter,
             &mut BASIS_RE,
             &mut BASIS_IM,
         )

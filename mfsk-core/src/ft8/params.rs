@@ -17,10 +17,17 @@ pub const NMAX: usize = 15 * 12000; // 180,000
 /// FFT size for symbol spectra (2 × NSPS)
 pub const NFFT1: usize = 2 * NSPS; // 3840
 pub const NH1: usize = NFFT1 / 2; // 1920
-/// Rough time-sync step size (1/4 symbol)
+/// Rough time-sync step size. WSJT-X reference uses 1/4-symbol
+/// (= NSPS/4 = 480) which gives `coarse_sync` 2× the time-axis
+/// resolution but doubles spec memory + stage-1 FFT count vs the
+/// `nstep-half` build (NSPS/2 = 960). Embedded targets enable
+/// `nstep-half` to fit the LX6/LX7 budget; host stays on NSPS/4.
+#[cfg(not(feature = "nstep-half"))]
 pub const NSTEP: usize = NSPS / 4; // 480
-/// Number of symbol spectra at 1/4-symbol steps
-pub const NHSYM: usize = NMAX / NSTEP - 3; // 357
+#[cfg(feature = "nstep-half")]
+pub const NSTEP: usize = NSPS / 2; // 960
+/// Number of symbol spectra at the active step size.
+pub const NHSYM: usize = NMAX / NSTEP - 3;
 
 /// Downsample factor: 12000 Hz → 200 Hz
 pub const NDOWN: usize = 60;
@@ -68,5 +75,12 @@ pub const GRAYMAP: [usize; 8] = [0, 1, 3, 2, 5, 6, 4, 7];
 /// LLR scale factor (empirically tuned in WSJT-X ft8b.f90)
 pub const LLR_SCALE: f32 = 2.83;
 
-/// Maximum BP decoder iterations
-pub const BP_MAX_ITER: u32 = 30;
+/// Default maximum BP decoder iterations (= WSJT-X
+/// `bpdecode174_91.f90` `maxiterations`). Runtime-tunable via
+/// [`crate::ft8::decode_block::DecodeTuning`] / `_tuned` entry points
+/// — embedded targets (LX6 / LX7) lower this to trade weak-signal
+/// recall for post-SlotEnd time budget.
+pub const DEFAULT_BP_MAX_ITER: u32 = 30;
+
+/// Backwards-compat alias used by the legacy `decode.rs` path.
+pub const BP_MAX_ITER: u32 = DEFAULT_BP_MAX_ITER;

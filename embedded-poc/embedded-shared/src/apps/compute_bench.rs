@@ -229,6 +229,7 @@ fn decode_one(slot: &[i16], max_cand: usize, _dt_grid: u8, _df_grid: u8, _q_thre
             pass2,
             depth,
             mfsk_core::ft8::decode_block::DEFAULT_Q_THRESH,
+            mfsk_core::ft8::params::DEFAULT_BP_MAX_ITER,
             &mut BASIS_RE,
             &mut BASIS_IM,
         )

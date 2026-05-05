@@ -78,7 +78,6 @@ struct WorkerCtx {
     head_n_freq: usize,
     tail_ia: usize,
     tail_n_freq: usize,
-    hann: [i16; NSPS],
     /// FFT planner and forward FFT object — created once, reused
     /// across all slots. The plan_forward call returns a Box<dyn Fft16>
     /// so its allocation is one-time.
@@ -138,13 +137,6 @@ pub fn spawn(chunk_q: QueueHandle_t, slot_q: QueueHandle_t, spec_q: QueueHandle_
     let (head_ia, head_n_freq) = band_for(ALLSUM_FREQ_MIN, ALLSUM_FREQ_MID, n_freq);
     let (tail_ia, tail_n_freq) = band_for(ALLSUM_FREQ_MID, ALLSUM_FREQ_MAX, n_freq);
 
-    let mut hann = [0i16; NSPS];
-    for n in 0..NSPS {
-        let phase = 2.0 * core::f32::consts::PI * (n as f32) / (NSPS as f32);
-        let w = 0.5 - 0.5 * phase.cos();
-        hann[n] = (w * 32767.0) as i16;
-    }
-
     let mut fft_planner = mfsk_core::core::fft::default_planner_16();
     let fft = fft_planner.plan_forward(NFFT_SPEC);
     let fft_buf: Vec<Complex<i16>> = vec![Complex::new(0i16, 0i16); NFFT_SPEC];
@@ -158,7 +150,6 @@ pub fn spawn(chunk_q: QueueHandle_t, slot_q: QueueHandle_t, spec_q: QueueHandle_
         head_n_freq,
         tail_ia,
         tail_n_freq,
-        hann,
         _fft_planner: fft_planner,
         fft,
         fft_buf,
@@ -235,7 +226,10 @@ fn advance_pairs(ctx: &mut WorkerCtx) {
         while ctx.cur.peak_abs << shift < TARGET_PEAK && shift < 8 {
             shift += 1;
         }
-        ctx.cur.shift = (shift + 1).min(8);
+        // Auto-gain shift only — rectangular window does not need the
+        // +1 Hann coherent-gain compensation (host dropped it at the
+        // NFFT=3840 migration; see decode_block.rs:419).
+        ctx.cur.shift = shift.min(8);
         ctx.cur.shift_locked = true;
     }
     if !ctx.cur.shift_locked {
@@ -297,23 +291,26 @@ fn compute_pair_into(ctx: &mut WorkerCtx, j_a: usize, j_b: usize) {
     // k=0 to 0 (DC bin is real), as the demux formula expects.
 
     // Pack audio[ia_a..+NSPS] real, audio[ia_b..+NSPS] imag, both
-    // through the Hann window with auto-gain shift applied.
+    // **Rectangular window** — matches host `compute_spectrogram` and
+    // WSJT-X `sync8.f90` after the NFFT=3840 migration. Hann was
+    // dropped on the host side because at integer tone alignment
+    // (tone_step_bins = 2.0 exactly) the rectangular-window sidelobes
+    // do not leak onto adjacent FT8 tones; Hann's coherent gain 0.5
+    // costs ~3 dB SNR and spreads each tone's mainlobe across 2 bins,
+    // negating the integer-bin advantage. See decode_block.rs:107.
     {
         let cur = &ctx.cur;
-        let hann = &ctx.hann;
         let buf = &mut ctx.fft_buf;
         for k in 0..NFFT_SPEC {
             let re = if k < NSPS && ia_a + k < cur.audio.len() {
                 let raw = cur.audio[ia_a + k] as i32;
-                let scaled = (raw << shift).clamp(i16::MIN as i32, i16::MAX as i32);
-                ((scaled * hann[k] as i32) >> 15) as i16
+                (raw << shift).clamp(i16::MIN as i32, i16::MAX as i32) as i16
             } else {
                 0
             };
             let im = if k < NSPS && ia_b + k < cur.audio.len() {
                 let raw = cur.audio[ia_b + k] as i32;
-                let scaled = (raw << shift).clamp(i16::MIN as i32, i16::MAX as i32);
-                ((scaled * hann[k] as i32) >> 15) as i16
+                (raw << shift).clamp(i16::MIN as i32, i16::MAX as i32) as i16
             } else {
                 0
             };
@@ -379,20 +376,26 @@ fn update_one_half(
     spec: &[u16],
     dst: &mut [f32],
 ) {
-    let win = ALLSUM_WIN;
-    let mut s: f32 = 0.0;
+    // 7-tone gather at 2-bin step — matches WSJT-X `sync8.f90:66`
+    // (k=0..6; tone 7 is data-only, never a Costas position) and
+    // `coarse_sync_inner`'s score-formula divisor `(NTONES - 2) = 6`.
+    //
+    // NFFT=3840 → tone_step_bins = 2.0 exactly. The earlier 16-bin
+    // contiguous sliding window matched the NFFT=4096 era when
+    // tone_step ≈ 2.13 + Hann mainlobe leakage made the in-between
+    // bins informative; at NFFT=3840 those bins carry pure noise and
+    // a 16-contig sum nearly doubles `t0_ref`, halving sync ratio
+    // and dropping weak qso3 signals (mid/high band → 0 hits).
+    const TONE_STEP_BINS: usize = 2;
     let row_base = m * spec_n_freq;
-    for j in 0..win {
-        let bin = (ia + j).min(spec_n_freq - 1);
-        s += spec[row_base + bin] as f32;
-    }
-    dst[m] = s;
-    for fi in 1..n_freq {
-        let drop_bin = ia + fi - 1;
-        let add_bin = (ia + fi + win - 1).min(spec_n_freq - 1);
-        let drop_v = spec[row_base + drop_bin] as f32;
-        let add_v = spec[row_base + add_bin] as f32;
-        s = s - drop_v + add_v;
+    let upper = spec_n_freq - 1;
+    for fi in 0..n_freq {
+        let i_carrier = ia + fi;
+        let mut s: f32 = 0.0;
+        for k in 0..(NTONES - 1) {
+            let bin = (i_carrier + TONE_STEP_BINS * k).min(upper);
+            s += spec[row_base + bin] as f32;
+        }
         dst[fi * N_TIME + m] = s;
     }
 }

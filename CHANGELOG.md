@@ -1,5 +1,113 @@
 # Changelog
 
+## 0.5.5 — embedded recall fix (Hann→Rect window) + runtime BP iter + nstep-half feature
+
+A targeted patch addressing two latent embedded-side bugs uncovered while
+benchmarking M5StickS3 (ESP32-S3 LX7) against the JTDX 18-entry decode
+of the qso3 busy-band reference WAV.
+
+Headline numbers — qso3_busy on LX7 ship config (pass1=30, max_cand=15):
+
+| Path | Pre-0.5.5 | 0.5.5 |
+|---|---|---|
+| Decodes (vs JTDX 18-entry golden) | 3 | **6** |
+| post-SlotEnd | 0.71 s (0.5.4) → 1.22 s (latent regression) | **1.28 s** |
+| Time / decode | ~240 ms | **213 ms** |
+
+### Library (mfsk-core)
+
+API additions — runtime tunable BP iterations (the dominant time-scaling
+knob inside stage 3, particularly on weak signals where every LLR variant
+exhausts `BP_MAX_ITER` × NMS):
+
+- `ft8::params::DEFAULT_BP_MAX_ITER` (= 30, WSJT-X reference) —
+  named alias for the existing `BP_MAX_ITER`.
+- `ft8::decode_block::decode_block_tuned(.., bp_max_iter)` — host-facing.
+- `ft8::decode_block::decode_block_into_tuned(.., bp_max_iter, basis_re, basis_im)`
+  — fixed-point + caller-basis variant.
+- `ft8::decode_block::process_candidates_tuned`,
+  `process_candidates_into_tuned`,
+  `process_candidates_into_with_cs_scratch_tuned` — for callers that
+  bypass `decode_block`'s spectrogram + coarse_sync (e.g. embedded
+  dual-core dispatch).
+
+The non-`_tuned` entry points keep their stable signatures and forward
+to the `_tuned` variants with `DEFAULT_BP_MAX_ITER`.
+
+New cargo feature:
+
+- `nstep-half` — flips `ft8::params::NSTEP` from `NSPS/4` (= 480, the
+  WSJT-X faithful default) to `NSPS/2` (= 960). Embedded targets enable
+  this so the spec time-axis (= `NMAX/NSTEP - 3`) stays at 184 cells
+  instead of doubling to 372 — at NSPS/4 the stage-1 FFT count and
+  spectrogram memory both 2× and overrun the LX7 / LX6 post-SlotEnd
+  budget. Host stays on the WSJT-X-faithful value by default; existing
+  host tests are unaffected.
+
+Doc + comment cleanup:
+
+- `coarse_sync_inner`'s "tone_step ≈ 2.13 multi-bin Plan A" comment is
+  rewritten to reflect the NFFT=3840 single-bin gather actually in
+  effect, and to flag that Hann-window + multi-bin sum were always
+  paired (do not re-add one without the other).
+
+### Embedded (`embedded-poc/embedded-shared`)
+
+The two bugs:
+
+1. **`stage1_inc` was applying a Hann window** while the host
+   `compute_spectrogram` had migrated to **rectangular** at the
+   NFFT=3840 cutover (commit dec4016 era). Hann's coherent gain 0.5
+   plus its 2-bin mainlobe spread were specifically what the
+   integer-bin migration moved away from; keeping Hann nullified the
+   integer-bin SNR advantage. Removing it (and the `+1` shift that
+   compensated Hann's gain) is the recall fix above.
+
+2. **A latent stage-3 OOB**: `coarse_sync_inner`'s `m_base` is derived
+   from `params::NSTEP`. Task #24 moved the host to NSPS/4 (m_u up to
+   ~350) but `stage1_inc` kept building the spec at NSPS/2 (n_time =
+   184). With the ship config's `q_thresh=12` from 0.5.4, few candidates
+   reached the deep-m blocks and the panic was masked; with
+   `DEFAULT_Q_THRESH` lowered (later WSJT-X-faithful change) the
+   embedded build started panicking at `power_acc`. Fixed structurally
+   by the `nstep-half` feature.
+
+API additions:
+
+- `embedded_shared::apps::rx_wavsim::run(.., bp_max_iter)` — accepts the
+  runtime BP iter cap. The old 4-arg form is gone (breaking change for
+  callers of this internal app crate; both bundled targets are updated).
+- `embedded_shared::apps::rx_wavsim::RxSweepCfg` + `run_sweep(wavs, cfgs)`
+  — rotate through configs slot-by-slot for in-binary parameter sweeps.
+  Used to find the (pass1, max_cand, q_thresh, bp_max_iter) Pareto in
+  one flash instead of N flashes.
+- `dual_core::stage3_split(.., bp_max_iter, ..)` — threads the BP cap
+  through the work-stealing dispatch.
+
+`stage1_inc::WorkerCtx::hann` field + table generation deleted.
+
+### Per-target binaries
+
+- `embedded-poc/m5stack-s3/src/bin/rx_wavsim.rs` and
+  `embedded-poc/m5stack-core2/src/bin/rx_wavsim.rs` pass
+  `mfsk_core::ft8::params::DEFAULT_BP_MAX_ITER` for the new arg.
+- `embedded-poc/m5stack-s3-app/src/decode_pipeline.rs` likewise.
+
+### Sweep insights captured for future tuning (qso3_busy / LX7)
+
+| pass1 / max_cand / q / BP | post-SlotEnd | decodes |
+|---|---|---|
+| 30 / 15 / 6 / 30 (ship) | 1.30 s | 6 |
+| 45 / 20 / 6 / 30 | 2.14 s | 6 |
+| 60 / 30 / 6 / 30 | 2.68 s | 6 |
+| 45 / 20 / 6 / **15** | 1.80 s | 6 |
+| 45 / 20 / **12** / 30 | 1.43 s | 6 |
+
+After the rect-window fix, all configs converge to 6 / 18 JTDX (5 hits +
+1 WSJT-X-only). The 7th decode (N1PJT HB9CQK -10 dB, fractional bin
+alignment) requires `fine_refine_pass1`'s 192k-FFT cd0 path — infeasible
+on Xtensa. **Pareto-optimal ship config = `(30, 15, q=6, BP=30)`**.
+
 ## 0.5.4 — embedded streaming pipeline + S3 LX7 sub-1 s + bench against WSJT-X reference
 
 API-additive patch on the host side; all changes are concentrated in

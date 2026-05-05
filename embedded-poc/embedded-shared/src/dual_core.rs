@@ -42,7 +42,7 @@ use alloc::vec::Vec;
 use mfsk_core::core::sync::SyncCandidate;
 use mfsk_core::ft8::decode::{DecodeDepth, DecodeResult};
 use mfsk_core::ft8::decode_block::{
-    coarse_sync, process_candidates_into_with_cs_scratch, refine_candidates_into,
+    coarse_sync, process_candidates_into_with_cs_scratch_tuned, refine_candidates_into,
     RefinedCandidate, Spectrogram, BASIS_SCRATCH_LEN,
 };
 
@@ -75,6 +75,7 @@ enum Job {
         audio_len: usize,
         depth: DecodeDepth,
         q_thresh: u32,
+        bp_max_iter: u32,
         slots_ptr: *mut Option<RefinedCandidate>,
         slots_len: usize,
         next_idx: *const AtomicUsize,
@@ -191,6 +192,7 @@ extern "C" fn worker_main(_arg: *mut core::ffi::c_void) {
                 audio_len,
                 depth,
                 q_thresh,
+                bp_max_iter,
                 slots_ptr,
                 slots_len,
                 next_idx,
@@ -205,6 +207,7 @@ extern "C" fn worker_main(_arg: *mut core::ffi::c_void) {
                         &*next_idx,
                         depth,
                         q_thresh,
+                        bp_max_iter,
                         &mut BASIS_RE_C1,
                         &mut BASIS_IM_C1,
                         &mut CS_SCRATCH_WORKER,
@@ -371,11 +374,13 @@ pub fn pass2_split(
 /// on one core doesn't stall the other. Compared to the old
 /// fixed head/tail split, this absorbs the per-cand BP wall-clock
 /// variance (qso3 ~7 of 15 cands fail and run all 4 LLR variants).
+#[allow(clippy::too_many_arguments)]
 pub fn stage3_split(
     audio: &[i16],
     pass2: Vec<RefinedCandidate>,
     depth: DecodeDepth,
     q_thresh: u32,
+    bp_max_iter: u32,
     basis_re_main: &mut [i16],
     basis_im_main: &mut [i16],
 ) -> Vec<DecodeResult> {
@@ -392,6 +397,7 @@ pub fn stage3_split(
         audio_len: audio.len(),
         depth,
         q_thresh,
+        bp_max_iter,
         slots_ptr,
         slots_len,
         next_idx: next_idx_ptr,
@@ -408,6 +414,7 @@ pub fn stage3_split(
             &next_idx,
             depth,
             q_thresh,
+            bp_max_iter,
             basis_re_main,
             basis_im_main,
             &mut CS_SCRATCH_MAIN,
@@ -438,6 +445,7 @@ unsafe fn drain_stage3_queue(
     next_idx: &AtomicUsize,
     depth: DecodeDepth,
     q_thresh: u32,
+    bp_max_iter: u32,
     basis_re: &mut [i16],
     basis_im: &mut [i16],
     cs_scratch: &mut [[mfsk_core::core::scalar::Cmplx<f32>; 8]; 79],
@@ -453,11 +461,12 @@ unsafe fn drain_stage3_queue(
         let cand = unsafe { (*slots_ptr.add(i)).take() };
         let Some(cand) = cand else { continue };
         let mut single = vec![cand];
-        let mut results = process_candidates_into_with_cs_scratch(
+        let mut results = process_candidates_into_with_cs_scratch_tuned(
             audio,
             core::mem::take(&mut single),
             depth,
             q_thresh,
+            bp_max_iter,
             basis_re,
             basis_im,
             cs_scratch,

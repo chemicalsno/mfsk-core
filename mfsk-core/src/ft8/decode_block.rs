@@ -29,7 +29,7 @@ use num_traits::Float;
 use super::decode::{DecodeDepth, DecodeResult};
 use super::llr::sync_quality;
 use super::message::unpack77;
-use super::params::{BP_MAX_ITER, COSTAS, COSTAS_POS, LDPC_N, NMAX, NN, NSPS, NTONES};
+use super::params::{COSTAS, COSTAS_POS, DEFAULT_BP_MAX_ITER, LDPC_N, NMAX, NN, NSPS, NTONES};
 use super::wave_gen::message_to_tones;
 #[cfg(not(feature = "fixed-point"))]
 use crate::core::fft::default_planner;
@@ -123,7 +123,15 @@ pub const NFFT_SPEC: usize = 3840;
 /// to lock. The previous comment claimed halving to NSPS killed
 /// AWGN sensitivity — but that was vs NSPS, not NSPS/4 (the WSJT-X
 /// choice), which had not been benchmarked.
+// Mirrors `crate::ft8::params::NSTEP` — gated on `nstep-half` so
+// embedded targets pick the NSPS/2 (= 960) variant the embedded
+// `stage1_inc` builds spec at, instead of the WSJT-faithful NSPS/4
+// (= 480) used on host. Both consts must agree because the score
+// loop in `coarse_sync_inner` derives `m_base` from them.
+#[cfg(not(feature = "nstep-half"))]
 const NSTEP: usize = NSPS / 4;
+#[cfg(feature = "nstep-half")]
+const NSTEP: usize = NSPS / 2;
 
 /// Steps per symbol — used to map symbol-index to time-step lag.
 const NSSY: i32 = (NSPS / NSTEP) as i32;
@@ -712,15 +720,15 @@ fn coarse_sync_inner(
     #[cfg(feature = "std")]
     let t_setup = std::time::Instant::now();
 
-    // **Multi-bin tone sum (Plan A)**: tone_step_bins ≈ 2.13 means
-    // the 8 FT8 tones fall at fractional bin positions [0.00, 2.13,
-    // 4.27, 6.40, 8.53, 10.67, 12.80, 14.93]. Reading just `round(...)`
-    // captures only one bin's worth of the Hann mainlobe (which is
-    // ~2 bins wide); off-bin tones lose 1–3 dB to the neighbour.
-    // We sum the floor-bin and floor-bin+1 instead, recovering the
-    // full mainlobe energy for every tone regardless of fractional
-    // alignment. Cost: 2× spec reads per tone — negligible vs PSRAM
-    // bandwidth headroom on Core2.
+    // **Single-bin tone gather**. NFFT=3840 → tone_step_bins = 2.0
+    // exactly, so the 8 FT8 tones sit on integer bins {0, 2, 4, …, 14}
+    // relative to the carrier. With the rectangular pre-FFT window
+    // each tone's mainlobe is one bin wide and contains the full tone
+    // energy, so single-bin reads are loss-less. The Plan-A multi-bin
+    // sum (floor-bin + floor-bin+1) was a fractional-alignment +
+    // Hann-mainlobe compensation for the NFFT=4096 era and was
+    // dropped at the 3840 migration; do NOT re-add it without also
+    // restoring Hann (the two were always paired).
     let mut tone_bin_lo = [0usize; NTONES];
     for k in 0..NTONES {
         tone_bin_lo[k] = (k as f32 * tone_step_bins).floor() as usize;
@@ -1602,7 +1610,39 @@ pub fn decode_block<S: AudioSample>(
     depth: DecodeDepth,
     max_cand: usize,
 ) -> Vec<DecodeResult> {
-    decode_block_multipass(audio, freq_min, freq_max, sync_min, depth, max_cand)
+    decode_block_multipass(
+        audio,
+        freq_min,
+        freq_max,
+        sync_min,
+        depth,
+        max_cand,
+        DEFAULT_BP_MAX_ITER,
+    )
+}
+
+/// Variant of [`decode_block`] that accepts a runtime `bp_max_iter`
+/// (= per-LLR-variant BP iteration cap, default
+/// [`DEFAULT_BP_MAX_ITER`]). Useful on time-budgeted targets.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_block_tuned<S: AudioSample>(
+    audio: &[S],
+    freq_min: f32,
+    freq_max: f32,
+    sync_min: f32,
+    depth: DecodeDepth,
+    max_cand: usize,
+    bp_max_iter: u32,
+) -> Vec<DecodeResult> {
+    decode_block_multipass(
+        audio,
+        freq_min,
+        freq_max,
+        sync_min,
+        depth,
+        max_cand,
+        bp_max_iter,
+    )
 }
 
 /// WSJT-X `ft8_decode.f90:172-236` 3-pass loop driver. Each pass:
@@ -1618,6 +1658,7 @@ pub fn decode_block<S: AudioSample>(
 /// (subtract operates on i16 samples). Embedded targets compile through
 /// the same path; the clone cost is dominated by the BP work it enables.
 #[cfg(feature = "fft-rustfft")]
+#[allow(clippy::too_many_arguments)]
 fn decode_block_multipass<S: AudioSample>(
     audio: &[S],
     freq_min: f32,
@@ -1625,6 +1666,7 @@ fn decode_block_multipass<S: AudioSample>(
     sync_min: f32,
     depth: DecodeDepth,
     max_cand: usize,
+    bp_max_iter: u32,
 ) -> Vec<DecodeResult> {
     use alloc::vec::Vec as AllocVec;
     let mut work: AllocVec<i16> = audio.iter().map(|s| s.to_i16()).collect();
@@ -1674,8 +1716,13 @@ fn decode_block_multipass<S: AudioSample>(
         #[cfg(not(feature = "std"))]
         let trace = false;
         for cand in pass2 {
-            let single_results =
-                process_candidates(work.as_slice(), alloc::vec![cand], depth, DEFAULT_Q_THRESH);
+            let single_results = process_candidates_tuned(
+                work.as_slice(),
+                alloc::vec![cand],
+                depth,
+                DEFAULT_Q_THRESH,
+                bp_max_iter,
+            );
             for r in single_results {
                 if all.iter().any(|x| x.message77 == r.message77) {
                     continue;
@@ -1839,6 +1886,7 @@ fn recompute_snr_xsnr2(
 /// production behaviour, no subtract). Host-only `fft-rustfft` adds
 /// the multipass driver.
 #[cfg(not(feature = "fft-rustfft"))]
+#[allow(clippy::too_many_arguments)]
 fn decode_block_multipass<S: AudioSample>(
     audio: &[S],
     freq_min: f32,
@@ -1846,13 +1894,14 @@ fn decode_block_multipass<S: AudioSample>(
     sync_min: f32,
     depth: DecodeDepth,
     max_cand: usize,
+    bp_max_iter: u32,
 ) -> Vec<DecodeResult> {
     let spec = compute_spectrogram(audio, freq_max);
     let pass1 = coarse_sync(&spec, freq_min, freq_max, sync_min, pass1_limit());
     drop(spec);
     let pass1 = fine_refine_pass1(audio, pass1);
     let pass2 = refine_candidates(audio, pass1, max_cand);
-    process_candidates(audio, pass2, depth, DEFAULT_Q_THRESH)
+    process_candidates_tuned(audio, pass2, depth, DEFAULT_Q_THRESH, bp_max_iter)
 }
 
 /// Per-candidate WSJT-X-style 3-stage fine refine. Builds the
@@ -1916,11 +1965,49 @@ pub fn decode_block_into<S: AudioSample>(
     basis_re: &mut [i16],
     basis_im: &mut [i16],
 ) -> Vec<DecodeResult> {
+    decode_block_into_tuned(
+        audio,
+        freq_min,
+        freq_max,
+        sync_min,
+        depth,
+        max_cand,
+        DEFAULT_BP_MAX_ITER,
+        basis_re,
+        basis_im,
+    )
+}
+
+/// Variant of [`decode_block_into`] that accepts a runtime
+/// `bp_max_iter`. The recommended top-level entry point for embedded
+/// LX6 / LX7 callers — `bp_max_iter` is the dominant time-scaling
+/// knob in the post-SlotEnd budget.
+#[cfg(feature = "fixed-point")]
+#[allow(clippy::too_many_arguments)]
+pub fn decode_block_into_tuned<S: AudioSample>(
+    audio: &[S],
+    freq_min: f32,
+    freq_max: f32,
+    sync_min: f32,
+    depth: DecodeDepth,
+    max_cand: usize,
+    bp_max_iter: u32,
+    basis_re: &mut [i16],
+    basis_im: &mut [i16],
+) -> Vec<DecodeResult> {
     let spec = compute_spectrogram(audio, freq_max);
     let pass1 = coarse_sync(&spec, freq_min, freq_max, sync_min, pass1_limit());
     drop(spec);
     let pass2 = refine_candidates_into(audio, pass1, max_cand, basis_re, basis_im);
-    process_candidates_into(audio, pass2, depth, DEFAULT_Q_THRESH, basis_re, basis_im)
+    process_candidates_into_tuned(
+        audio,
+        pass2,
+        depth,
+        DEFAULT_Q_THRESH,
+        bp_max_iter,
+        basis_re,
+        basis_im,
+    )
 }
 
 /// Pass-1 candidate cap — coarse_sync emits at most this many
@@ -2188,6 +2275,21 @@ pub fn process_candidates<S: AudioSample>(
     depth: DecodeDepth,
     q_thresh: u32,
 ) -> Vec<DecodeResult> {
+    process_candidates_tuned(audio, cands, depth, q_thresh, DEFAULT_BP_MAX_ITER)
+}
+
+/// Variant of [`process_candidates`] that accepts a runtime
+/// `bp_max_iter` (= per-LLR-variant BP iteration cap). Embedded
+/// LX6 / LX7 callers tune this to trade weak-signal recall for
+/// post-SlotEnd time budget.
+#[doc(hidden)]
+pub fn process_candidates_tuned<S: AudioSample>(
+    audio: &[S],
+    cands: Vec<RefinedCandidate>,
+    depth: DecodeDepth,
+    q_thresh: u32,
+    bp_max_iter: u32,
+) -> Vec<DecodeResult> {
     let mut cs_scratch: alloc::boxed::Box<[[Cmplx<f32>; 8]; 79]> =
         alloc::vec![[Cmplx::<f32>::default(); 8]; 79]
             .try_into()
@@ -2197,6 +2299,7 @@ pub fn process_candidates<S: AudioSample>(
         cands,
         depth,
         q_thresh,
+        bp_max_iter,
         &mut cs_scratch,
         |cs, cand, mask| {
             fill_symbol_spectra(cs, audio, cand.freq_hz, cand.dt_sec, mask);
@@ -2222,15 +2325,42 @@ pub fn process_candidates_into<S: AudioSample>(
     basis_re: &mut [i16],
     basis_im: &mut [i16],
 ) -> Vec<DecodeResult> {
-    let mut cs_scratch: alloc::boxed::Box<[[Cmplx<f32>; 8]; 79]> =
-        alloc::vec![[Cmplx::<f32>::default(); 8]; 79]
-            .try_into()
-            .unwrap();
-    process_candidates_into_with_cs_scratch(
+    process_candidates_into_tuned(
         audio,
         cands,
         depth,
         q_thresh,
+        DEFAULT_BP_MAX_ITER,
+        basis_re,
+        basis_im,
+    )
+}
+
+/// Variant of [`process_candidates_into`] that accepts a runtime
+/// `bp_max_iter`. Same role as [`process_candidates_tuned`] but for
+/// the caller-provided-basis path.
+#[cfg(feature = "fixed-point")]
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn process_candidates_into_tuned<S: AudioSample>(
+    audio: &[S],
+    cands: Vec<RefinedCandidate>,
+    depth: DecodeDepth,
+    q_thresh: u32,
+    bp_max_iter: u32,
+    basis_re: &mut [i16],
+    basis_im: &mut [i16],
+) -> Vec<DecodeResult> {
+    let mut cs_scratch: alloc::boxed::Box<[[Cmplx<f32>; 8]; 79]> =
+        alloc::vec![[Cmplx::<f32>::default(); 8]; 79]
+            .try_into()
+            .unwrap();
+    process_candidates_into_with_cs_scratch_tuned(
+        audio,
+        cands,
+        depth,
+        q_thresh,
+        bp_max_iter,
         basis_re,
         basis_im,
         &mut cs_scratch,
@@ -2255,11 +2385,41 @@ pub fn process_candidates_into_with_cs_scratch<S: AudioSample>(
     basis_im: &mut [i16],
     cs_scratch: &mut [[Cmplx<f32>; 8]; 79],
 ) -> Vec<DecodeResult> {
+    process_candidates_into_with_cs_scratch_tuned(
+        audio,
+        cands,
+        depth,
+        q_thresh,
+        DEFAULT_BP_MAX_ITER,
+        basis_re,
+        basis_im,
+        cs_scratch,
+    )
+}
+
+/// Variant of [`process_candidates_into_with_cs_scratch`] that accepts
+/// a runtime `bp_max_iter`. This is the entry point used by the
+/// embedded `dual_core::stage3_split` worker so LX6 / LX7 binaries
+/// can dial the BP cap without rebuilding `mfsk-core`.
+#[cfg(feature = "fixed-point")]
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn process_candidates_into_with_cs_scratch_tuned<S: AudioSample>(
+    audio: &[S],
+    cands: Vec<RefinedCandidate>,
+    depth: DecodeDepth,
+    q_thresh: u32,
+    bp_max_iter: u32,
+    basis_re: &mut [i16],
+    basis_im: &mut [i16],
+    cs_scratch: &mut [[Cmplx<f32>; 8]; 79],
+) -> Vec<DecodeResult> {
     process_candidates_with(
         audio,
         cands,
         depth,
         q_thresh,
+        bp_max_iter,
         cs_scratch,
         |cs, cand, mask| {
             // Host fft-rustfft: use the cd0-based 32-pt FFT cs builder
@@ -2300,6 +2460,7 @@ fn process_candidates_with<S: AudioSample, F>(
     cands: Vec<RefinedCandidate>,
     depth: DecodeDepth,
     q_thresh: u32,
+    bp_max_iter: u32,
     cs_scratch: &mut [[Cmplx<f32>; 8]; 79],
     mut fill: F,
 ) -> Vec<DecodeResult>
@@ -2367,7 +2528,7 @@ where
         let bp_step1 = bp_step_select::<LlrT>(
             &mut bp_scratch,
             &llr_a_fast.llra,
-            BP_MAX_ITER,
+            bp_max_iter,
             Some(check_crc14),
         );
         if let Some(bp) = bp_step1
@@ -2398,7 +2559,7 @@ where
             let bp_d = bp_step_select::<LlrT>(
                 &mut bp_scratch,
                 &llr_a_fast.llrd,
-                BP_MAX_ITER,
+                bp_max_iter,
                 Some(check_crc14),
             );
             if let Some(bp) = bp_d
@@ -2413,7 +2574,7 @@ where
                 let bp_b = bp_step_select::<LlrT>(
                     &mut bp_scratch,
                     &llrb_arr,
-                    BP_MAX_ITER,
+                    bp_max_iter,
                     Some(check_crc14),
                 );
                 if let Some(bp) = bp_b
@@ -2429,7 +2590,7 @@ where
                 let bp_c = bp_step_select::<LlrT>(
                     &mut bp_scratch,
                     &llrc_arr,
-                    BP_MAX_ITER,
+                    bp_max_iter,
                     Some(check_crc14),
                 );
                 if let Some(bp) = bp_c
