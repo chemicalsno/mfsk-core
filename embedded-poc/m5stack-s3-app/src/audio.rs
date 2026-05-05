@@ -170,6 +170,16 @@ pub fn audio_thread(mut i2s: I2sDriver<'static, I2sTx>, wav: &'static [u8]) -> !
     let mut env: f32 = 1.0;
     const ENV_STEP: f32 = 1.0 / 600.0;
 
+    // Loop-boundary fade window — # of input samples over which we
+    // ramp at the start and end of each WAV cycle. 600 samples at
+    // 12 kHz = 50 ms each side. The FT8 slot has ~0.5 s of silence
+    // around the tone block in the source WAV, so this fade fits
+    // entirely inside the natural quiet zone and the user doesn't
+    // hear a level dip on the signal itself — only the discontinuity
+    // at byte_pos wrap-around is smoothed away.
+    const LOOP_FADE_SAMPLES: usize = 600;
+    let total_samples = pcm.len() / 2;
+
     let mut byte_pos = 0usize;
     loop {
         let target_env: f32 = if AUDIO_GATE.load(Ordering::Acquire) {
@@ -183,21 +193,33 @@ pub fn audio_thread(mut i2s: I2sDriver<'static, I2sTx>, wav: &'static [u8]) -> !
                 byte_pos = 0; // loop the WAV
             }
             let s = i16::from_le_bytes([pcm[byte_pos], pcm[byte_pos + 1]]);
+            let sample_idx = byte_pos / 2;
             byte_pos += 2;
 
-            // Walk the envelope towards the gate target — 1 step per
-            // OUTPUT sample (= every 4× upsample tick). The 4× repeat
-            // below shares the same envelope value across the upsample
-            // group so the ramp is sample-rate accurate.
+            // Gate envelope — walks toward the AUDIO_GATE target one
+            // step per input sample (= 1/12 kHz tick).
             if env < target_env {
                 env = (env + ENV_STEP).min(target_env);
             } else if env > target_env {
                 env = (env - ENV_STEP).max(target_env);
             }
 
-            // -18 dBFS digital attenuation × envelope. Use f32 multiply
-            // since envelope is fractional; cast back to i16 LE.
-            let attenuated = ((s >> 3) as f32 * env) as i16;
+            // Loop-boundary envelope — 1.0 in the middle of the
+            // WAV, ramping linearly to 0 in the LOOP_FADE_SAMPLES
+            // closest to either end. Multiplied with the gate
+            // envelope so loop discontinuity and gate transitions
+            // are both smoothed.
+            let dist_to_end = total_samples.saturating_sub(sample_idx);
+            let loop_env = if sample_idx < LOOP_FADE_SAMPLES {
+                sample_idx as f32 / LOOP_FADE_SAMPLES as f32
+            } else if dist_to_end <= LOOP_FADE_SAMPLES {
+                dist_to_end as f32 / LOOP_FADE_SAMPLES as f32
+            } else {
+                1.0
+            };
+
+            // -18 dBFS digital attenuation × gate × loop envelope.
+            let attenuated = ((s >> 3) as f32 * env * loop_env) as i16;
             let attn = attenuated.to_le_bytes();
             for _ in 0..4 {
                 out[o] = attn[0];
