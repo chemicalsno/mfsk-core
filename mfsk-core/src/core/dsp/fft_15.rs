@@ -260,7 +260,7 @@ const S2: f32 = 0.587_785_3; //  sin(144°)
 ///
 /// Uses the Rader/Winograd-style sum/diff pairing with conjugate symmetry
 /// of `ω` and `ω̄` to share multiplications between symmetric output pairs
-/// (X[1] ↔ X[4], X[2] ↔ X[3]).
+/// (`X[1]` ↔ `X[4]`, `X[2]` ↔ `X[3]`).
 #[inline]
 pub fn fft_5(x: &mut [Complex32; 5]) {
     let x0 = x[0];

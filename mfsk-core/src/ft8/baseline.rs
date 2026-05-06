@@ -15,7 +15,7 @@
 
 pub use crate::core::baseline::fit_baseline;
 
-/// Compute the average linear power per FFT bin from a [`Spectrogram`].
+/// Compute the average linear power per FFT bin from a `Spectrogram`.
 /// `out.len()` must equal `spec.n_freq`. FT8-specific because it
 /// targets the embedded `decode_block::Spectrogram` layout.
 pub fn avg_spectrum(spec: &crate::ft8::decode_block::Spectrogram, out: &mut [f32]) {

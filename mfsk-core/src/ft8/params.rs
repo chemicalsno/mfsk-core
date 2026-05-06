@@ -77,7 +77,7 @@ pub const LLR_SCALE: f32 = 2.83;
 
 /// Default maximum BP decoder iterations (= WSJT-X
 /// `bpdecode174_91.f90` `maxiterations`). Runtime-tunable via
-/// [`crate::ft8::decode_block::DecodeTuning`] / `_tuned` entry points
+/// `crate::ft8::decode_block::DecodeTuning` / `_tuned` entry points
 /// — embedded targets (LX6 / LX7) lower this to trade weak-signal
 /// recall for post-SlotEnd time budget.
 pub const DEFAULT_BP_MAX_ITER: u32 = 30;

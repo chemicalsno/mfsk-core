@@ -189,7 +189,7 @@ pub fn refine_freq(
 ///
 /// Works for both GFSK (FT8/FT4 — `cfg.gfsk = Some`) and continuous-
 /// phase MSK / abrupt-tone (WSPR — `cfg.gfsk = None`) modulations.
-/// The reference is built via [`generate_iq`], which dispatches on
+/// The reference is built via `generate_iq`, which dispatches on
 /// `cfg.gfsk`.
 pub fn subtract_tones_lpf(
     audio: &mut [i16],

@@ -8,7 +8,7 @@
 //! Three stages:
 //!
 //! 1. ±10 idt sample search at the candidate's initial frequency, using
-//!    [`fine_sync_power`] (= sync8d-equivalent Costas correlation power
+//!    `fine_sync_power` (= sync8d-equivalent Costas correlation power
 //!    summed over the 3 sync blocks).
 //! 2. ±5 ifr × 0.5 Hz frequency sweep at the Stage-1 best `ibest`.
 //!    Applies a phasor `exp(-j·2π·delf·k·dt2)` to a working copy of cd0
@@ -110,7 +110,7 @@ fn shift_freq(cd0: &[Complex<f32>], delf_hz: f32, out: &mut [Complex<f32>]) {
 /// `initial_dt_sec` is the candidate's initial dt (relative to the
 /// nominal TX start, i.e. with the 0.5 s offset already removed).
 /// Returns the refined `(dt_sec, delf_hz, score)`. Negative dt is
-/// supported via [`fine_sync_power_signed`], which mirrors WSJT-X
+/// supported via `fine_sync_power_signed`, which mirrors WSJT-X
 /// `sync8d.f90:43-45` (zero contribution from any sync block whose
 /// samples fall outside the cd0 window).
 pub fn fine_refine_3stage(cd0: &[Complex<f32>], initial_dt_sec: f32) -> FineRefine {

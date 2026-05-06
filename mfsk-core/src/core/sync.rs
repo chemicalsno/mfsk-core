@@ -163,7 +163,7 @@ fn nuttall_window(n: usize) -> Vec<f32> {
 
 /// Compute per-time-step power spectra from raw 12 kHz PCM.
 ///
-/// The per-NSPS-sample chunk is multiplied by [`Protocol::SPECTRUM_WINDOW`]
+/// The per-NSPS-sample chunk is multiplied by `Protocol::SPECTRUM_WINDOW`
 /// before the NFFT1-point FFT. FT4 uses [`SpectrumWindow::Nuttall4`] to
 /// match WSJT-X `getcandidates4.f90:22` (sidelobe leakage from strong
 /// signals would otherwise inflate the per-bin polynomial baseline and

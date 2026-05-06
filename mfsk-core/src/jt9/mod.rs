@@ -78,9 +78,10 @@ pub struct Jt9Decode {
 }
 
 /// Scan an audio buffer for any JT9 frames: runs coarse (freq, time)
-/// search via [`search::coarse_search`] and uses the baseband pipeline
-/// in [`decode`] on each candidate in score order, collapsing duplicates
-/// that decode to the same message within ±4 Hz / ±1 symbol.
+/// search via [`search::coarse_search`] and uses the WSJT-X-faithful
+/// `softsym` pipeline (`downsam9` + `peakdt9` + `symspec2`) on each
+/// candidate in score order, collapsing duplicates that decode to the
+/// same message within ±4 Hz / ±1 symbol.
 pub fn decode_scan(
     audio: &[f32],
     sample_rate: u32,

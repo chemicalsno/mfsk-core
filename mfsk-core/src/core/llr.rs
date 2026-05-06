@@ -45,7 +45,7 @@ pub const LLR_SCALE: f32 = 2.83;
 // Pre-LDPC info scrambler (FT4-only)
 // ──────────────────────────────────────────────────────────────────────────
 
-/// Apply [`Protocol::INFO_SCRAMBLE_RVEC`] to the first
+/// Apply `Protocol::INFO_SCRAMBLE_RVEC` to the first
 /// `min(rvec.len(), info.len())` bits of `info`, in place. No-op when
 /// the protocol doesn't define a scrambler.
 ///

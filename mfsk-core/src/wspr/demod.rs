@@ -191,9 +191,11 @@ pub fn tone_amplitudes(
 
 /// Per-symbol non-coherent bit metric (`nblock = 1` path of
 /// `noncoherent_sequence_detection`). For each symbol `i`:
+/// ```text
 ///   sync = WSPR_SYNC_VECTOR[i]     (∈ {0, 1})
 ///   data = 0 → tone (sync), data = 1 → tone (sync + 2)
 ///   bm[i] = |is_data1 + j·qs_data1| − |is_data0 + j·qs_data0|
+/// ```
 ///
 /// Then z-score normalise the 162-element bm vector (matches wsprd's
 /// `normalizebmet` plus `symfac/fac` scale). Output is bm scaled by
