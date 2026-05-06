@@ -33,6 +33,8 @@ use crate::msg::Wsjt77Message;
 #[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub mod decode;
 pub mod encode;
+#[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
+pub mod refine_fine;
 
 /// FT4 protocol marker: 4-GFSK, 103 symbols over 7.5 s slot, 20.833 Hz tone
 /// spacing, four different Costas-4 arrays, LDPC(174,91) FEC, WSJT 77-bit

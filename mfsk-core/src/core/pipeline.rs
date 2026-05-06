@@ -16,6 +16,8 @@ use num_complex::Complex;
 #[cfg(not(feature = "std"))]
 use num_traits::Float;
 
+#[cfg(feature = "ft4")]
+use super::ProtocolId;
 use super::dsp::downsample::{DownsampleCfg, build_fft_cache, downsample_cached};
 use super::dsp::subtract::{SubtractCfg, subtract_tones};
 use super::equalize::{EqMode, equalize_local};
@@ -151,8 +153,37 @@ pub fn process_candidate_basic<P: Protocol>(
             *c *= inv;
         }
     }
-    let refined = refine_candidate::<P>(&cd0, cand, refine_steps);
-    let i_start = ((refined.dt_sec + tx_start) * ds_rate).round() as usize;
+
+    // FT4 uses the WSJT-X-faithful 2-D `sync4d` refine (±12 Hz / 3 Hz
+    // step → ±4 Hz / 1 Hz step × ±20 / ±5 sample window). Other
+    // protocols (FT8, FST4, …) keep the generic time-only
+    // `refine_candidate` path; FT8 has its own 3-stage refine wired
+    // separately in `ft8/decode.rs`.
+    #[cfg(feature = "ft4")]
+    let (refined, i_start) = if P::ID == ProtocolId::Ft4 {
+        let s4 = crate::ft4::refine_fine::sync4d_refine::<P>(&cd0, cand);
+        let df_hz = s4.freq_hz - cand.freq_hz;
+        // Mix `cd0` so the refined carrier sits at DC; this lets
+        // `symbol_spectra` keep using bins 0..NTONES-1 unchanged.
+        cd0 = crate::ft4::refine_fine::freq_shift_cd0(&cd0, df_hz, ds_rate);
+        let i_start = s4.i0.max(0) as usize;
+        let refined = SyncCandidate {
+            freq_hz: s4.freq_hz,
+            dt_sec: (s4.i0 as f32) / ds_rate - tx_start,
+            score: s4.score,
+        };
+        (refined, i_start)
+    } else {
+        let refined = refine_candidate::<P>(&cd0, cand, refine_steps);
+        let i_start = ((refined.dt_sec + tx_start) * ds_rate).round() as usize;
+        (refined, i_start)
+    };
+    #[cfg(not(feature = "ft4"))]
+    let (refined, i_start) = {
+        let refined = refine_candidate::<P>(&cd0, cand, refine_steps);
+        let i_start = ((refined.dt_sec + tx_start) * ds_rate).round() as usize;
+        (refined, i_start)
+    };
 
     let cs_raw = symbol_spectra::<P>(&cd0, i_start);
     let nsync = sync_quality::<P>(&cs_raw);
