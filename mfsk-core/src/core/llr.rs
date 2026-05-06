@@ -172,13 +172,16 @@ fn fill_bmet_for_nsym<P: Protocol, S: SpecScalar>(
     // Bit-normalised array (llrd) is only produced for nsym=1.
     let mut bmet_norm_holder = bmet_norm;
 
-    let mut chunk_bit_base = 0usize;
-    for &(chunk_start_sym, chunk_len) in &chunks {
-        let mut k = 0usize;
-        while k + nsym <= chunk_len {
-            let ks = chunk_start_sym + k;
-
-            // |Σ cs_k[gray[idx_k]]| for each tone-combination.
+    // Inner closure: compute bit metrics for one nsym-symbol group
+    // starting at frame symbol `ks`, write into `bmet_primary` /
+    // `bmet_norm_holder` at relative offset `i_bit_base`. Used by
+    // both the regular non-overlapping group sweep and the
+    // overlap-tail patch below.
+    let mut process_group =
+        |ks: usize,
+         i_bit_base: usize,
+         bmet_primary: &mut [f32],
+         bmet_norm_holder: &mut Option<&mut [f32]>| {
             for (i, s2_i) in s2.iter_mut().enumerate() {
                 let digits = base_digits(i, ntones, nsym);
                 let mut sum_re = 0.0f32;
@@ -190,8 +193,6 @@ fn fill_bmet_for_nsym<P: Protocol, S: SpecScalar>(
                 }
                 *s2_i = (sum_re * sum_re + sum_im * sum_im).sqrt();
             }
-
-            let i_bit_base = chunk_bit_base + k * bps;
             for ib in 0..=ibmax {
                 let bit_idx = i_bit_base + ib;
                 if bit_idx >= codeword_len {
@@ -217,8 +218,34 @@ fn fill_bmet_for_nsym<P: Protocol, S: SpecScalar>(
                     b[bit_idx] = if den > 0.0 { bm / den } else { 0.0 };
                 }
             }
+        };
 
+    let mut chunk_bit_base = 0usize;
+    for &(chunk_start_sym, chunk_len) in &chunks {
+        let mut k = 0usize;
+        while k + nsym <= chunk_len {
+            let ks = chunk_start_sym + k;
+            let i_bit_base = chunk_bit_base + k * bps;
+            process_group(ks, i_bit_base, bmet_primary, &mut bmet_norm_holder);
             k += nsym;
+        }
+        // Tail patch (issue #18, slice 5):
+        // when `chunk_len` is not a multiple of `nsym`, the last
+        // `chunk_len - k` symbols are uncovered by the non-overlapping
+        // sweep above. WSJT-X's `get_ft4_bitmetrics.f90` iterates over
+        // the **whole** frame (including sync symbols) so the loop
+        // structure naturally covers everything; our chunk-restricted
+        // loop drops `chunk_len % nsym` data symbols per chunk = 6
+        // bits total for FT4 (chunk_len=29, nsym=4). We patch by
+        // running one final overlapping group at `k = chunk_len -
+        // nsym` whose later bits overwrite the prior group's overlap
+        // and whose new bits fill the tail. Identity for chunks that
+        // are exact multiples of `nsym` (k == chunk_len there).
+        if k < chunk_len && chunk_len >= nsym {
+            let tail_k = chunk_len - nsym;
+            let ks = chunk_start_sym + tail_k;
+            let i_bit_base = chunk_bit_base + tail_k * bps;
+            process_group(ks, i_bit_base, bmet_primary, &mut bmet_norm_holder);
         }
         chunk_bit_base += chunk_len * bps;
     }
