@@ -97,9 +97,10 @@ const FREQ_TOL_HZ: f32 = 4.0;
 const DT_TOL_SEC: f32 = 0.5; // ≈ 1 symbol; covers ⅛-sym lag grid + slot-offset uncertainty
 
 #[test]
-#[ignore = "JT9 host path currently 0/5 against WSJT-X golden \
-            (Fano locks onto noise around 1354 Hz, no callsign sanity \
-            filter) — run with `cargo test -- --ignored` to track repair"]
+#[ignore = "JT9 host path 2/5 against WSJT-X golden after packgrid fix \
+            (EM41 + 73 hit; IO75 / CN84 / IO82 still miss — wrong-codeword \
+            in ng field at busy bands) — run with `cargo test -- --ignored` \
+            to track repair"]
 fn jt9_wsjtx_sample_recall_vs_golden() {
     let Some(path) = sample_path() else {
         eprintln!(

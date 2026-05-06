@@ -231,6 +231,12 @@ pub fn unpack_call(ncall: u32) -> Option<String> {
 /// integer mapping used by WSJT-X `packgrid` (without the
 /// extended-range report tricks — callers can build those up
 /// manually).
+///
+/// WSJT-X reference (`lib/packjt.f90:341-345` + `grid2deg.f90`):
+/// `dlong = (180 - 20*fl - 2*sl) - 62.5/60`, `lat = 10*fla + sla`,
+/// `ng = ((int(dlong) + 180) / 2) * 180 + lat`. For valid grids
+/// (fl ∈ 0..=17, sl ∈ 0..=9) the integer-arithmetic equivalent
+/// collapses to `ng_long_part = 179 - 10*fl - sl`.
 fn pack_grid4_plain(grid: &str) -> Option<u32> {
     let b = grid.as_bytes();
     if b.len() != 4 {
@@ -252,10 +258,9 @@ fn pack_grid4_plain(grid: &str) -> Option<u32> {
         c @ b'0'..=b'9' => (c - b'0') as i32,
         _ => return None,
     };
-    // Mirror the int(dlong) / int(dlat+90) arithmetic.
-    let dlong_int = -180 + fl * 20 + sl * 2 + 1;
-    let lat_int = fla * 10 + sla;
-    let ng = ((dlong_int + 180) / 2) * 180 + lat_int;
+    let ng_long_part = 179 - 10 * fl - sl;
+    let lat_int = 10 * fla + sla;
+    let ng = ng_long_part * 180 + lat_int;
     Some(ng as u32)
 }
 
@@ -307,13 +312,14 @@ pub fn unpack_grid(ng: u32) -> String {
         return format!("R-{:02}", n);
     }
     if ng < NGBASE {
-        // Standard grid. Reverse the (int(dlong), int(dlat+90)) path.
-        let long = (ng / 180) as i32;
+        // Standard grid. Inverse of pack_grid4_plain:
+        //   long_part = ng / 180 = 179 - 10*fl - sl
+        //   lat       = ng % 180 = 10*fla + sla
+        let long_part = (ng / 180) as i32;
         let lat = (ng % 180) as i32;
-        // long = (dlong_int + 180) / 2 (integer division).
-        // To recover a valid grid letter/digit, step by 2° per sub.
-        let fl = long / 10;
-        let sl = long % 10; // each step is 2° long = 1 sub step
+        let fl_sl = 179 - long_part;
+        let fl = fl_sl / 10;
+        let sl = fl_sl % 10;
         let fla = lat / 10;
         let sla = lat % 10;
         let mut g = [0u8; 4];
@@ -482,6 +488,24 @@ mod tests {
             let ng = pack_grid_or_report(grid).unwrap_or_else(|| panic!("pack {grid}"));
             let back = unpack_grid(ng);
             assert_eq!(back, grid, "roundtrip {grid}");
+        }
+    }
+
+    /// Pin the canonical WSJT-X `ng` values for a few grids so we cannot
+    /// regress on the `packgrid` formula again. Values derived directly
+    /// from `lib/packjt.f90:341-345` + `grid2deg.f90`.
+    #[test]
+    fn grid_wsjtx_canonical_ng() {
+        for (grid, expected_ng) in [
+            ("EM41", 24421u32),
+            ("FN42", 22632),
+            ("PM95", 3725),
+            ("JN58", 15258),
+            ("AA00", 32220),
+            ("RR99", 179),
+        ] {
+            let ng = pack_grid_or_report(grid).unwrap_or_else(|| panic!("pack {grid}"));
+            assert_eq!(ng, expected_ng, "WSJT-X canonical ng for {grid}");
         }
     }
 

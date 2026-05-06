@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased — JT9 packgrid formula fix (#19 partial: 1/5 → 2/5)
+
+`msg/jt72.rs::pack_grid4_plain` and the matching `unpack_grid` grid
+branch were both encoding/decoding the maidenhead → 15-bit `ng`
+field with a self-consistent but **non-WSJT-X-compatible** formula
+(`(-180 + fl*20 + sl*2 + 1)` long offset). Self-roundtrip passed,
+but real WSJT-X-encoded WAVs decoded with the wrong grid (e.g.
+`K1JT N5KDV EM41` → `K1JT N5KDV NM51`).
+
+Replaced both with the integer-arithmetic equivalent of WSJT-X's
+`packgrid` (`lib/packjt.f90:341-345` + `grid2deg.f90`):
+
+```text
+ng_long_part = 179 - 10*fl - sl     // for valid grids fl∈[0..17], sl∈[0..9]
+ng_lat       = 10*fla + sla
+ng           = ng_long_part * 180 + ng_lat
+```
+
+Pinned the canonical values for EM41 / FN42 / PM95 / JN58 / AA00 /
+RR99 in a new `grid_wsjtx_canonical_ng` test so this can't regress
+into another symmetrically-broken state.
+
+WSJT-X golden recall (`tests/jt9_wsjtx_samples.rs`) is now 2 / 5:
+`K1JT N5KDV EM41` joins `K1JT KF4RWA 73`. The remaining three
+misses (`CQ GM7GAX IO75` @ 1119 Hz, `TF3G N7MQ CN84` @ 1186 Hz,
+`CQ M0WAY IO82` @ 1290 Hz) are not packgrid bugs — at 1186 Hz we
+decode the same callsigns at the same freq/dt but with a different
+ng (`EH03` instead of `CN84`), i.e. the LLR/Fano stage is locking
+onto a near-but-wrong codeword in the busy band. Tracked separately.
+
 ## 0.5.9 — WSJT-X golden recall: WSPR 8/8, FT4 6/6, JT9 1/5 (encoder bug #19)
 
 End-to-end recall harness for the WSJT-X-distributed reference

@@ -570,12 +570,12 @@ mod tests {
     fn dump_synth_em41() {
         // 60-second slot at 12 kHz: WSJT-X expects 720_000 frames.
         let mut audio = vec![0f32; 12_000 * 60];
-        // dt = +0.1 s — matches the timing of the golden 130418_1742.wav
-        // signals exactly. Earlier dt=+1.0 s landed past WSJT-X's JT9
-        // search window and tripped the "audio gap" guard.
+        // dt = +1.0 s — matches WSJT-X jt9sim's "k=12000" signal start.
+        // The 130418_1742.wav golden signals also live at dt ≈ +0.86..+1.04
+        // (WSJT-X's coarse search expects signals near +1 s, not +0.1 s).
         let signal =
             synthesize_standard("K1JT", "N5KDV", "EM41", 12_000, 1500.0, 0.3).expect("synth");
-        let off = 1_200usize; // 0.1 s × 12 kHz
+        let off = 12_000usize; // 1.0 s × 12 kHz
         let n = signal.len().min(audio.len() - off);
         audio[off..off + n].copy_from_slice(&signal[..n]);
 
@@ -604,7 +604,7 @@ mod tests {
         }
         std::fs::write(path, &bytes).expect("write WAV");
         eprintln!("Wrote noiseless 'K1JT N5KDV EM41' synth → {}", path);
-        eprintln!("  carrier = 1500 Hz, dt = +0.1 s, 60 s slot, mono PCM-16 12 kHz");
+        eprintln!("  carrier = 1500 Hz, dt = +1.0 s, 60 s slot, mono PCM-16 12 kHz");
         eprintln!("  amplitude = 0.3 (~ -10 dBFS peak)");
         eprintln!("  Decode with WSJT-X (mode=JT9) and report what it says.");
     }
