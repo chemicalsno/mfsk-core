@@ -130,7 +130,14 @@ fn ft4_wsjtx_sample_recall_vs_golden() {
     audio[..copy].copy_from_slice(&raw[..copy]);
 
     // Wide search — FT4 audio band is ~100..2700 Hz.
-    let decodes = decode_frame_subtract(&audio, 100.0, 2700.0, 0.5, 60);
+    // `max_cand` matters: synth diagnostics show that at +10 dB SNR
+    // with the polynomial-baseline divisor in `coarse_sync` (slice 1
+    // of #18), many spurious candidates rank above the true signal
+    // — bumping max_cand from 50 → 100 takes recall from 0/10 to
+    // 10/10. Real-WAV recordings carry 6+ coexisting signals each
+    // contributing several alternate alignments, so 200 is the
+    // working budget.
+    let decodes = decode_frame_subtract(&audio, 100.0, 2700.0, 0.5, 200);
 
     // Enumerate decodes (msg + freq + dt) for diagnostic visibility.
     let decoded: Vec<(String, f32, f32)> = decodes

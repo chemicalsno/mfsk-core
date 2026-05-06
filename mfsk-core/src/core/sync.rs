@@ -357,10 +357,15 @@ pub fn coarse_sync<P: Protocol>(
     //     per-frequency so a sloped/coloured noise band gets correctly
     //     normalised — this is what closes the FT4 real-WAV recall gap.
     //
-    // Shape is clamped to `[0.5, 2.0]` so a degenerate polyfit on a
-    // mostly-empty spectrum (synth signal with `1e-30`-clamped bins
-    // that drag the dB curve to ~-300) cannot grossly amplify or
-    // suppress any single bin's score.
+    // Shape clamp `[1.0, 2.0]`: the polyfit baseline is only allowed
+    // to *increase* the divisor above the global pct floor (i.e.
+    // suppress regions known to be noisier than average) and is never
+    // permitted to *decrease* it. Letting it decrease would amplify
+    // noise scores in quiet regions of the band — empirically this
+    // floods the candidate list with sub-noise spurious peaks at
+    // ~1234-1250 Hz on the FT4 reference WAV, crowding out the real
+    // golden signals. Synth-only paths still degrade gracefully via
+    // the `n_freq > 0` fallback when polyfit returns nothing.
     let avg_pwr = s.avg_power_per_bin();
     let sbase_db = crate::core::baseline::fit_baseline(&avg_pwr, ia, ib);
     let sbase: Vec<f32> = if sbase_db.len() == n_freq && n_freq > 0 {
@@ -368,7 +373,7 @@ pub fn coarse_sync<P: Protocol>(
         let mean = (lin.iter().sum::<f32>() / n_freq as f32).max(f32::EPSILON);
         lin.iter()
             .map(|&p| {
-                let shape = (p / mean).clamp(0.5, 2.0);
+                let shape = (p / mean).clamp(1.0, 2.0);
                 global_base * shape
             })
             .collect()
