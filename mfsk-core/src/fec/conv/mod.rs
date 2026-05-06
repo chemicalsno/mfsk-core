@@ -34,8 +34,15 @@ impl ConvFano {
     pub const DEFAULT_MAX_CYCLES: u64 = 10_000;
     /// LLR → branch-metric quantisation scale.
     pub const METRIC_SCALE: f32 = 16.0;
-    /// Fano bias, subtracted from each per-bit metric.
-    pub const METRIC_BIAS: f32 = 0.0;
+    /// Fano bias, subtracted from each per-bit metric. WSJT-X
+    /// `wsprd/fano.c` uses `bias = 0.42` on a ±1 soft-symbol scale.
+    /// Our LLR pipeline runs at a higher scale (≈ ±20 clamp), and a
+    /// proportional bias of 4.2 breaks synthetic-low-magnitude tests
+    /// (`tolerates_a_few_errors` runs at LLR magnitude 6). 1.0 is the
+    /// largest value that keeps both synthetic and real-WAV decodes
+    /// healthy; raising further would need an LLR-normalisation pass
+    /// before Fano (deferred — see `wspr_wsjtx_samples.rs`).
+    pub const METRIC_BIAS: f32 = 1.0;
 }
 
 /// Pack the message bits + 31 zero tail into the 11-byte buffer that
