@@ -107,10 +107,10 @@ const FREQ_TOL_HZ: f32 = 4.0;
 const DT_TOL_SEC: f32 = 0.5;
 
 #[test]
-#[ignore = "WSPR host path currently 4/8 against WSJT-X golden \
-            (sub-bin demod + 2-D Δf/Δt refine landed; remaining gaps: \
-            DJ6OL needs negative-dt support, W3BI is -27 dB / hash table, \
-            W5BIT/NM7J probably need Fano metric bias + callsign sanity) \
+#[ignore = "WSPR host path currently 5/8 against WSJT-X golden \
+            (sub-bin demod + 2-D Δf/Δt refine + negative-dt support \
+            landed; remaining gaps: W3BI is -27 dB / hash table, \
+            W5BIT/NM7J need Fano metric bias + callsign sanity) \
             — run with `cargo test --release -- --ignored` to track repair"]
 fn wspr_wsjtx_sample_recall_vs_golden() {
     let Some(path) = sample_path() else {
@@ -130,7 +130,7 @@ fn wspr_wsjtx_sample_recall_vs_golden() {
     let params = SearchParams {
         freq_min_hz: 1400.0,
         freq_max_hz: 1620.0,
-        max_candidates: 50,
+        max_candidates: 100,
         score_threshold: 0.05,
         ..SearchParams::default()
     };
@@ -139,13 +139,7 @@ fn wspr_wsjtx_sample_recall_vs_golden() {
 
     let decoded: Vec<(String, f32, f32)> = decodes
         .iter()
-        .map(|d| {
-            // WSPR `start_sample` is symbol-0 start; WSPR slots open
-            // ~1 s into the slot, so `dt = start/12000 − 1.0` matches
-            // the wsprd "dt" column convention.
-            let dt = d.start_sample as f32 / 12_000.0 - 1.0;
-            (d.message.to_string(), d.freq_hz, dt)
-        })
+        .map(|d| (d.message.to_string(), d.freq_hz, d.dt_sec))
         .collect();
 
     eprintln!("WSPR sample decoded {} message(s):", decoded.len());

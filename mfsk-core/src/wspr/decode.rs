@@ -19,8 +19,16 @@ pub struct WsprDecode {
     pub message: WsprMessage,
     /// Base frequency (tone 0) used for demodulation.
     pub freq_hz: f32,
-    /// Sample index at which symbol 0 started.
+    /// Sample index at which symbol 0 started, in the *caller's* audio
+    /// buffer. **Clamped to 0** when the signal actually started before
+    /// the buffer (negative-dt case); use [`Self::dt_sec`] for the
+    /// signed offset that matches wsprd's reporting.
     pub start_sample: usize,
+    /// wsprd-equivalent `dt`: signal-start offset in seconds, relative
+    /// to the WSPR nominal anchor (slot start + 1 s). Positive values
+    /// = signal arrived late, negative = arrived early. Range that
+    /// `decode_scan` can express: `−NEGATIVE_DT_PAD_SEC .. +∞`.
+    pub dt_sec: f32,
 }
 
 /// Decode one WSPR frame at a known (freq, start_sample). Returns `None`
@@ -34,10 +42,12 @@ pub fn decode_at(
     let mut llrs = demodulate_aligned(audio, sample_rate, start_sample, freq_hz);
     deinterleave_llrs(&mut llrs);
     let message = decode_from_deinterleaved_llrs(&llrs)?;
+    let dt_sec = start_sample as f32 / sample_rate as f32 - 1.0;
     Some(WsprDecode {
         message,
         freq_hz,
         start_sample,
+        dt_sec,
     })
 }
 
@@ -98,13 +108,32 @@ fn refine_align(
     best
 }
 
+/// Half-window (in seconds) of front-side zero padding added before
+/// the search runs. WSPR transmissions can start up to ~2 s **before**
+/// the nominal slot anchor (wsprd reports such cases as `dt < -1.0`);
+/// the missing pre-roll samples are not in the recording, but with
+/// front padding the demodulator still aligns the rest of the frame
+/// and Fano can recover from ~1–2 missing leading symbols. Mirrors
+/// wsprd's `wspr_decode.f90` which prepends a configurable buffer
+/// for the same reason.
+const NEGATIVE_DT_PAD_SEC: f32 = 3.0;
+
 pub fn decode_scan(
     audio: &[f32],
     sample_rate: u32,
     nominal_start_sample: usize,
     params: &SearchParams,
 ) -> Vec<WsprDecode> {
-    let cands = coarse_search(audio, sample_rate, nominal_start_sample, params);
+    // Prepend zeros so signals that started before audio[0] (negative
+    // dt) become reachable. Internal `start_sample`s are shifted by
+    // `pad`; we subtract `pad` back out before returning so callers
+    // see the original time base.
+    let pad = (NEGATIVE_DT_PAD_SEC * sample_rate as f32) as usize;
+    let mut padded = alloc::vec![0f32; pad + audio.len()];
+    padded[pad..].copy_from_slice(audio);
+    let nominal_shifted = nominal_start_sample + pad;
+    let cands = coarse_search(&padded, sample_rate, nominal_shifted, params);
+    let audio = &padded[..]; // shadow so all downstream reads use padded buffer
     let mut seen: Vec<WsprDecode> = Vec::new();
     const FREQ_DEDUP_HZ: f32 = 5.0;
     const TIME_DEDUP_SAMPLES: i64 = 8192; // one WSPR symbol at 12 kHz
@@ -140,9 +169,15 @@ pub fn decode_scan(
             refine_time_radius,
             refine_time_step,
         );
-        let Some(d) = decode_at(audio, sample_rate, start_refined, freq_refined) else {
+        let Some(mut d) = decode_at(audio, sample_rate, start_refined, freq_refined) else {
             continue;
         };
+        // Translate alignment back to the caller's time base.
+        // `dt_sec` is the source of truth (signed); `start_sample` is
+        // clamped to 0 when the alignment lands inside the prepended
+        // silence so its `usize` type is preserved.
+        d.dt_sec = (start_refined as i64 - pad as i64) as f32 / sample_rate as f32 - 1.0;
+        d.start_sample = start_refined.saturating_sub(pad);
         let dup = seen.iter().any(|prev| {
             prev.message == d.message
                 && (prev.freq_hz - d.freq_hz).abs() <= FREQ_DEDUP_HZ
