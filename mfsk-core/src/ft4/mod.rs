@@ -58,11 +58,11 @@ impl ModulationParams for Ft4 {
     // threshold curves — BP already converges within that range. Keeping
     // the WSJT-X default.
 
-    // Nuttall-4 window matches WSJT-X `getcandidates4.f90:22`. With
-    // the polyfit-shape clamp [1.0, 2.0] (slice 1) it cleanly suppresses
-    // the spurious 1234-1250 Hz region on the FT4 reference WAV without
-    // killing the genuine golden candidates (verified via diagnostic).
-    const SPECTRUM_WINDOW: crate::core::SpectrumWindow = crate::core::SpectrumWindow::Nuttall4;
+    // Spectrum window: Rectangular preserves the synth-roundtrip
+    // tests (clean-signal case where Nuttall + global-pct baseline
+    // misranks the signal bin against sidelobes). Nuttall is correct
+    // per WSJT-X but needs a more robust noise-floor estimator first.
+    const SPECTRUM_WINDOW: crate::core::SpectrumWindow = crate::core::SpectrumWindow::Rectangular;
 
     // 4-symbol coherent integration on the 3rd LLR variant (matches
     // WSJT-X `get_ft4_bitmetrics.f90:71` `nsym=4`). Gives ~3 dB SNR

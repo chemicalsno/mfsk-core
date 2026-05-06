@@ -277,16 +277,31 @@ pub fn coarse_sync<P: Protocol>(
             let t0_all: f32 = t0_blocks.iter().sum();
             // Reference excludes the signal energy: normalise by
             // (t0_total - t_total) / (NTONES - 1).
+            // Zero-denominator case: a CLEAN synthetic signal lands
+            // entirely on Costas tones (`t0_all == t_all`) so the
+            // "non-Costas tone power" is zero. Treat that as a perfect
+            // match (the signal is *all* Costas energy) and report
+            // `t_all` directly — a large number that beats any
+            // noise-floor candidate. Without this, pure-synth
+            // round-trip tests get score 0 at the signal bin.
             let t0_ref = (t0_all - t_all) / (ntones as f32 - 1.0);
-            let sync_all = if t0_ref > 0.0 { t_all / t0_ref } else { 0.0 };
+            let sync_all = if t0_ref > f32::EPSILON {
+                t_all / t0_ref
+            } else if t_all > 0.0 {
+                t_all
+            } else {
+                0.0
+            };
 
             // Trailing N-1 blocks (drop the first), to tolerate an early-block loss.
             let score = if num_blocks > 1 {
                 let t_tail: f32 = t_blocks[1..].iter().sum();
                 let t0_tail: f32 = t0_blocks[1..].iter().sum();
                 let t0_tail_ref = (t0_tail - t_tail) / (ntones as f32 - 1.0);
-                let sync_tail = if t0_tail_ref > 0.0 {
+                let sync_tail = if t0_tail_ref > f32::EPSILON {
                     t_tail / t0_tail_ref
+                } else if t_tail > 0.0 {
+                    t_tail
                 } else {
                     0.0
                 };
