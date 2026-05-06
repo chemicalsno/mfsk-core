@@ -334,52 +334,24 @@ pub fn coarse_sync<P: Protocol>(
     };
     let global_base = pct(&red);
 
-    // Per-bin polynomial baseline (slice 1, issue #18). Match WSJT-X
-    // `ft4_baseline.f90` / `baseline.f90`: feed averaged linear power
-    // and convert the returned dB curve back to linear so the
-    // `raw / sbase[fi]` divide below is dimensionally consistent
-    // with the previous global-percentile path.
+    // Reverted slice 1's per-bin polynomial baseline divisor (issue
+    // #18 follow-up): on real WAVs with multiple coexisting signals
+    // it inverts the priority — the polyfit baseline tracks the
+    // signal-contaminated avg power, raising the divisor ABOVE
+    // `global_base` at signal bins (halving real-signal scores) and
+    // leaving it at floor in quiet noise regions (where Costas-
+    // correlation false alarms from random tones inflate the
+    // ranking). Wide-band ranks of the WSJT-X golden signals dropped
+    // to 229-2905 / 4000 — well below `max_cand` cutoffs — while
+    // spurious peaks at 1234-1250 Hz topped the list at scores
+    // 12-18. Plain `global_base` keeps real-signal scores at ~1.0
+    // and spurious at ~0.7, so the goldens make the candidate list.
     //
-    // Falls back to the constant `global_base` whenever the spectrum
-    // is too short for the 5-term polyfit (synthetic / short-band
-    // tests with `n_freq < NSEG * NTERMS`); that preserves the old
-    // behaviour for unit tests.
-    // Per-bin baseline divisor (slice 1 of issue #18).
-    //
-    // Computed as `global_base × shape[fi]`, where `shape` is the
-    // mean-normalised linear-power polynomial baseline returned by
-    // [`crate::core::baseline::fit_baseline`]. This decomposes the
-    // divisor into:
-    //   - **scale** (`global_base`, 40-pct of `red`): preserves the
-    //     old single-baseline behaviour, so synthetic-signal lib tests
-    //     where the noise floor is essentially zero see no regression
-    //   - **shape** (`shape[fi]`, mean 1.0): redistributes the divisor
-    //     per-frequency so a sloped/coloured noise band gets correctly
-    //     normalised — this is what closes the FT4 real-WAV recall gap.
-    //
-    // Shape clamp `[1.0, 2.0]`: the polyfit baseline is only allowed
-    // to *increase* the divisor above the global pct floor (i.e.
-    // suppress regions known to be noisier than average) and is never
-    // permitted to *decrease* it. Letting it decrease would amplify
-    // noise scores in quiet regions of the band — empirically this
-    // floods the candidate list with sub-noise spurious peaks at
-    // ~1234-1250 Hz on the FT4 reference WAV, crowding out the real
-    // golden signals. Synth-only paths still degrade gracefully via
-    // the `n_freq > 0` fallback when polyfit returns nothing.
-    let avg_pwr = s.avg_power_per_bin();
-    let sbase_db = crate::core::baseline::fit_baseline(&avg_pwr, ia, ib);
-    let sbase: Vec<f32> = if sbase_db.len() == n_freq && n_freq > 0 {
-        let lin: Vec<f32> = sbase_db.iter().map(|&db| 10.0f32.powf(db / 10.0)).collect();
-        let mean = (lin.iter().sum::<f32>() / n_freq as f32).max(f32::EPSILON);
-        lin.iter()
-            .map(|&p| {
-                let shape = (p / mean).clamp(1.0, 2.0);
-                global_base * shape
-            })
-            .collect()
-    } else {
-        vec![global_base; n_freq]
-    };
+    // The polyfit baseline still has value for **per-symbol LLR
+    // normalisation** (slice 2 territory) but that's a separate
+    // place from the candidate ranking. Leave the helper
+    // `core::baseline::fit_baseline` in place for that future use.
+    let sbase: Vec<f32> = vec![global_base; n_freq];
 
     let mut cands: Vec<SyncCandidate> = Vec::new();
     for fi in 0..n_freq {
