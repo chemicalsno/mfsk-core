@@ -107,8 +107,11 @@ const FREQ_TOL_HZ: f32 = 4.0;
 const DT_TOL_SEC: f32 = 0.5;
 
 #[test]
-#[ignore = "WSPR host path currently 3/8 against WSJT-X golden — \
-            run with `cargo test -- --ignored` to track repair progress"]
+#[ignore = "WSPR host path currently 4/8 against WSJT-X golden \
+            (sub-bin demod + 2-D Δf/Δt refine landed; remaining gaps: \
+            DJ6OL needs negative-dt support, W3BI is -27 dB / hash table, \
+            W5BIT/NM7J probably need Fano metric bias + callsign sanity) \
+            — run with `cargo test --release -- --ignored` to track repair"]
 fn wspr_wsjtx_sample_recall_vs_golden() {
     let Some(path) = sample_path() else {
         eprintln!(
@@ -119,10 +122,16 @@ fn wspr_wsjtx_sample_recall_vs_golden() {
     let audio = read_wsjtx_wav_f32(&path).expect("WAV must be 12 kHz mono PCM-16");
 
     // Golden carriers span 1446..1594 Hz — widen well past the
-    // ±100-Hz default to keep edges in scope.
+    // ±100-Hz default to keep edges in scope. WSPR slots commonly
+    // hold 6–10 transmissions; weak signals score 0.15–0.4 and
+    // get crowded out of the default 16-candidate budget by the
+    // strong (0.7+) signals' alternate alignments. Bump candidate
+    // count so the weak signals have a chance.
     let params = SearchParams {
         freq_min_hz: 1400.0,
         freq_max_hz: 1620.0,
+        max_candidates: 50,
+        score_threshold: 0.05,
         ..SearchParams::default()
     };
 

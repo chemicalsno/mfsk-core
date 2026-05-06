@@ -28,6 +28,7 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
+use core::f32::consts::PI;
 use num_complex::Complex;
 #[cfg(not(feature = "std"))]
 use num_traits::Float;
@@ -61,7 +62,16 @@ pub fn extract_tone_magnitudes(
 ) -> Option<ToneMagnitudes> {
     let nsps = (sample_rate as f32 * <Wspr as ModulationParams>::SYMBOL_DT).round() as usize;
     let df = sample_rate as f32 / nsps as f32;
-    let base_bin = (base_freq_hz / df).round() as usize;
+    // Sub-bin freq accuracy: split base_freq_hz into the nearest bin
+    // plus a residual offset, then mix the audio by `-residual` so the
+    // carrier of tone 0 lands exactly on `base_bin` regardless of the
+    // sub-bin offset. Without this, an off-bin carrier (typical for
+    // WSPR — 1.46 Hz bins, signals routinely sit ±0.7 Hz off-bin)
+    // loses up to ~50 % of its energy to FFT scalloping and the
+    // Fano decoder converges to noise instead of the correct payload.
+    let bin_pos = base_freq_hz / df;
+    let base_bin = bin_pos.round() as usize;
+    let residual_hz = base_freq_hz - base_bin as f32 * df;
     // Bail out if the caller asked for a window that doesn't fit.
     if start_sample + 162 * nsps > audio.len() || base_bin + 4 >= nsps / 2 {
         return None;
@@ -75,10 +85,23 @@ pub fn extract_tone_magnitudes(
     let mut noise_acc = 0.0f32;
     let mut noise_count = 0u32;
 
+    let mix_w = -2.0 * PI * residual_hz / sample_rate as f32;
+
     for i in 0..162 {
         let sym_start = start_sample + i * nsps;
-        for (slot, &s) in buf.iter_mut().zip(&audio[sym_start..sym_start + nsps]) {
-            *slot = Complex::new(s, 0.0);
+        // Mix `audio[sym_start..]` by `exp(-j 2π residual t)` (absolute
+        // sample index `t` so phase is continuous across symbols).
+        if residual_hz.abs() > 1e-6 {
+            for k in 0..nsps {
+                let abs_n = sym_start + k;
+                let ph = mix_w * abs_n as f32;
+                let s = audio[abs_n];
+                buf[k] = Complex::new(s * ph.cos(), s * ph.sin());
+            }
+        } else {
+            for (slot, &s) in buf.iter_mut().zip(&audio[sym_start..sym_start + nsps]) {
+                *slot = Complex::new(s, 0.0);
+            }
         }
         // The trait does in-place; allocates its own scratch internally
         // (rustfft) or operates true in-place (microfft).

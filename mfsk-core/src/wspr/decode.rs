@@ -8,6 +8,7 @@ use alloc::vec::Vec;
 
 use crate::msg::WsprMessage;
 
+use super::rx::{extract_tone_magnitudes, sync_score};
 use super::search::{SearchParams, coarse_search};
 use super::{decode_from_deinterleaved_llrs, demodulate_aligned};
 
@@ -46,6 +47,57 @@ pub fn decode_at(
 /// score-descending order. Duplicate decodes (same message within ±5 Hz
 /// and ±1 symbol) are collapsed to the single earliest-candidate hit,
 /// so each transmission appears at most once in the output.
+/// Refine a coarse candidate's (carrier, time) alignment by maximising
+/// [`sync_score`] over a 2-D grid of (Δf, Δt) offsets. WSPR's coarse
+/// search rounds carriers to the 1.4648-Hz FFT bin and start times to
+/// quarter-symbol steps (170 ms); both are too loose for low-SNR
+/// signals — Fano can't recover from > ±0.5 bin freq error or > ±50 ms
+/// time error. Without this refinement, real WSJT-X recordings drop
+/// >50 % of the decodes wsprd recovers.
+///
+/// Search radius defaults: ±2 Hz × ±170 ms (one t_step). 9 × 9 = 81
+/// evaluations per candidate; in release that's < 0.3 s/candidate.
+fn refine_align(
+    audio: &[f32],
+    sample_rate: u32,
+    start_sample: usize,
+    freq_hz_init: f32,
+    freq_radius_hz: f32,
+    freq_step_hz: f32,
+    time_radius_samples: i64,
+    time_step_samples: i64,
+) -> (usize, f32) {
+    let mut best = (start_sample, freq_hz_init);
+    let mut best_score =
+        match extract_tone_magnitudes(audio, sample_rate, start_sample, freq_hz_init) {
+            Some(tm) => sync_score(&tm),
+            None => f32::NEG_INFINITY,
+        };
+    let mut dt = -time_radius_samples;
+    while dt <= time_radius_samples {
+        let s_signed = start_sample as i64 + dt;
+        if s_signed < 0 {
+            dt += time_step_samples;
+            continue;
+        }
+        let s = s_signed as usize;
+        let mut df = -freq_radius_hz;
+        while df <= freq_radius_hz + 1e-3 {
+            let f = freq_hz_init + df;
+            if let Some(tm) = extract_tone_magnitudes(audio, sample_rate, s, f) {
+                let sc = sync_score(&tm);
+                if sc > best_score {
+                    best_score = sc;
+                    best = (s, f);
+                }
+            }
+            df += freq_step_hz;
+        }
+        dt += time_step_samples;
+    }
+    best
+}
+
 pub fn decode_scan(
     audio: &[f32],
     sample_rate: u32,
@@ -56,8 +108,39 @@ pub fn decode_scan(
     let mut seen: Vec<WsprDecode> = Vec::new();
     const FREQ_DEDUP_HZ: f32 = 5.0;
     const TIME_DEDUP_SAMPLES: i64 = 8192; // one WSPR symbol at 12 kHz
+    // 2-D refinement: WSPR's Fano (K=32 convolutional, no CRC) is
+    // sensitive to *both* sub-bin freq and sub-t_step time mis-
+    // alignment. Coarse-search rounds to 1.46 Hz / 170 ms; this
+    // pass refines:
+    //   time : ±170 ms / 43 ms step ⇒ 9 points
+    //   freq : ±2 Hz   / 0.5 Hz step ⇒ 9 points
+    // ≈ 81 sync_score evals × candidate.
+    //
+    // Going finer in time (e.g. 10 ms) actually *hurts* recall on
+    // weak signals: WSPR has no CRC, so the highest-sync_score
+    // alignment is often a noise-pattern Fano ghost rather than the
+    // true signal. 43 ms preserves true peaks while the coarser
+    // grid keeps us out of the ghost-attractor region. Better
+    // long-term fix is a Fano-metric / callsign-sanity gate; until
+    // then, 43 ms is the empirical optimum on the WSJT-X golden.
+    const REFINE_FREQ_RADIUS_HZ: f32 = 2.0;
+    const REFINE_FREQ_STEP_HZ: f32 = 0.5;
+    let nsps = (sample_rate as f32 * <super::Wspr as crate::core::ModulationParams>::SYMBOL_DT)
+        .round() as i64;
+    let refine_time_radius = nsps / 4; // one coarse t_step (≈170 ms)
+    let refine_time_step = nsps / 16; // ≈43 ms — see comment block above.
     for c in cands {
-        let Some(d) = decode_at(audio, sample_rate, c.start_sample, c.freq_hz) else {
+        let (start_refined, freq_refined) = refine_align(
+            audio,
+            sample_rate,
+            c.start_sample,
+            c.freq_hz,
+            REFINE_FREQ_RADIUS_HZ,
+            REFINE_FREQ_STEP_HZ,
+            refine_time_radius,
+            refine_time_step,
+        );
+        let Some(d) = decode_at(audio, sample_rate, start_refined, freq_refined) else {
             continue;
         };
         let dup = seen.iter().any(|prev| {
