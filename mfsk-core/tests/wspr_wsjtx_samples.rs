@@ -11,7 +11,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use mfsk_core::wspr::SearchParams;
-use mfsk_core::wspr::decode::decode_scan;
+use mfsk_core::wspr::decode::decode_scan_subtract;
 
 fn read_wsjtx_wav_f32(path: &Path) -> Option<Vec<f32>> {
     let mut file = File::open(path).ok()?;
@@ -135,7 +135,7 @@ fn wspr_wsjtx_sample_recall_vs_golden() {
         ..SearchParams::default()
     };
 
-    let decodes = decode_scan(&audio, 12_000, 0, &params);
+    let decodes = decode_scan_subtract(&audio, 12_000, 0, &params);
 
     let decoded: Vec<(String, f32, f32)> = decodes
         .iter()

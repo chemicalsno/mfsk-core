@@ -187,9 +187,10 @@ pub fn refine_freq(
 ///
 /// # Requirements
 ///
-/// `cfg.gfsk` must be `Some` — abrupt-transition references won't
-/// match real WSJT signals. The subtract reference is built via
-/// [`crate::core::dsp::gfsk::synth_complex_f32_into`].
+/// Works for both GFSK (FT8/FT4 — `cfg.gfsk = Some`) and continuous-
+/// phase MSK / abrupt-tone (WSPR — `cfg.gfsk = None`) modulations.
+/// The reference is built via [`generate_iq`], which dispatches on
+/// `cfg.gfsk`.
 pub fn subtract_tones_lpf(
     audio: &mut [i16],
     tones: &[u8],
@@ -198,29 +199,8 @@ pub fn subtract_tones_lpf(
     cfg: &SubtractCfg,
     lpf_half: usize,
 ) {
-    let g = match cfg.gfsk {
-        Some(g) => g,
-        None => return, // LPF subtract is only meaningful with GFSK reference
-    };
-
     let nframe = tones.len() * cfg.samples_per_symbol;
-    let mut cref_re = vec![0.0f32; nframe];
-    let mut cref_im = vec![0.0f32; nframe];
-    let gfsk_cfg = crate::core::dsp::gfsk::GfskCfg {
-        sample_rate: cfg.sample_rate,
-        samples_per_symbol: cfg.samples_per_symbol,
-        bt: g.bt,
-        hmod: g.hmod,
-        ramp_samples: g.ramp_samples,
-    };
-    crate::core::dsp::gfsk::synth_complex_f32_into(
-        &mut cref_re,
-        &mut cref_im,
-        tones,
-        freq_hz,
-        1.0,
-        &gfsk_cfg,
-    );
+    let (cref_re, cref_im) = generate_iq(tones, freq_hz, cfg);
 
     let signed_start = ((cfg.base_offset_s + dt_sec) * cfg.sample_rate).round() as i64;
     let (audio_off, ref_off) = if signed_start < 0 {
