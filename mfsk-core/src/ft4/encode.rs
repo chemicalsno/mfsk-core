@@ -37,8 +37,17 @@ fn append_crc14(message77: &[u8; 77]) -> [u8; 91] {
 }
 
 /// Encode a 77-bit message into the 103-symbol FT4 tone sequence.
+///
+/// XORs the input with [`super::FT4_RVEC`] before CRC + LDPC, matching
+/// WSJT-X `genft4.f90:64`. The CRC-14 is then computed over the
+/// **scrambled** message bits — same as WSJT-X, so the receive-side
+/// CRC verification stays correct.
 pub fn message_to_tones(message77: &[u8; 77]) -> Vec<u8> {
-    let info = append_crc14(message77);
+    let mut scrambled = *message77;
+    for (b, &r) in scrambled.iter_mut().zip(super::FT4_RVEC.iter()) {
+        *b = (*b ^ r) & 1;
+    }
+    let info = append_crc14(&scrambled);
     let codec = Ldpc174_91;
     let mut cw = [0u8; 174];
     codec.encode(&info, &mut cw);

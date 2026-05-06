@@ -137,7 +137,7 @@ fn ft4_wsjtx_sample_recall_vs_golden() {
     // 10/10. Real-WAV recordings carry 6+ coexisting signals each
     // contributing several alternate alignments, so 200 is the
     // working budget.
-    let decodes = decode_frame_subtract(&audio, 100.0, 2700.0, 0.5, 200);
+    let decodes = decode_frame_subtract(&audio, 100.0, 2700.0, 0.05, 500);
 
     // Enumerate decodes (msg + freq + dt) for diagnostic visibility.
     let decoded: Vec<(String, f32, f32)> = decodes

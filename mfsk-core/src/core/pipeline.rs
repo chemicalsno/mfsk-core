@@ -19,7 +19,7 @@ use num_traits::Float;
 use super::dsp::downsample::{DownsampleCfg, build_fft_cache, downsample_cached};
 use super::dsp::subtract::{SubtractCfg, subtract_tones};
 use super::equalize::{EqMode, equalize_local};
-use super::llr::{compute_llr, compute_snr_db, symbol_spectra, sync_quality};
+use super::llr::{compute_llr, compute_snr_db, descramble_info, symbol_spectra, sync_quality};
 use super::sync::{SyncCandidate, coarse_sync, fine_sync_power_per_block, refine_candidate};
 use super::tx::codeword_to_itone;
 use super::{FecCodec, FecOpts, MessageCodec, Protocol};
@@ -215,9 +215,12 @@ pub fn process_candidate_basic<P: Protocol>(
         };
 
         for (llr, pass_id) in &variants {
-            if let Some(r) = fec.decode_soft(llr, &bp_opts) {
+            if let Some(mut r) = fec.decode_soft(llr, &bp_opts) {
                 let itone = encode_tones_for_snr::<P>(&r.info, &fec);
                 let snr_db = compute_snr_db::<P>(cs, &itone);
+                // FT4 pre-LDPC scramble (WSJT-X `genft4.f90:64`): undo
+                // the rvec XOR before presenting the 77-bit payload.
+                descramble_info::<P>(&mut r.info);
                 return Some(DecodeResult {
                     info: r.info.into_boxed_slice(),
                     freq_hz: cand.freq_hz,
@@ -246,12 +249,13 @@ pub fn process_candidate_basic<P: Protocol>(
                     ..FecOpts::default()
                 };
                 for (llr, _) in &variants {
-                    if let Some(r) = fec.decode_soft(llr, &osd_opts) {
+                    if let Some(mut r) = fec.decode_soft(llr, &osd_opts) {
                         if r.hard_errors >= strictness.osd_max_errors(osd_depth) {
                             continue;
                         }
                         let itone = encode_tones_for_snr::<P>(&r.info, &fec);
                         let snr_db = compute_snr_db::<P>(cs, &itone);
+                        descramble_info::<P>(&mut r.info);
                         return Some(DecodeResult {
                             info: r.info.into_boxed_slice(),
                             freq_hz: cand.freq_hz,
@@ -274,12 +278,13 @@ pub fn process_candidate_basic<P: Protocol>(
                         ..FecOpts::default()
                     };
                     for (llr, _) in &variants {
-                        if let Some(r) = fec.decode_soft(llr, &osd4_opts) {
+                        if let Some(mut r) = fec.decode_soft(llr, &osd4_opts) {
                             if r.hard_errors >= strictness.osd_max_errors(4) {
                                 continue;
                             }
                             let itone = encode_tones_for_snr::<P>(&r.info, &fec);
                             let snr_db = compute_snr_db::<P>(cs, &itone);
+                            descramble_info::<P>(&mut r.info);
                             return Some(DecodeResult {
                                 info: r.info.into_boxed_slice(),
                                 freq_hz: cand.freq_hz,
@@ -518,7 +523,13 @@ pub fn decode_frame_subtract<P: Protocol>(
             // for the same workaround applied to the FT8 SIC path.
             let qsb = (r.sync_cv > 0.3) as u32 as f32;
             let gain = 1.0 - 0.5 * qsb;
-            let tones = encode_tones_for_snr::<P>(&r.info, &fec);
+            // `r.info` is post-descramble (FT4 only); re-apply the rvec
+            // XOR before re-encoding so the subtracted tones match what
+            // was actually on the air. XOR is its own inverse, so calling
+            // `descramble_info` here scrambles back to the wire form.
+            let mut info_for_tx = r.info.to_vec();
+            descramble_info::<P>(&mut info_for_tx);
+            let tones = encode_tones_for_snr::<P>(&info_for_tx, &fec);
             subtract_tones(&mut residual, &tones, r.freq_hz, r.dt_sec, gain, sub_cfg);
         }
         all_results.extend(deduped);

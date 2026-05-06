@@ -35,6 +35,27 @@ const C38: &[u8] = b" 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ/";
 /// 42-char alphabet for free-text messages
 const FREE_TEXT: &[u8] = b" 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ+-./?";
 
+/// US states + Canadian provinces + DX-region tags used by the ARRL
+/// RTTY Roundup Type-3 message format. Mirrors WSJT-X
+/// `packjt77.f90:240-258` `cmult` table (NUSCAN=171). Index 0 = "AL",
+/// 4 = "CA", 20 = "MA", etc.; entries past index 71 are "X01"…"X99"
+/// placeholders.
+const RTTY_STATES: &[&str] = &[
+    "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA", "HI", "ID", "IL", "IN", "IA", "KS",
+    "KY", "LA", "ME", "MD", "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ", "NM", "NY",
+    "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC", "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV",
+    "WI", "WY", "NB", "NS", "QC", "ON", "MB", "SK", "AB", "BC", "NWT", "NF", "LB", "NU", "YT",
+    "PEI", "DC", "DR", "FR", "GD", "GR", "OV", "ZH", "ZL", "X01", "X02", "X03", "X04", "X05",
+    "X06", "X07", "X08", "X09", "X10", "X11", "X12", "X13", "X14", "X15", "X16", "X17", "X18",
+    "X19", "X20", "X21", "X22", "X23", "X24", "X25", "X26", "X27", "X28", "X29", "X30", "X31",
+    "X32", "X33", "X34", "X35", "X36", "X37", "X38", "X39", "X40", "X41", "X42", "X43", "X44",
+    "X45", "X46", "X47", "X48", "X49", "X50", "X51", "X52", "X53", "X54", "X55", "X56", "X57",
+    "X58", "X59", "X60", "X61", "X62", "X63", "X64", "X65", "X66", "X67", "X68", "X69", "X70",
+    "X71", "X72", "X73", "X74", "X75", "X76", "X77", "X78", "X79", "X80", "X81", "X82", "X83",
+    "X84", "X85", "X86", "X87", "X88", "X89", "X90", "X91", "X92", "X93", "X94", "X95", "X96",
+    "X97", "X98", "X99",
+];
+
 // ── Token boundaries ─────────────────────────────────────────────────────────
 
 const NTOKENS: u32 = 2_063_592;
@@ -302,13 +323,40 @@ pub fn unpack77(msg: &[u8; 77]) -> Option<String> {
 
         // ── Type 3: ARRL RTTY Contest ─────────────────────────────────────
         3 => {
-            // Format: b1 b28 b28 b1 b3 b13 b3
-            let _itu = msg[0] & 1;
+            // Format (WSJT-X `packjt77.f90:514` `b1,2b28.28,b1,b3.3,b13.13,b3.3`):
+            //   b1: itu (0 = US/Can, 1 = TU; prefix)
+            //   b28: call1
+            //   b28: call2
+            //   b1: ir (0 = no prefix, 1 = "R " prefix on RST)
+            //   b3: irpt → RST = 5{irpt+2}9 (e.g. irpt=6 → "589")
+            //   b13: nexch → if `> 8000`, `imult = nexch-8000` indexes RTTY_STATES;
+            //        else `nserial = nexch`, formatted as 4-digit serial
+            //   b3: i3 (= 3, type marker)
+            let itu = msg[0] & 1;
             let n28a = read_bits(msg, 1, 28);
             let n28b = read_bits(msg, 29, 28);
+            let ir = msg[57] & 1;
+            let irpt = read_bits(msg, 58, 3) as u8;
+            let nexch = read_bits(msg, 61, 13);
             let c1 = unpack28(n28a);
             let c2 = unpack28(n28b);
-            Some(format!("{} {} [RTTY]", c1, c2))
+
+            let rst = format!("5{}9", irpt + 2);
+            let exch = if nexch > 8000 && (nexch as usize - 8000) <= RTTY_STATES.len() {
+                RTTY_STATES[(nexch as usize - 8000) - 1].to_string()
+            } else if (1..=7999).contains(&nexch) {
+                format!("{:04}", nexch)
+            } else {
+                // Out-of-range exchange: keep the [RTTY] placeholder so callers
+                // can still see the callsign pair without misleading state codes.
+                return Some(format!("{} {} [RTTY]", c1, c2));
+            };
+            let prefix = if itu == 1 { "TU; " } else { "" };
+            let r_prefix = if ir == 1 { "R " } else { "" };
+            Some(format!(
+                "{}{} {} {}{} {}",
+                prefix, c1, c2, r_prefix, rst, exch
+            ))
         }
 
         // ── Type 4: one non-standard call + 12-bit hash ───────────────────
@@ -448,12 +496,30 @@ pub fn unpack77_with_hash(msg: &[u8; 77], ht: &CallsignHashTable) -> Option<Stri
         }
 
         3 => {
-            let _itu = msg[0] & 1;
+            // Hashed-callsign variant of the ARRL RTTY Roundup unpack;
+            // see `unpack77` for the bit-layout commentary.
+            let itu = msg[0] & 1;
             let n28a = read_bits(msg, 1, 28);
             let n28b = read_bits(msg, 29, 28);
+            let ir = msg[57] & 1;
+            let irpt = read_bits(msg, 58, 3) as u8;
+            let nexch = read_bits(msg, 61, 13);
             let c1 = unpack28_h(n28a, ht);
             let c2 = unpack28_h(n28b, ht);
-            Some(format!("{} {} [RTTY]", c1, c2))
+            let rst = format!("5{}9", irpt + 2);
+            let exch = if nexch > 8000 && (nexch as usize - 8000) <= RTTY_STATES.len() {
+                RTTY_STATES[(nexch as usize - 8000) - 1].to_string()
+            } else if (1..=7999).contains(&nexch) {
+                format!("{:04}", nexch)
+            } else {
+                return Some(format!("{} {} [RTTY]", c1, c2));
+            };
+            let prefix = if itu == 1 { "TU; " } else { "" };
+            let r_prefix = if ir == 1 { "R " } else { "" };
+            Some(format!(
+                "{}{} {} {}{} {}",
+                prefix, c1, c2, r_prefix, rst, exch
+            ))
         }
 
         4 => {

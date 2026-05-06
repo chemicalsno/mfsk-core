@@ -116,6 +116,19 @@ pub trait ModulationParams: Copy + Default + 'static {
     /// to 3 inside the LLR loop.
     const LLR_NSYM_MAX: u32 = 3;
 
+    /// Optional 77-bit pre-LDPC scrambler. WSJT-X applies an
+    /// FT4-specific scrambler in `genft4.f90:64`
+    /// (`msgbits=mod(msgbits+rvec,2)`) before computing CRC-14 and
+    /// running LDPC encode; the receiver removes it after LDPC
+    /// decode + CRC verify (`ft4_decode.f90:430`). Without this our
+    /// decoder converges on a valid codeword whose unscrambled
+    /// payload is the WSJT-X-transmitted message — but emerges as
+    /// nonsense because we never undo the XOR.
+    ///
+    /// Default `None` (FT8 / FST4 / others don't scramble); FT4
+    /// overrides to `Some(&FT4_RVEC)`. Length must be 77 when set.
+    const INFO_SCRAMBLE_RVEC: Option<&'static [u8]> = None;
+
     /// Window function applied per `NSPS`-sample chunk in
     /// [`crate::core::sync::compute_spectra`] before the NFFT1 FFT.
     /// Default = [`SpectrumWindow::Rectangular`] (preserves FT8's

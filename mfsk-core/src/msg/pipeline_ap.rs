@@ -260,7 +260,13 @@ fn finalise_result<P: Protocol>(
     ap_cfg: Option<&ApHint>,
     fec: &P::Fec,
 ) -> Option<DecodeResult> {
-    let msg77: [u8; 77] = fec_result.info[..77].try_into().ok()?;
+    // FT4 pre-LDPC scramble (WSJT-X `genft4.f90:64`): undo the rvec
+    // XOR on the 77 message bits before unpacking text. SNR re-
+    // encode below still uses the *scrambled* `fec_result.info`
+    // because that's what the on-air codeword carried.
+    let mut info_unscrambled = fec_result.info.clone();
+    crate::core::llr::descramble_info::<P>(&mut info_unscrambled);
+    let msg77: [u8; 77] = info_unscrambled[..77].try_into().ok()?;
     let text = unpack77(&msg77)?;
     if text.is_empty() || !is_plausible_message(&text) {
         return None;
@@ -295,7 +301,7 @@ fn finalise_result<P: Protocol>(
     let snr_db = compute_snr_db::<P>(cs, &itone);
 
     Some(DecodeResult {
-        info: fec_result.info.clone().into_boxed_slice(),
+        info: info_unscrambled.into_boxed_slice(),
         freq_hz: cand.freq_hz,
         dt_sec: refined.dt_sec,
         hard_errors: fec_result.hard_errors,

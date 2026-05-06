@@ -42,6 +42,32 @@ pub struct LlrSet<T: LlrScalar = f32> {
 pub const LLR_SCALE: f32 = 2.83;
 
 // ──────────────────────────────────────────────────────────────────────────
+// Pre-LDPC info scrambler (FT4-only)
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Apply [`Protocol::INFO_SCRAMBLE_RVEC`] to the first
+/// `min(rvec.len(), info.len())` bits of `info`, in place. No-op when
+/// the protocol doesn't define a scrambler.
+///
+/// Must be called *after* the FEC layer accepts the candidate and
+/// produces SNR-estimation tones (since those tones must be encoded
+/// from the still-scrambled `info`), but *before* the result is
+/// presented to the caller / message codec — the unpacker expects
+/// raw 77-bit payload, not its rvec-XORed counterpart.
+///
+/// Mirrors WSJT-X `ft4_decode.f90:430`
+/// (`message77 = mod(message77 + rvec, 2)`).
+#[inline]
+pub fn descramble_info<P: super::Protocol>(info: &mut [u8]) {
+    if let Some(rvec) = <P as super::ModulationParams>::INFO_SCRAMBLE_RVEC {
+        let n = rvec.len().min(info.len());
+        for (b, &r) in info[..n].iter_mut().zip(rvec.iter()) {
+            *b = (*b ^ r) & 1;
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
 // Symbol spectra
 // ──────────────────────────────────────────────────────────────────────────
 

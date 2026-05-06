@@ -70,6 +70,9 @@ impl ModulationParams for Ft4 {
     // weak FT4 goldens at 0.4–3× noise need to land on the true
     // codeword instead of a CRC-14 false positive.
     const LLR_NSYM_MAX: u32 = 4;
+
+    // 77-bit pre-LDPC scrambler (WSJT-X `genft4.f90:64`).
+    const INFO_SCRAMBLE_RVEC: Option<&'static [u8]> = Some(&FT4_RVEC);
 }
 
 impl FrameLayout for Ft4 {
@@ -87,6 +90,20 @@ impl Protocol for Ft4 {
     type Msg = Wsjt77Message;
     const ID: ProtocolId = ProtocolId::Ft4;
 }
+
+/// FT4-specific 77-bit pre-LDPC scrambler. WSJT-X `genft4.f90:33-35,64`
+/// XORs the 77-bit message with this fixed sequence before appending
+/// CRC-14 + LDPC parity, and `ft4_decode.f90:430` removes the
+/// scrambling after LDPC decode + CRC verify. Without it, our
+/// decoder converges on a valid codeword whose payload is the
+/// message bits XORed with this vector — passes CRC (because the
+/// CRC was committed in the scrambled domain) but unpacks as
+/// nonsense.
+pub const FT4_RVEC: [u8; 77] = [
+    0, 1, 0, 0, 1, 0, 1, 0, 0, 1, 0, 1, 1, 1, 1, 0, 1, 0, 0, 0, 1, 0, 0, 1, 1, 0, 1, 1, 0, 1, 0, 0,
+    1, 0, 1, 1, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 0, 0, 1, 1, 1, 1, 0, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1,
+    1, 0, 1, 1, 1, 1, 1, 0, 0, 0, 1, 0, 1,
+];
 
 /// FT4's four Costas arrays — each a distinct permutation of `[0,1,2,3]`.
 const FT4_COSTAS_A: [u8; 4] = [0, 1, 3, 2];
