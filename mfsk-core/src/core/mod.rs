@@ -50,5 +50,5 @@ pub mod tx;
 
 pub use protocol::{
     BpKind, DecodeContext, FecCodec, FecOpts, FecResult, FrameLayout, MessageCodec, MessageFields,
-    ModulationParams, Protocol, ProtocolId, SyncBlock, SyncMode,
+    ModulationParams, Protocol, ProtocolId, SpectrumWindow, SyncBlock, SyncMode,
 };

@@ -132,7 +132,7 @@ fn normalize_bmet(bmet: &mut [f32]) {
 /// the generic `compute_llr_generic` — use the generic form when
 /// the caller already holds [`Cmplx<S>`] storage.
 pub fn compute_llr<P: Protocol, T: LlrScalar>(cs: &[Complex<f32>]) -> LlrSet<T> {
-    compute_llr_generic::<P, f32, T>(complex_slice_as_cmplx_f32(cs), 3)
+    compute_llr_generic::<P, f32, T>(complex_slice_as_cmplx_f32(cs), P::LLR_NSYM_MAX as usize)
 }
 
 /// Same as [`compute_llr`] but stops at nsym=1. `llrb`/`llrc` come
@@ -251,11 +251,20 @@ pub fn compute_llr_generic<P: Protocol, S: SpecScalar, T: LlrScalar>(
     let mut bmetc = vec![0.0f32; codeword_len];
     let mut bmetd = vec![0.0f32; codeword_len];
 
+    // `max_nsym=3` (FT8 / default) → run nsym ∈ {1, 2, 3}, store
+    //   results in {bmeta, bmetb, bmetc} respectively.
+    // `max_nsym=4` (FT4, matching WSJT-X `get_ft4_bitmetrics.f90:71`)
+    //   → run nsym ∈ {1, 2, 4}, store in {bmeta, bmetb, bmetc}; skip
+    //   nsym=3. The 4-symbol coherent integration gives ~3 dB SNR
+    //   gain on stable signals vs nsym=3.
     for nsym in 1usize..=max_nsym {
+        if max_nsym == 4 && nsym == 3 {
+            continue; // FT4 path skips 3-symbol; bmetc holds the nsym=4 result
+        }
         let primary: &mut [f32] = match nsym {
             1 => &mut bmeta,
             2 => &mut bmetb,
-            3 => &mut bmetc,
+            3 | 4 => &mut bmetc,
             _ => unreachable!(),
         };
         if nsym == 1 {

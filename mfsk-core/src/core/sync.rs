@@ -17,7 +17,7 @@ use num_complex::Complex;
 #[cfg(not(feature = "std"))]
 use num_traits::Float;
 
-use super::Protocol;
+use super::{Protocol, SpectrumWindow};
 use crate::core::fft::default_planner;
 
 /// One synchronisation candidate.
@@ -136,12 +136,49 @@ impl Spectrogram {
     }
 }
 
+/// Build the per-sample Nuttall-4 window of length `n`.
+/// Matches WSJT-X `nuttal_window.f90`. Coefficients fixed by the
+/// CW shape of the window — see `SpectrumWindow::Nuttall4` doc.
+fn nuttall_window(n: usize) -> Vec<f32> {
+    const A0: f32 = 0.3635819;
+    const A1: f32 = 0.4891775;
+    const A2: f32 = 0.1365995;
+    const A3: f32 = 0.0106411;
+    let mut w = vec![0.0f32; n];
+    if n < 2 {
+        if n == 1 {
+            w[0] = 1.0;
+        }
+        return w;
+    }
+    let two_pi = 2.0 * PI;
+    let denom = (n - 1) as f32;
+    for (k, slot) in w.iter_mut().enumerate() {
+        let x = k as f32 / denom;
+        *slot = A0 - A1 * (two_pi * x).cos() + A2 * (2.0 * two_pi * x).cos()
+            - A3 * (3.0 * two_pi * x).cos();
+    }
+    w
+}
+
 /// Compute per-time-step power spectra from raw 12 kHz PCM.
+///
+/// The per-NSPS-sample chunk is multiplied by [`Protocol::SPECTRUM_WINDOW`]
+/// before the NFFT1-point FFT. FT4 uses [`SpectrumWindow::Nuttall4`] to
+/// match WSJT-X `getcandidates4.f90:22` (sidelobe leakage from strong
+/// signals would otherwise inflate the per-bin polynomial baseline and
+/// mask weak signals); FT8 stays on `Rectangular` (its synth-roundtrip
+/// path is calibrated against rectangular).
 pub fn compute_spectra<P: Protocol>(audio: &[i16]) -> Spectrogram {
     let d = SyncDims::of::<P>();
     let fac = 1.0f32 / 300.0;
     let mut planner = default_planner();
     let fft = planner.plan_forward(d.nfft1);
+
+    let window: Option<Vec<f32>> = match P::SPECTRUM_WINDOW {
+        SpectrumWindow::Rectangular => None,
+        SpectrumWindow::Nuttall4 => Some(nuttall_window(d.nsps)),
+    };
 
     let mut data = vec![0.0f32; d.nh1 * d.nhsym];
     let mut buf = vec![Complex::new(0.0f32, 0.0); d.nfft1];
@@ -151,7 +188,11 @@ pub fn compute_spectra<P: Protocol>(audio: &[i16]) -> Spectrogram {
         for (k, c) in buf.iter_mut().enumerate() {
             *c = if k < d.nsps {
                 let sample = if ia + k < audio.len() {
-                    audio[ia + k] as f32 * fac
+                    let raw = audio[ia + k] as f32 * fac;
+                    match &window {
+                        Some(w) => raw * w[k],
+                        None => raw,
+                    }
                 } else {
                     0.0
                 };

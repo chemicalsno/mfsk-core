@@ -55,6 +55,19 @@ impl ModulationParams for Ft4 {
     // LLR_SCALE tuning (2.0 / 2.83 / 3.5) was measured to give identical
     // threshold curves — BP already converges within that range. Keeping
     // the WSJT-X default.
+
+    // Nuttall-4 window matches WSJT-X `getcandidates4.f90:22` and is a
+    // hard requirement for real-WAV recall: rectangular sidelobes
+    // around strong signals inflate the per-bin polynomial baseline,
+    // suppressing weak signals' candidate scores below sync_min.
+    const SPECTRUM_WINDOW: crate::core::SpectrumWindow = crate::core::SpectrumWindow::Nuttall4;
+
+    // 4-symbol coherent integration on the 3rd LLR variant (matches
+    // WSJT-X `get_ft4_bitmetrics.f90:71` `nsym=4`). Gives ~3 dB SNR
+    // boost on stable signals vs the default nsym=3 — exactly what
+    // weak FT4 goldens at 0.4–3× noise need to land on the true
+    // codeword instead of a CRC-14 false positive.
+    const LLR_NSYM_MAX: u32 = 4;
 }
 
 impl FrameLayout for Ft4 {

@@ -104,6 +104,42 @@ pub trait ModulationParams: Copy + Default + 'static {
     /// bits-per-symbol counts may shift the optimum — FT4's 2-bit LLR
     /// dynamics are not identical to FT8's 3-bit case.
     const LLR_SCALE: f32 = 2.83;
+
+    /// Maximum coherent-integration depth for the 3rd LLR variant.
+    /// `compute_llr` builds three variants `llra/llrb/llrc` from
+    /// `nsym` ∈ `{1, 2, LLR_NSYM_MAX}` symbol blocks. WSJT-X uses
+    /// `nsym=1, 2, 4` for FT4 (`get_ft4_bitmetrics.f90:69-71`); we
+    /// default to `nsym=3` (FT8 path is calibrated to it). FT4
+    /// overrides to `4` for an extra ~3 dB SNR boost on stable
+    /// signals — closes the recall gap on real-WAV recordings.
+    /// Must be one of `{3, 4}`; values outside that range fall back
+    /// to 3 inside the LLR loop.
+    const LLR_NSYM_MAX: u32 = 3;
+
+    /// Window function applied per `NSPS`-sample chunk in
+    /// [`crate::core::sync::compute_spectra`] before the NFFT1 FFT.
+    /// Default = [`SpectrumWindow::Rectangular`] (preserves FT8's
+    /// existing synth-roundtrip behaviour); FT4 overrides to
+    /// [`SpectrumWindow::Nuttall4`] to match WSJT-X
+    /// `getcandidates4.f90:22` and suppress sidelobe leakage that
+    /// otherwise inflates the per-bin baseline near strong signals.
+    const SPECTRUM_WINDOW: SpectrumWindow = SpectrumWindow::Rectangular;
+}
+
+/// Window function applied to each NSPS-sample chunk before the
+/// coarse-sync FFT. See [`ModulationParams::SPECTRUM_WINDOW`].
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum SpectrumWindow {
+    /// No window (multiplied by 1.0). Default. Suitable for synth
+    /// roundtrip and for protocols whose sync metric tolerates
+    /// rectangular-window sidelobes.
+    Rectangular,
+    /// Nuttall-4 window (a0=0.3635819, a1=0.4891775, a2=0.1365995,
+    /// a3=0.0106411). Matches WSJT-X `getcandidates4.f90`/
+    /// `getcandidates.f90` (FT4 / FT8 respectively in WSJT-X, though
+    /// in our port only FT4 currently opts in — FT8's existing path
+    /// is calibrated to rectangular).
+    Nuttall4,
 }
 
 /// One Costas / pilot block: a contiguous run of tones starting at a specific
