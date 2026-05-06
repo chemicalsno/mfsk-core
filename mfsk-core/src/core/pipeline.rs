@@ -133,7 +133,24 @@ pub fn process_candidate_basic<P: Protocol>(
     let ds_rate = 12_000.0 / P::NDOWN as f32;
     let tx_start = P::TX_START_OFFSET_S;
 
-    let cd0 = downsample_cached(fft_cache, cand.freq_hz, cfg);
+    let mut cd0 = downsample_cached(fft_cache, cand.freq_hz, cfg);
+    // RMS-normalise the downsampled baseband to unit power.
+    // Matches WSJT-X `ft4_decode.f90:231-232`:
+    //   sum2 = sum(|cd2|²) / (NMAX/NDOWN)
+    //   cd2  = cd2 / sqrt(sum2)
+    // The LLR_SCALE=2.83 used by `compute_llr` is calibrated against
+    // unit-RMS input; without this normalisation the per-tone
+    // magnitudes feeding `tanh(llr/2)` inside BP land at the wrong
+    // scale and the decoder converges on systematically wrong
+    // codewords that just happen to satisfy CRC-14 (the 4-CRC-false-
+    // positive symptom on the FT4 reference WAV — issue #18).
+    let sum2: f32 = cd0.iter().map(|c| c.norm_sqr()).sum::<f32>() / cd0.len() as f32;
+    if sum2 > f32::EPSILON {
+        let inv = 1.0 / sum2.sqrt();
+        for c in cd0.iter_mut() {
+            *c *= inv;
+        }
+    }
     let refined = refine_candidate::<P>(&cd0, cand, refine_steps);
     let i_start = ((refined.dt_sec + tx_start) * ds_rate).round() as usize;
 

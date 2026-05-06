@@ -27,6 +27,8 @@
 //! `DecodeContext`, `FecOpts`, `FecResult`, `MessageFields`) are also
 //! re-exported at the crate root for ergonomics.
 
+#[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
+pub mod baseline;
 pub mod dotprod;
 pub mod dsp;
 pub mod equalize;

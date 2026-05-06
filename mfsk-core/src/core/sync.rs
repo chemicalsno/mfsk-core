@@ -113,6 +113,27 @@ impl Spectrogram {
     fn get(&self, freq: usize, time: usize) -> f32 {
         self.data[freq * self.n_time + time]
     }
+
+    /// Mean linear power per FFT bin, averaged across all time slices.
+    ///
+    /// Returns `Vec<f32>` of length [`Self::n_freq`]. Used by
+    /// [`crate::core::baseline::fit_baseline`] to compute the
+    /// per-frequency noise floor (WSJT-X `ft4_baseline.f90` /
+    /// `baseline.f90` first input). Memory layout is row-major by
+    /// frequency, so each output entry is a contiguous reduction.
+    pub fn avg_power_per_bin(&self) -> Vec<f32> {
+        let inv_t = 1.0 / self.n_time as f32;
+        let mut out = vec![0.0f32; self.n_freq];
+        for f in 0..self.n_freq {
+            let base = f * self.n_time;
+            let mut s = 0.0f32;
+            for t in 0..self.n_time {
+                s += self.data[base + t];
+            }
+            out[f] = s * inv_t;
+        }
+        out
+    }
 }
 
 /// Compute per-time-step power spectra from raw 12 kHz PCM.
@@ -256,7 +277,7 @@ pub fn coarse_sync<P: Protocol>(
     const MLAG: i32 = 10;
 
     // First compute the per-bin best score (still needed for the
-    // 40-percentile noise-floor normalisation that anchors sync_min).
+    // 40-percentile noise-floor normalisation as a fallback).
     let mut red = vec![0.0f32; n_freq];
     for fi in 0..n_freq {
         red[fi] = (-d.jz..=d.jz)
@@ -270,19 +291,65 @@ pub fn coarse_sync<P: Protocol>(
         let pct_idx = (0.40 * n_freq as f32) as usize;
         sorted[pct_idx.min(n_freq - 1)].max(f32::EPSILON)
     };
-    let base = pct(&red);
+    let global_base = pct(&red);
+
+    // Per-bin polynomial baseline (slice 1, issue #18). Match WSJT-X
+    // `ft4_baseline.f90` / `baseline.f90`: feed averaged linear power
+    // and convert the returned dB curve back to linear so the
+    // `raw / sbase[fi]` divide below is dimensionally consistent
+    // with the previous global-percentile path.
+    //
+    // Falls back to the constant `global_base` whenever the spectrum
+    // is too short for the 5-term polyfit (synthetic / short-band
+    // tests with `n_freq < NSEG * NTERMS`); that preserves the old
+    // behaviour for unit tests.
+    // Per-bin baseline divisor (slice 1 of issue #18).
+    //
+    // Computed as `global_base × shape[fi]`, where `shape` is the
+    // mean-normalised linear-power polynomial baseline returned by
+    // [`crate::core::baseline::fit_baseline`]. This decomposes the
+    // divisor into:
+    //   - **scale** (`global_base`, 40-pct of `red`): preserves the
+    //     old single-baseline behaviour, so synthetic-signal lib tests
+    //     where the noise floor is essentially zero see no regression
+    //   - **shape** (`shape[fi]`, mean 1.0): redistributes the divisor
+    //     per-frequency so a sloped/coloured noise band gets correctly
+    //     normalised — this is what closes the FT4 real-WAV recall gap.
+    //
+    // Shape is clamped to `[0.5, 2.0]` so a degenerate polyfit on a
+    // mostly-empty spectrum (synth signal with `1e-30`-clamped bins
+    // that drag the dB curve to ~-300) cannot grossly amplify or
+    // suppress any single bin's score.
+    let avg_pwr = s.avg_power_per_bin();
+    let sbase_db = crate::core::baseline::fit_baseline(&avg_pwr, ia, ib);
+    let sbase: Vec<f32> = if sbase_db.len() == n_freq && n_freq > 0 {
+        let lin: Vec<f32> = sbase_db.iter().map(|&db| 10.0f32.powf(db / 10.0)).collect();
+        let mean = (lin.iter().sum::<f32>() / n_freq as f32).max(f32::EPSILON);
+        lin.iter()
+            .map(|&p| {
+                let shape = (p / mean).clamp(0.5, 2.0);
+                global_base * shape
+            })
+            .collect()
+    } else {
+        vec![global_base; n_freq]
+    };
 
     let mut cands: Vec<SyncCandidate> = Vec::new();
     for fi in 0..n_freq {
         let i = ia + fi;
         let freq_hz = i as f32 * d.df;
 
+        // Per-bin baseline divisor; falls back to the global one
+        // computed above when polyfit didn't run.
+        let local_base = sbase[fi];
+
         // Collect every (lag, normalised_score) pair above the
         // threshold within the full ±jz lag range.
         let mut peaks: Vec<(i32, f32)> = (-d.jz..=d.jz)
             .filter_map(|lag| {
                 let raw = sync2d[idx(fi, lag)];
-                let norm = raw / base;
+                let norm = raw / local_base;
                 if norm.is_finite() && norm >= sync_min {
                     Some((lag, norm))
                 } else {
