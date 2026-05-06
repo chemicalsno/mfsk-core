@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Local fence: format + clippy (same -D warnings as CI).
+# Local fence: format + clippy + rustdoc (same -D warnings as CI).
 # The full test suite stays in CI (~1 min); this hook skips it so
-# commits don't stall. If clippy or fmt complains, CI would have
-# rejected the push anyway — fail fast here.
+# commits don't stall. If any check fails, CI would have rejected the
+# push anyway — fail fast here.
 #
 # Enable once per clone:
 #   git config core.hooksPath .githooks
@@ -15,5 +15,12 @@ cargo fmt --all -- --check
 
 echo "==> cargo clippy --workspace --all-targets --features full -- -D warnings"
 cargo clippy --workspace --all-targets --features full --no-deps -- -D warnings
+
+# Mirrors `.github/workflows/ci.yml::docs`. Catches broken intra-doc
+# links (e.g. `[`fine_sync_power`]` pointing at a private item) before
+# CI does — they don't break the release publish, but they block
+# `docs` and pollute docs.rs renders.
+echo "==> RUSTDOCFLAGS=-D warnings cargo doc -p mfsk-core --features full --no-deps"
+RUSTDOCFLAGS="-D warnings" cargo doc -p mfsk-core --features full --no-deps
 
 echo "==> pre-commit OK"
