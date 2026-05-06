@@ -135,13 +135,21 @@ pub fn extract_tone_magnitudes(
     })
 }
 
-/// Convert per-symbol tone magnitudes to 162 data-bit LLRs using the
-/// known sync vector to pick which pair of tones carries the data bit.
-/// Returns LLRs clamped to ±20 for numeric stability in the downstream
-/// integer-metric Fano decoder.
+/// Convert per-symbol tone magnitudes to 162 data-bit soft metrics.
+///
+/// Mirrors WSJT-X `wsprd.c::noncoherent_sequence_detection` (line 465+):
+/// `bm[i] = max_one_magnitude − max_zero_magnitude`, then z-score
+/// normalise by the population standard deviation. Magnitude-based
+/// (NOT power-based — earlier `(m_e² − m_o²) / σ²` was a square-law
+/// metric that doesn't match wsprd's linear-difference detector and
+/// lost weak signals like NM7J at -1 dB SNR).
+///
+/// The sync vector (`WSPR_SYNC_VECTOR`) selects which pair of tones
+/// carries the data bit at symbol `i`:
+///   sync = 0 → tones (0, 2) carry data bit (= 0 vs 1)
+///   sync = 1 → tones (1, 3) carry data bit
 pub fn mags_to_llrs(tm: &ToneMagnitudes) -> [f32; 162] {
-    let mut m_even = [0.0f32; 162];
-    let mut m_odd = [0.0f32; 162];
+    let mut bmet = [0.0f32; 162];
     for i in 0..162 {
         let sync = WSPR_SYNC_VECTOR[i];
         let (e, o) = if sync == 0 {
@@ -149,24 +157,35 @@ pub fn mags_to_llrs(tm: &ToneMagnitudes) -> [f32; 162] {
         } else {
             (tm.mags[i][1], tm.mags[i][3])
         };
-        m_even[i] = e;
-        m_odd[i] = o;
+        bmet[i] = e - o;
     }
 
-    let mean_sig_power = m_even
-        .iter()
-        .chain(m_odd.iter())
-        .map(|&m| m * m)
-        .sum::<f32>()
-        / (2.0 * 162.0);
-    let sigma2 = tm.noise_power_est.max(mean_sig_power * 1e-4);
-
-    let mut llrs = [0f32; 162];
-    for i in 0..162 {
-        let raw = (m_even[i] * m_even[i] - m_odd[i] * m_odd[i]) / sigma2;
-        llrs[i] = raw.clamp(-20.0, 20.0);
+    // z-score normalise by population std (matches WSJT-X
+    // `normalizebmet` in `ft8b.f90:466-479`).
+    let n = bmet.len() as f32;
+    let mean = bmet.iter().sum::<f32>() / n;
+    let mean_sq = bmet.iter().map(|&x| x * x).sum::<f32>() / n;
+    let var = mean_sq - mean * mean;
+    let sig = if var > 0.0 {
+        var.sqrt()
+    } else {
+        mean_sq.sqrt()
+    };
+    if sig > 0.0 {
+        for x in bmet.iter_mut() {
+            *x /= sig;
+        }
     }
-    llrs
+    // Scale to match wsprd. wsprd `wsprd.c:477` uses `symfac=50`
+    // then clamps to ±127 before quantising as u8. Our Fano takes
+    // float LLRs scaled by `SCALE`; matching `symfac` directly gives
+    // the FEC the same effective signal magnitude.
+    let _ = tm.noise_power_est; // no longer used; kept to avoid struct churn
+    const SCALE: f32 = 2.83;
+    for x in bmet.iter_mut() {
+        *x *= SCALE;
+    }
+    bmet
 }
 
 /// Coarse sync score at a hypothesised alignment.

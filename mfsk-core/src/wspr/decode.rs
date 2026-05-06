@@ -8,9 +8,9 @@ use alloc::vec::Vec;
 
 use crate::msg::WsprMessage;
 
-use super::demodulate_aligned;
-use super::rx::{extract_tone_magnitudes, sync_score};
-use super::search::{SearchParams, coarse_search};
+#[cfg(any())]
+use super::search::coarse_search;
+use super::search::{SearchParams, SyncCandidate}; // kept for synth round-trip lib tests
 
 /// One successful WSPR decode.
 #[derive(Clone, Debug)]
@@ -37,31 +37,209 @@ pub struct WsprDecode {
 
 /// Decode one WSPR frame at a known (freq, start_sample). Returns `None`
 /// if the Fano decoder fails to converge or the message doesn't unpack.
+///
+/// Routes through the new 375 Hz baseband demod path
+/// ([`super::demod::bit_metrics_from_audio`]) — port of WSJT-X
+/// `wsprd.c::noncoherent_sequence_detection` at `nblock=1`. Per-symbol
+/// explicit 4-tone Goertzel on the decimated baseband. Closes the
+/// W5BIT and NM7J gaps that the previous 12 kHz / 8192-pt-FFT path
+/// couldn't reach.
 pub fn decode_at(
     audio: &[f32],
     sample_rate: u32,
     start_sample: usize,
     freq_hz: f32,
 ) -> Option<WsprDecode> {
-    use crate::core::{FecCodec, FecOpts, MessageCodec};
-    let mut llrs = demodulate_aligned(audio, sample_rate, start_sample, freq_hz);
-    deinterleave_llrs(&mut llrs);
-    // Inline the FEC + unpack so we can capture the 50-bit info for
-    // later SIC reconstruction.
-    let codec = crate::fec::ConvFano;
-    let fec_res = codec.decode_soft(&llrs, &FecOpts::default())?;
-    let mut info_bits = [0u8; 50];
-    info_bits.copy_from_slice(&fec_res.info);
-    let message =
-        crate::msg::Wspr50Message.unpack(&info_bits, &crate::core::DecodeContext::default())?;
-    let dt_sec = start_sample as f32 / sample_rate as f32 - 1.0;
-    Some(WsprDecode {
-        message,
-        freq_hz,
+    decode_at_with_drift(audio, sample_rate, start_sample, freq_hz, 0.0)
+}
+
+/// Same as [`decode_at`] but with an explicit drift estimate
+/// (`drift_hz` is total drift across the 110.6 s frame; matches
+/// wsprd's `drift1`). The caller supplies the drift for now; a
+/// future drift-search slice will sweep it inside the decode loop
+/// like wsprd does.
+/// Decode at known alignment using a pre-decimated baseband. Avoids
+/// the O(NFFT1) decimation cost when many candidates share the same
+/// audio (e.g. inside `decode_scan` / `decode_scan_subtract`).
+///
+/// `idat`, `qdat`: 46080-sample 375 Hz baseband from
+/// [`super::baseband::decimate_to_baseband`].
+/// `freq_hz`: tone-0 frequency in audio Hz (matches our coarse-search
+/// convention; converted to wsprd's tone-center via `+1.5·df` inside).
+/// `start_sample`: audio-rate sample where symbol 0 starts.
+pub fn decode_at_baseband(
+    idat: &[f32],
+    qdat: &[f32],
+    sample_rate: u32,
+    start_sample: usize,
+    freq_hz: f32,
+    drift_hz: f32,
+) -> Option<WsprDecode> {
+    decode_at_baseband_nblocks(
+        idat,
+        qdat,
+        sample_rate,
         start_sample,
-        dt_sec,
-        info_bits,
-    })
+        freq_hz,
+        drift_hz,
+        &[1],
+    )
+}
+
+/// Variant of [`decode_at_baseband`] that tries multiple `nblock`
+/// values (e.g. `&[1, 2, 3]`) for coherent block detection. The hot
+/// loop scales O(`nblocks.len()`); used by pass 2 of `decode_scan`
+/// where the noise-floor reduction makes the extra cost worth it.
+pub fn decode_at_baseband_nblocks(
+    idat: &[f32],
+    qdat: &[f32],
+    sample_rate: u32,
+    start_sample: usize,
+    freq_hz: f32,
+    drift_hz: f32,
+    nblocks: &[usize],
+) -> Option<WsprDecode> {
+    use crate::core::{FecCodec, FecOpts, MessageCodec};
+    // `freq_hz` follows our tone-0 convention (matches `synthesize_audio`
+    // and `coarse_search.freq_hz`); wsprd's `noncoherent_sequence_detection`
+    // takes the signal CENTER, so we add 1.5·tone_spacing here and sweep
+    // around that point. A wide ±4 Hz sweep is needed because real-world
+    // coarse picks can land 2-4 Hz off the true centre when nearby
+    // signals or sub-bin offsets perturb the score landscape.
+    // wsprd-style refine→demod cascade. Replaces the previous
+    // brute-force 15×7 (Δf, Δdt) sweep, which ran Fano on every cell
+    // and burnt seconds of CPU per candidate. Architecture follows
+    // `wsprd.c:1217-1280`: mode 0 (lag refine) → mode 1 (freq refine)
+    // → mode 2 (final demod), with Fano run only at the refined
+    // alignment (not per cell).
+    let f0_center_init = freq_hz + 1.5 * super::demod::TONE_SPACING_HZ;
+    let f0_baseband_init = f0_center_init - super::baseband::CENTER_HZ;
+    let lag_baseband_init = start_sample as i32 / 32;
+    let codec = crate::fec::ConvFano;
+
+    // Mode 0: lag refine. wsprd uses lagstep=64 baseband-samples,
+    // ±128 around shift1 → 5 lags. Per cell: tone_amplitudes
+    // (≈ 700 k float ops) + sync_score — no Fano.
+    let mut best_lag = lag_baseband_init;
+    let mut best_lag_sync = f32::NEG_INFINITY;
+    let mut best_lag_isqs = None;
+    for &dlag in &[-128i32, -64, 0, 64, 128] {
+        let lag = lag_baseband_init + dlag;
+        let isqs = super::demod::tone_amplitudes(idat, qdat, f0_baseband_init, lag, drift_hz);
+        let sync = super::demod::sync_score_isqs(&isqs);
+        if sync > best_lag_sync {
+            best_lag_sync = sync;
+            best_lag = lag;
+            best_lag_isqs = Some(isqs);
+        }
+    }
+
+    // Mode 1: freq refine at the best lag. wsprd uses fstep=0.25 Hz
+    // ± 2 → 5 freqs; we use ±1.0 Hz at 0.5 Hz step (slightly wider
+    // since coarse's freq grid is 0.73 Hz/bin). 4 new evals (+1 reuse
+    // at df=0 from mode 0).
+    let mut best_freq = f0_baseband_init;
+    let mut best_freq_sync = best_lag_sync;
+    let mut best_isqs = best_lag_isqs.expect("at least one lag eval succeeded");
+    for &df in &[-1.0f32, -0.5, 0.5, 1.0] {
+        let f = f0_baseband_init + df;
+        let isqs = super::demod::tone_amplitudes(idat, qdat, f, best_lag, drift_hz);
+        let sync = super::demod::sync_score_isqs(&isqs);
+        if sync > best_freq_sync {
+            best_freq_sync = sync;
+            best_freq = f;
+            best_isqs = isqs;
+        }
+    }
+
+    // Mode 2: bit metrics + Fano at the refined alignment. Try each
+    // requested nblock value (caller controls; pass 1 = [1], pass 2 =
+    // [1, 2, 3] for coherent-block gain). IsQs is reused across
+    // nblocks — only `nblock_bit_metrics` (cheap, no oscillator
+    // build) runs per variant.
+    let mut best_type1: Option<(u32, WsprDecode)> = None;
+    let mut best_other: Option<(u32, WsprDecode)> = None;
+    for &nblock in nblocks {
+        let bm = super::demod::nblock_bit_metrics(&best_isqs, nblock);
+        let mut llrs = bm;
+        deinterleave_llrs(&mut llrs);
+        // Fano first; if it fails to converge, fall back to OSD-1
+        // (Ordered-Statistics Decoding, port of `osdwspr.f90`). OSD
+        // can recover signals at -27 dB SNR (e.g. W3BI on the WSJT-X
+        // golden) where Fano alone hits the convergence threshold.
+        let (info_bits, hard_errors) =
+            if let Some(fec_res) = codec.decode_soft(&llrs, &FecOpts::default()) {
+                let mut info = [0u8; 50];
+                info.copy_from_slice(&fec_res.info);
+                (info, fec_res.hard_errors)
+            } else if let Some((info, nhardmin)) = super::osd::osd_decode(&llrs) {
+                // OSD-2 will synthesise a valid codeword for *any* input;
+                // gate by:
+                //   1. `nhardmin ≤ 44` — at -27 dB the real signal lands
+                //      around 35-40 hard errors after pass-2 subtract;
+                //      pure noise produces ≥ 50.
+                //   2. Reject Type-3 (hashed-callsign) messages — they're
+                //      the dominant phantom class because the 13-bit hash
+                //      space produces a nominally valid message for ~15 %
+                //      of all 50-bit info vectors. We have no hash table
+                //      so any Type-3 that pops out of OSD is overwhelmingly
+                //      likely to be garbage.
+                const OSD_HARD_ERR_MAX: u32 = 44;
+                if nhardmin > OSD_HARD_ERR_MAX {
+                    continue;
+                }
+                let Some(msg) =
+                    crate::msg::Wspr50Message.unpack(&info, &crate::core::DecodeContext::default())
+                else {
+                    continue;
+                };
+                if matches!(msg, crate::msg::WsprMessage::Type3 { .. }) {
+                    continue;
+                }
+                (info, nhardmin)
+            } else {
+                continue;
+            };
+        let Some(message) =
+            crate::msg::Wspr50Message.unpack(&info_bits, &crate::core::DecodeContext::default())
+        else {
+            continue;
+        };
+        let lag_audio = best_lag * 32;
+        let dt_sec = lag_audio as f32 / sample_rate as f32 - 1.0;
+        let candidate = WsprDecode {
+            message: message.clone(),
+            freq_hz: best_freq + super::baseband::CENTER_HZ - 1.5 * super::demod::TONE_SPACING_HZ,
+            start_sample: lag_audio.max(0) as usize,
+            dt_sec,
+            info_bits,
+        };
+        let he = hard_errors;
+        match message {
+            crate::msg::WsprMessage::Type1 { .. } | crate::msg::WsprMessage::Type2 { .. } => {
+                if best_type1.as_ref().is_none_or(|(b, _)| he < *b) {
+                    best_type1 = Some((he, candidate));
+                }
+            }
+            crate::msg::WsprMessage::Type3 { .. } => {
+                if best_other.as_ref().is_none_or(|(b, _)| he < *b) {
+                    best_other = Some((he, candidate));
+                }
+            }
+        }
+    }
+    best_type1.map(|(_, d)| d).or(best_other.map(|(_, d)| d))
+}
+
+pub fn decode_at_with_drift(
+    audio: &[f32],
+    sample_rate: u32,
+    start_sample: usize,
+    freq_hz: f32,
+    drift_hz: f32,
+) -> Option<WsprDecode> {
+    let (idat, qdat) = super::baseband::decimate_to_baseband(audio);
+    decode_at_baseband(&idat, &qdat, sample_rate, start_sample, freq_hz, drift_hz)
 }
 
 /// Scan an audio buffer for any number of WSPR frames, returning all
@@ -70,57 +248,6 @@ pub fn decode_at(
 /// score-descending order. Duplicate decodes (same message within ±5 Hz
 /// and ±1 symbol) are collapsed to the single earliest-candidate hit,
 /// so each transmission appears at most once in the output.
-/// Refine a coarse candidate's (carrier, time) alignment by maximising
-/// [`sync_score`] over a 2-D grid of (Δf, Δt) offsets. WSPR's coarse
-/// search rounds carriers to the 1.4648-Hz FFT bin and start times to
-/// quarter-symbol steps (170 ms); both are too loose for low-SNR
-/// signals — Fano can't recover from > ±0.5 bin freq error or > ±50 ms
-/// time error. Without this refinement, real WSJT-X recordings drop
-/// >50 % of the decodes wsprd recovers.
-///
-/// Search radius defaults: ±2 Hz × ±170 ms (one t_step). 9 × 9 = 81
-/// evaluations per candidate; in release that's < 0.3 s/candidate.
-fn refine_align(
-    audio: &[f32],
-    sample_rate: u32,
-    start_sample: usize,
-    freq_hz_init: f32,
-    freq_radius_hz: f32,
-    freq_step_hz: f32,
-    time_radius_samples: i64,
-    time_step_samples: i64,
-) -> (usize, f32) {
-    let mut best = (start_sample, freq_hz_init);
-    let mut best_score =
-        match extract_tone_magnitudes(audio, sample_rate, start_sample, freq_hz_init) {
-            Some(tm) => sync_score(&tm),
-            None => f32::NEG_INFINITY,
-        };
-    let mut dt = -time_radius_samples;
-    while dt <= time_radius_samples {
-        let s_signed = start_sample as i64 + dt;
-        if s_signed < 0 {
-            dt += time_step_samples;
-            continue;
-        }
-        let s = s_signed as usize;
-        let mut df = -freq_radius_hz;
-        while df <= freq_radius_hz + 1e-3 {
-            let f = freq_hz_init + df;
-            if let Some(tm) = extract_tone_magnitudes(audio, sample_rate, s, f) {
-                let sc = sync_score(&tm);
-                if sc > best_score {
-                    best_score = sc;
-                    best = (s, f);
-                }
-            }
-            df += freq_step_hz;
-        }
-        dt += time_step_samples;
-    }
-    best
-}
-
 /// Half-window (in seconds) of front-side zero padding added before
 /// the search runs. WSPR transmissions can start up to ~2 s **before**
 /// the nominal slot anchor (wsprd reports such cases as `dt < -1.0`);
@@ -145,8 +272,47 @@ pub fn decode_scan(
     let mut padded = alloc::vec![0f32; pad + audio.len()];
     padded[pad..].copy_from_slice(audio);
     let nominal_shifted = nominal_start_sample + pad;
-    let cands = coarse_search(&padded, sample_rate, nominal_shifted, params);
-    let audio = &padded[..]; // shadow so all downstream reads use padded buffer
+    // Decimate ONCE up-front; the wsprd-equivalent coarse and the
+    // demod both consume the same baseband buffer, so we save 32×
+    // FFT work vs running each separately.
+    let (idat, qdat) = super::baseband::decimate_to_baseband(&padded);
+    // wsprd-equivalent coarse: 512-pt windowed FFT on the 375 Hz
+    // baseband, time-averaged spectrum + 30 th-percentile noise
+    // floor, peak detection on smspec, 3-D (freq, time, drift)
+    // refinement. Lifts the coarse score landscape to actually peak
+    // at the right (freq, dt) for weak signals next to strong ones
+    // (W5BIT, W3BI). See `coarse_baseband.rs`.
+    let max_drift = 4i32;
+    let bb_cands = super::coarse_baseband::coarse_baseband(
+        &idat,
+        &qdat,
+        pad,
+        params.max_candidates,
+        max_drift,
+    );
+    // Use the wsprd-equivalent coarse only. Legacy `coarse_search`
+    // (12 kHz spectrogram) costs ~30 s of recall-test runtime on a
+    // 122 s slot and brings nothing the new coarse doesn't already
+    // find — every golden hit on the WSJT-X reference WAV (ND6P,
+    // WD4LHT, NM7J, KI7CI, DJ6OL, W3HH, W5BIT) comes through the
+    // baseband path. Kept the legacy module for synth round-trip
+    // tests; not invoked here.
+    let _ = nominal_shifted;
+    let mut cands: Vec<SyncCandidate> = bb_cands
+        .iter()
+        .map(|c| SyncCandidate {
+            start_sample: c.start_sample,
+            freq_hz: c.freq_hz,
+            score: c.sync,
+        })
+        .collect();
+    cands.sort_unstable_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(core::cmp::Ordering::Equal)
+    });
+    cands.truncate(params.max_candidates);
+    let _audio = &padded[..]; // shadow so all downstream reads use padded buffer
     let mut seen: Vec<WsprDecode> = Vec::new();
     const FREQ_DEDUP_HZ: f32 = 5.0;
     const TIME_DEDUP_SAMPLES: i64 = 8192; // one WSPR symbol at 12 kHz
@@ -177,24 +343,27 @@ pub fn decode_scan(
         .round() as i64;
     let refine_time_radius = nsps / 8; // ≈85 ms half-window
     let refine_time_step = nsps / 8; // 1 step at radius → 3 cells in time
-    for c in cands {
-        let (start_refined, freq_refined) = refine_align(
-            audio,
-            sample_rate,
-            c.start_sample,
-            c.freq_hz,
-            REFINE_FREQ_RADIUS_HZ,
-            REFINE_FREQ_STEP_HZ,
-            refine_time_radius,
-            refine_time_step,
-        );
-        let Some(mut d) = decode_at(audio, sample_rate, start_refined, freq_refined) else {
+    // (idat, qdat) computed above and shared with coarse_baseband.
+    // Suppress the unused-warnings for refine_align knobs — they
+    // belong to the legacy 12 kHz path that the new baseband
+    // demod has retired (decode_at_baseband does its own ±1.5 Hz /
+    // ±0.1 s sweep around the coarse pick).
+    let _ = (
+        REFINE_FREQ_RADIUS_HZ,
+        REFINE_FREQ_STEP_HZ,
+        refine_time_radius,
+        refine_time_step,
+    );
+    // pass-1 decodes carry their padded-buffer alignment so we can
+    // subtract them from the baseband for pass 2.
+    let mut pass1: Vec<(WsprDecode, usize)> = Vec::new();
+    for c in &cands {
+        let Some(mut d) =
+            decode_at_baseband(&idat, &qdat, sample_rate, c.start_sample, c.freq_hz, 0.0)
+        else {
             continue;
         };
-        // Translate alignment back to the caller's time base.
-        // `dt_sec` is the source of truth (signed); `start_sample` is
-        // clamped to 0 when the alignment lands inside the prepended
-        // silence so its `usize` type is preserved.
+        let start_refined = d.start_sample;
         d.dt_sec = (start_refined as i64 - pad as i64) as f32 / sample_rate as f32 - 1.0;
         d.start_sample = start_refined.saturating_sub(pad);
         let dup = seen.iter().any(|prev| {
@@ -203,9 +372,76 @@ pub fn decode_scan(
                 && (prev.start_sample as i64 - d.start_sample as i64).abs() <= TIME_DEDUP_SAMPLES
         });
         if !dup {
+            pass1.push((d.clone(), start_refined));
             seen.push(d);
         }
     }
+
+    // Pass 2 — wsprd's 3rd pass equivalent. Subtract every pass-1
+    // decode from the baseband (port of `subtract_signal2`,
+    // `wsprd.c:541-705`), then re-run the coarse search on the cleaned
+    // residual. This exposes signals that were buried under stronger
+    // neighbours' noise floor — the only path that recovers W3BI on
+    // the WSJT-X golden (-27 dB SNR, hidden by ND6P / KI7CI / etc.).
+    if !pass1.is_empty() {
+        let mut idat2 = idat.clone();
+        let mut qdat2 = qdat.clone();
+        for (d, start_refined) in &pass1 {
+            let symbols = super::encode_channel_symbols(&d.info_bits);
+            let f0_audio = d.freq_hz + 1.5 * super::demod::TONE_SPACING_HZ;
+            let shift_baseband = (*start_refined as i32) / 32;
+            super::subtract::subtract_signal_baseband(
+                &mut idat2,
+                &mut qdat2,
+                f0_audio,
+                shift_baseband,
+                0.0,
+                &symbols,
+            );
+        }
+        // Re-run coarse on the cleaned baseband. Skip the legacy
+        // 12 kHz coarse here — pass 2 runs against an already-decimated
+        // residual buffer, and reconstructing 12 kHz from baseband is
+        // pointless for the same coarse_search call.
+        let bb_cands2 = super::coarse_baseband::coarse_baseband(
+            &idat2,
+            &qdat2,
+            pad,
+            params.max_candidates,
+            max_drift,
+        );
+        for c in bb_cands2 {
+            // Pass 2 uses nblock = 1, 2, 3 (coherent block detection)
+            // for the +3..+4.8 dB margin needed to decode signals like
+            // W3BI at -27 dB SNR. The strong-signal subtract above has
+            // exposed them in the spectrum, but they still need the
+            // coherent gain to clear the Fano convergence threshold.
+            let Some(mut d) = decode_at_baseband_nblocks(
+                &idat2,
+                &qdat2,
+                sample_rate,
+                c.start_sample,
+                c.freq_hz,
+                c.drift_hz,
+                &[1, 2, 3],
+            ) else {
+                continue;
+            };
+            let start_refined = d.start_sample;
+            d.dt_sec = (start_refined as i64 - pad as i64) as f32 / sample_rate as f32 - 1.0;
+            d.start_sample = start_refined.saturating_sub(pad);
+            let dup = seen.iter().any(|prev| {
+                prev.message == d.message
+                    && (prev.freq_hz - d.freq_hz).abs() <= FREQ_DEDUP_HZ
+                    && (prev.start_sample as i64 - d.start_sample as i64).abs()
+                        <= TIME_DEDUP_SAMPLES
+            });
+            if !dup {
+                seen.push(d);
+            }
+        }
+    }
+
     seen
 }
 

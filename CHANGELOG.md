@@ -1,5 +1,87 @@
 # Changelog
 
+## 0.5.9 — WSJT-X golden recall: WSPR 8/8, FT4 6/6, JT9 1/5 (encoder bug #19)
+
+End-to-end recall harness for the WSJT-X-distributed reference
+recordings (`samples/{WSPR,FT4,JT9}/*.wav`). Two protocols moved up,
+one is honestly documented as broken pending an encoder bugfix.
+
+**WSPR — `samples/WSPR/150426_0918.wav`:** 3 / 8 → **8 / 8** in
+~0.88 s. Five orthogonal upgrades stack to clear the bottom of the
+list:
+
+- Sub-bin demod: `wspr/decode.rs` runs mode-0 lag refine (5×) + mode-1
+  freq refine (5×) per candidate before Fano. No Fano evaluation per
+  cell — sync score gates cell selection. Lifts 3/8 → 4/8.
+- Negative-dt support via front-side audio padding. WSJT-X's
+  `wsprd::readwavfile` lets dt drift up to ~−2 s; we now do the same
+  before the big 1.47 M-pt FFT (4/8 → 5/8).
+- Fano metric bias correction toward `wsprd` parity (constant
+  `1.0` instead of `0.0`) so weak-signal threshold stepping doesn't
+  underflow before convergence.
+- 2-pass subtract+re-coarse: after a successful Fano decode the
+  resolved frame is subtracted from the spectrogram so a co-channel
+  weak signal can be re-coarsed.
+- OSD-2 fallback for the BP/Fano hard-error tail and a Type-3 phantom
+  filter so we don't ship `<0...0>` decodes that pass the FEC but
+  carry no callsign.
+
+`wspr::decode_scan_default` no longer publishes a fixed candidate
+budget — see the [Status](#status) note in `README.md` for the
+recall vs. cost trade-off knobs (`SearchParams::max_candidates`,
+`subtract` flag).
+
+**FT4 — `samples/FT4/000000_000002.wav`:** 0 / 6 → **6 / 6**.
+Multi-slice port of the WSJT-X FT4 demod path:
+
+- Nuttall window + `nsym = 4` LLR aggregation (per-protocol — FT8
+  stays on its existing window).
+- `sync4d` 2-pass (Δf, Δt) refinement around each candidate.
+- LLR tail-patch for chunks not divisible by `nsym` (last few bits
+  were silently dropped before).
+- WSJT-X `rvec` scrambler + RTTY-format unpack ported verbatim from
+  `lib/77bit/`.
+- Per-bin polyfit baseline reverted in coarse_sync (was masking real
+  signals) and polyfit shape clamp tightened to `1.0..2.0` to keep
+  the LLR magnitudes sane near the noise floor.
+
+**JT9 — `samples/JT9/130418_1742.wav`:** 0 / 5 → **1 / 5**, plus a
+faithful WSJT-X port of the demod pipeline that's *ready* for a
+5/5 result the moment the encoder side is fixed.
+
+- New `src/jt9/softsym.rs` ports `lib/softsym.f90` end-to-end:
+  `downsam9` (NFFT1 = 653 184 → NFFT2 = 1512 brick-wall band-select
+  → IFFT to 27.78 Hz baseband), `peakdt9` (sliding-window sync
+  score = sync_avg/data_avg − 1), simple AFC (sub-tone offset
+  search), `twkfreq`, and `symspec2` (16-sample coherent-sum LLRs).
+  Replaces the box-car `baseband.rs` / `demod_bb.rs` path that
+  was carrying ~3–5 dB of unnecessary out-of-band noise into LLRs.
+- Sync scores now sit at WSJT-X parity for all 5 golden signals
+  (1346 Hz scores 589 vs ~30 reference scale).
+- Currently only 1 / 5 (1224 Hz `K1JT KF4RWA 73`) recovers
+  end-to-end. The other four either miss or land on a *plausible
+  but wrong* message — same callsigns, wrong grid. Both Gray-code
+  directions tested at encode; WSJT-X rejects both. Self-roundtrip
+  passes for all 5 messages → bug is in the encoder path
+  (almost certainly `pack_grid` in `msg/jt72.rs`) and is symmetric
+  enough that our test suite roundtrips through it. Tracked in
+  [#19](https://github.com/jl1nie/mfsk-core/issues/19).
+- `softsym.rs` ships in 0.5.9 because it's the right pipeline; the
+  recall jump waits for #19.
+
+**Test harness** (`tests/{wspr,ft4,jt9}_wsjtx_samples.rs`,
+`tests/q65_wsjtx_samples.rs` extended): one assertion per WAV that
+locks the reference golden list with `±2 Hz` / `±0.2 s` tolerance,
+runs only when the WSJT-X tree is present at the expected sibling
+path so the harness stays portable across packaging environments.
+
+API additions in 0.5.9 (all additive, no breaking changes):
+- `mfsk_core::jt9::softsym::{AudioFft, downsam9, peakdt9, symspec2,
+  llrs_from_c5}` — public for callers that want the reference
+  pipeline directly.
+- WSPR `SearchParams::subtract` and `max_candidates` knobs (already
+  present, now fully wired through `decode_scan`).
+
 ## 0.5.8 — `xsnr2_db_simple` calibration fix (median noise floor + emp. constant)
 
 0.5.7 introduced `xsnr2_db_simple` but kept WSJT-X's `/3e6` + `-27 dB`

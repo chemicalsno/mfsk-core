@@ -19,6 +19,7 @@ use num_complex::Complex;
 use num_traits::Float;
 
 use crate::core::ModulationParams;
+use crate::core::baseline::fit_baseline;
 use crate::core::fft::default_planner;
 
 use super::Wspr;
@@ -37,6 +38,13 @@ pub struct Spectrogram {
     pub df: f32,
     /// Mean squared-magnitude of "noise" bins (rough σ² estimator).
     pub noise_per_bin: f32,
+    /// Per-bin polynomial-baseline LINEAR power (port of wsprd's
+    /// `noise_level` divisor + WSJT-X `ft8/baseline.f90` poly fit).
+    /// Length matches `n_freq`. Used by [`score_candidate`] to score
+    /// candidates as **SNR ratios** rather than absolute powers, so a
+    /// strong signal can't crowd a weak one out of the top-N just by
+    /// having higher absolute energy. See `wsprd.c:1054-1080`.
+    pub sbase_linear: Vec<f32>,
 }
 
 impl Spectrogram {
@@ -55,6 +63,7 @@ impl Spectrogram {
                 nsps,
                 df: sample_rate as f32 / nsps as f32,
                 noise_per_bin: 1.0,
+                sbase_linear: Vec::new(),
             };
         }
         let n_time = (audio.len() - nsps) / t_step + 1;
@@ -88,14 +97,47 @@ impl Spectrogram {
             1.0
         };
 
+        // Average power per bin (mean across time slices), then fit the
+        // 5-term polynomial baseline on the WSPR ±150 Hz working band
+        // around 1500 Hz. The result (in dB) is converted back to linear
+        // power for use as a per-bin divisor in `score_candidate`.
+        // Mirrors `wsprd.c:1054-1075` (smspec/noise_level - 1.0) but with
+        // the WSJT-X polynomial baseline algorithm instead of a single
+        // global percentile, so the divisor follows the noise-floor
+        // curvature across the band.
+        let df = sample_rate as f32 / nsps as f32;
+        let mut avg_pow = vec![0.0f32; n_freq];
+        for t in 0..n_time {
+            for f in 0..n_freq {
+                avg_pow[f] += mags_sqr[t * n_freq + f];
+            }
+        }
+        let inv = 1.0 / n_time as f32;
+        for v in avg_pow.iter_mut() {
+            *v *= inv;
+        }
+        let center_bin = (1500.0 / df).round() as usize;
+        let band_bins = (150.0 / df).round() as usize;
+        let ia = center_bin.saturating_sub(band_bins);
+        let ib = (center_bin + band_bins).min(n_freq - 1);
+        let sbase_db = fit_baseline(&avg_pow, ia, ib);
+        let mut sbase_linear = vec![noise_per_bin.max(1e-6); n_freq];
+        for (i, &db) in sbase_db.iter().enumerate() {
+            let bin = ia + i;
+            if bin < n_freq {
+                sbase_linear[bin] = (10f32.powf(db / 10.0)).max(1e-12);
+            }
+        }
+
         Self {
             mags_sqr,
             n_time,
             n_freq,
             t_step,
             nsps,
-            df: sample_rate as f32 / nsps as f32,
+            df,
             noise_per_bin: noise_per_bin.max(1e-6),
+            sbase_linear,
         }
     }
 
@@ -118,26 +160,68 @@ pub fn score_candidate(spec: &Spectrogram, t_row: usize, base_bin: usize) -> f32
     if last_row >= spec.n_time || base_bin + 4 > spec.n_freq {
         return 0.0;
     }
-    let mut sync_pwr = 0.0f32;
-    let mut off_pwr = 0.0f32;
+    // Per-bin baseline divisors (linear power). When the spectrogram
+    // was built with a polynomial baseline this is the wsprd-style
+    // noise-floor estimate; on stub builds (n_time=0) it defaults to
+    // `noise_per_bin`. Dividing each bin by its own baseline before
+    // summing puts strong and weak candidates on the same SNR scale,
+    // which is what lets weak signals like W5BIT survive the top-N
+    // ranking against strong neighbours like ND6P.
+    let nb = spec.noise_per_bin.max(1e-12);
+    let b0 = spec
+        .sbase_linear
+        .get(base_bin)
+        .copied()
+        .unwrap_or(nb)
+        .max(1e-12);
+    let b1 = spec
+        .sbase_linear
+        .get(base_bin + 1)
+        .copied()
+        .unwrap_or(nb)
+        .max(1e-12);
+    let b2 = spec
+        .sbase_linear
+        .get(base_bin + 2)
+        .copied()
+        .unwrap_or(nb)
+        .max(1e-12);
+    let b3 = spec
+        .sbase_linear
+        .get(base_bin + 3)
+        .copied()
+        .unwrap_or(nb)
+        .max(1e-12);
+    // Magnitude-based scoring (sqrt of power, then divide by sqrt of
+    // baseline). Matches wsprd.c:1175 `ss = Σ (2·pr3[k]-1)·((p1+p3)-(p0+p2))`
+    // where p* are magnitudes (`p0=sqrt(p0)` etc, line 1170). Power-based
+    // scoring is square-law and over-weights strong signals so weak
+    // signals get crowded out of the top-N by alternate rows of the
+    // strong ones; magnitudes give a more linear ranking that lets
+    // signals like W5BIT (-23 dB, next to ND6P at -19 dB) survive.
+    let bm0 = b0.sqrt();
+    let bm1 = b1.sqrt();
+    let bm2 = b2.sqrt();
+    let bm3 = b3.sqrt();
+    let mut sync_mag = 0.0f32;
+    let mut off_mag = 0.0f32;
     for i in 0..162 {
         let t = t_row + i * ROWS_PER_SYMBOL;
-        let m0 = spec.get(t, base_bin);
-        let m1 = spec.get(t, base_bin + 1);
-        let m2 = spec.get(t, base_bin + 2);
-        let m3 = spec.get(t, base_bin + 3);
+        let p0 = spec.get(t, base_bin).sqrt() / bm0;
+        let p1 = spec.get(t, base_bin + 1).sqrt() / bm1;
+        let p2 = spec.get(t, base_bin + 2).sqrt() / bm2;
+        let p3 = spec.get(t, base_bin + 3).sqrt() / bm3;
         if WSPR_SYNC_VECTOR[i] == 0 {
-            sync_pwr += m0 + m2;
-            off_pwr += m1 + m3;
+            sync_mag += p0 + p2;
+            off_mag += p1 + p3;
         } else {
-            sync_pwr += m1 + m3;
-            off_pwr += m0 + m2;
+            sync_mag += p1 + p3;
+            off_mag += p0 + p2;
         }
     }
-    let noise_floor = spec.noise_per_bin * 162.0;
-    let denom = sync_pwr + off_pwr + noise_floor;
+    let denom = sync_mag + off_mag + 162.0;
     if denom > 0.0 {
-        (sync_pwr - off_pwr) / denom
+        (sync_mag - off_mag) / denom
     } else {
         0.0
     }

@@ -60,36 +60,41 @@ struct Golden {
     dt_sec: f32,
 }
 
+// The recording `130418_1742.wav` starts ~0.91 s before the 17:42:00 slot
+// boundary.  WSJT-X reports dt relative to the slot; we measure start_sample
+// from the beginning of the WAV, so add WAV_PRE_ROLL_SEC to each WSJT-X dt.
+const WAV_PRE_ROLL_SEC: f32 = 0.91;
+
 const GOLDEN: &[Golden] = &[
     Golden {
         msg: "CQ GM7GAX IO75",
         freq_hz: 1119.0,
-        dt_sec: 0.0,
+        dt_sec: WAV_PRE_ROLL_SEC + 0.0, // 0.91
     },
     Golden {
         msg: "TF3G N7MQ CN84",
         freq_hz: 1186.0,
-        dt_sec: 0.0,
+        dt_sec: WAV_PRE_ROLL_SEC + 0.0, // 0.91
     },
     Golden {
         msg: "K1JT KF4RWA 73",
         freq_hz: 1224.0,
-        dt_sec: 0.1,
+        dt_sec: WAV_PRE_ROLL_SEC + 0.1, // 1.01  (confirmed from decode output)
     },
     Golden {
         msg: "CQ M0WAY IO82",
         freq_hz: 1290.0,
-        dt_sec: 0.1,
+        dt_sec: WAV_PRE_ROLL_SEC + 0.1, // 1.01
     },
     Golden {
         msg: "K1JT N5KDV EM41",
         freq_hz: 1346.0,
-        dt_sec: 0.1,
+        dt_sec: WAV_PRE_ROLL_SEC + 0.1, // 1.01
     },
 ];
 
 const FREQ_TOL_HZ: f32 = 4.0;
-const DT_TOL_SEC: f32 = 0.3;
+const DT_TOL_SEC: f32 = 0.5; // ≈ 1 symbol; covers ⅛-sym lag grid + slot-offset uncertainty
 
 #[test]
 #[ignore = "JT9 host path currently 0/5 against WSJT-X golden \
@@ -113,7 +118,7 @@ fn jt9_wsjtx_sample_recall_vs_golden() {
         freq_max_hz: 1500.0,
         time_tolerance_symbols: 3,
         score_threshold: 0.05,
-        max_candidates: 32,
+        max_candidates: 200,
     };
 
     // JT9 transmissions start at the top of the slot — `nominal_start_sample = 0`.

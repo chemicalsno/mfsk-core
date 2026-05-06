@@ -22,8 +22,8 @@ use mfsk_core::fec::qra::FadingModel;
 use mfsk_core::msg::ApHint;
 use mfsk_core::q65::search::SearchParams;
 use mfsk_core::q65::{
-    Q65a30, Q65a60, decode_multi_period_for, decode_scan, decode_scan_fading_for,
-    decode_scan_with_ap, decode_scan_with_ap_for,
+    Q65a30, Q65a60, Q65d60, decode_multi_period_for, decode_scan, decode_scan_fading_for,
+    decode_scan_for, decode_scan_with_ap, decode_scan_with_ap_for,
 };
 
 /// Minimal WAV reader for WSJT-X's exact format: RIFF/WAVE header,
@@ -350,4 +350,87 @@ fn eme_6m_sample_yields_decode_with_ap() {
          plain or AP — regression in the Q65-60A receive chain"
     );
     eprintln!("[info] 6m EME: plain {plain_count} decode(s), AP {ap_count} decode(s)");
+}
+
+/// Q65-60D 10 GHz EME sample: `WSJT-X/samples/Q65/60D_EME_10GHz/201212_1838.wav`.
+///
+/// WSJT-X UnitTests.txt golden: "VK7MO K6QPV DM12" / "VK7MO K6QPV -15"
+/// near 1000 Hz. At -25 to -30 dB SNR the AWGN-only BP metric fails;
+/// the fast-fading metric (b90 = 10 Hz, Gaussian) is required.
+///
+/// Verified 2026-05-06: fading path decodes cleanly (plain = 0 decodes,
+/// which matches WSJT-X's "No_AP" count ≤ 9/14 on the full dataset).
+#[test]
+fn eme_10ghz_60d_decodes_with_fading_metric() {
+    let manifest = std::env::var("CARGO_MANIFEST_DIR").ok().unwrap_or_default();
+    let path = std::path::Path::new(&manifest)
+        .join("../../WSJT-X/samples/Q65/60D_EME_10GHz/201212_1838.wav");
+    let path = match path.canonicalize() {
+        Ok(p) if p.is_file() => p,
+        _ => {
+            eprintln!(
+                "skipping: WSJT-X 60D_EME_10GHz sample not found at {}",
+                path.display()
+            );
+            return;
+        }
+    };
+
+    let audio = match read_wsjtx_wav(&path) {
+        Some(a) => a,
+        None => {
+            eprintln!("skipping: WAV format not recognised");
+            return;
+        }
+    };
+
+    // Signal is at ~1000 Hz; slot is 60 s.
+    let params = SearchParams {
+        freq_min_hz: 200.0,
+        freq_max_hz: 3_000.0,
+        time_tolerance_symbols: 10,
+        score_threshold: 0.05,
+        max_candidates: 100,
+    };
+
+    // Plain BP: expected 0 decodes at this SNR.
+    let plain = decode_scan_for::<Q65d60>(&audio, 12_000, 0, &params);
+    eprintln!("[info] 10 GHz EME plain: {} decode(s)", plain.len());
+
+    // Fast-fading Gaussian, b90 = 10 Hz: the path that actually works.
+    let fading = decode_scan_fading_for::<Q65d60>(
+        &audio,
+        12_000,
+        0,
+        &params,
+        10.0,
+        FadingModel::Gaussian,
+        None,
+    );
+    eprintln!(
+        "[info] 10 GHz EME fading b90=10 Gaussian: {} decode(s)",
+        fading.len()
+    );
+    for d in &fading {
+        eprintln!(
+            "  freq={:.1} Hz dt={:.2} s : {}",
+            d.freq_hz,
+            d.start_sample as f32 / 12_000.0,
+            d.message
+        );
+    }
+
+    // Must recover the golden message at the right frequency (±15 Hz)
+    // and dt (3.6 ± 1.0 s after slot start).
+    let hit = fading.iter().any(|d| {
+        d.message.contains("VK7MO")
+            && d.message.contains("K6QPV")
+            && (d.freq_hz - 1000.0).abs() <= 20.0
+    });
+    assert!(
+        hit,
+        "10 GHz EME Q65-60D fading decode did not recover 'VK7MO K6QPV' near 1000 Hz — \
+         regression in the fast-fading receive chain. Fading decodes: {:?}",
+        fading.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
 }

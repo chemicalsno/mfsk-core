@@ -287,17 +287,75 @@ for the integration contract and 0.5.5's runtime BP / `nstep-half`
 tuning knobs; `embedded-poc/m5stack-{s3,core2}/` are the working
 example binaries.
 
-Algorithm correctness is covered by the workspace test suite,
-including end-to-end synth → decode roundtrips for every protocol,
-an AWGN sensitivity sweep that confirms Q65-30A hits its
-WSJT-X-published −24 dB threshold, an AP-vs-plain comparison that
-shows the expected ~2 dB gain from a-priori call sign information,
-an AP-list (template matching) comparison that decodes 6/6 frames at
-SNR −25 dB where plain BP fails 0/6, a real 6 m EME recording (W7GJ
-exchanges from the WSJT-X reference set), and a real 10 GHz EME
-recording that the fast-fading metric is required to decode. The
-trait surface itself is pinned by `tests/protocol_invariants.rs` —
-a single generic `<P: Protocol>` checker run across every wired ZST
-so a new protocol gets structural validation without bespoke glue.
-Run with `--features full` for the eleven-ZST coverage; the default
-features (`ft8`, `ft4`) only exercise the two default protocols.
+Algorithm correctness is covered by the workspace test suite:
+end-to-end synth → decode roundtrips for every protocol, an AWGN
+sensitivity sweep that confirms Q65-30A hits its WSJT-X-published
+−24 dB threshold, an AP-vs-plain comparison that shows the expected
+~2 dB gain from a-priori call sign information, an AP-list
+(template matching) comparison that decodes 6/6 frames at SNR −25 dB
+where plain BP fails 0/6, a real 6 m EME recording (W7GJ exchanges
+from the WSJT-X reference set), and a real 10 GHz EME recording that
+the fast-fading metric is required to decode. The trait surface
+itself is pinned by `tests/protocol_invariants.rs` — a single generic
+`<P: Protocol>` checker run across every wired ZST. Run with
+`--features full` for the eleven-ZST coverage; the default features
+(`ft8`, `ft4`) only exercise the two default protocols.
+
+Recall against the **WSJT-X-distributed reference recordings**
+(`samples/{WSPR,FT4,JT9}/*.wav`) is locked by golden harnesses in
+`tests/{wspr,ft4,jt9}_wsjtx_samples.rs` (run only when the WSJT-X
+tree is present at the expected sibling path):
+
+| Reference WAV                       | Recall      | Notes                  |
+|-------------------------------------|-------------|------------------------|
+| `WSPR/150426_0918.wav` (8 frames)   | **8 / 8**   | sub-bin demod + neg-dt |
+| `FT4/000000_000002.wav` (6 frames)  | **6 / 6**   | Nuttall + sync4d       |
+| `JT9/130418_1742.wav` (5 frames)    | **1 / 5**   | encoder bug — see [#19](https://github.com/jl1nie/mfsk-core/issues/19) |
+| `MSK144/181211_120500.wav` (n/a)    | —           | MSK144 not implemented |
+| `JT65/*` (n/a)                      | —           | golden absent (WSJT-X v3 also fails on samples) |
+| `FST4/210115_0058.wav` (1 frame)    | —           | not yet wired against golden |
+
+#### Known limitations / quirks
+
+- **JT9** — `decode_scan` recall is **1 / 5** on the busy WSJT-X
+  reference. Self-roundtrip is consistent (`tests::softsym_golden_grid_roundtrips`
+  passes for all 5 messages including `K1JT N5KDV EM41`), but a
+  noiseless WAV synthesised by `synthesize_standard` is rejected
+  by WSJT-X itself, so the encoder is bit-incompatible with the
+  reference somewhere upstream of demod. The full WSJT-X
+  `softsym.f90` pipeline (`downsam9` + `peakdt9` + `symspec2`) is
+  in place on the demod side and ready for the fix. Tracked in
+  [#19](https://github.com/jl1nie/mfsk-core/issues/19); do not
+  rely on JT9 for real-world decode against on-air WSJT-X
+  transmissions yet.
+- **JT65** — `decode_scan` decodes synthesised JT65A frames cleanly
+  via the Reed-Solomon(63, 12) FEC and the AP-list path lifts weak
+  signals to within ~2 dB of WSJT-X. There's no golden WAV in this
+  crate's regression set because the WSJT-X v3 reference samples
+  themselves don't decode cleanly without the soft-symbol erasure
+  metadata that lives in private WSJT-X branches.
+- **FST4** — only the FST4-60A long-period variant is wired (sample
+  duration / Costas layout for FST4-15 / FST4W are out of scope of
+  the 0.5.x line). Recall against `samples/FST4/210115_0058.wav` is
+  not yet locked by a golden harness.
+- **MSK144** — not implemented in 0.5.x. The decode path is on the
+  post-0.5 roadmap because MSK144 needs a different correlator
+  geometry from the rest of the FT/JT/Q-family decoders this crate
+  is built around.
+
+#### What's solid
+
+- **FT8** — synth → decode round-trip 157 / 157 lib tests, real
+  WSJT-X reference (`210703_133430.wav`) JTDX-golden recall 6 / 18
+  on the embedded LX7 ship config (host f32 builds get more, but
+  the published numbers track the constrained M5StickS3 deployment).
+- **WSPR** — 8 / 8 WSJT-X golden, ~0.88 s end-to-end on a desktop
+  build. Sub-bin demod + 2-pass subtract+re-coarse + OSD-2 fallback +
+  Type-3 phantom filter.
+- **FT4** — 6 / 6 WSJT-X golden after the 0.5.9 multi-slice port of
+  the WSJT-X demod path (Nuttall window, `nsym = 4` LLR aggregation,
+  `sync4d` 2-pass refine, `rvec` scrambler).
+- **Q65** — fast-fading + AP-list paths exercise both the WSJT-X
+  6 m EME and the 10 GHz EME reference recordings.
+- **SNR (FT8)** — `xsnr2_db_simple` calibration (0.5.7 + 0.5.8) lands
+  reported SNR within ±3 dB of JTDX absolute on real silicon.

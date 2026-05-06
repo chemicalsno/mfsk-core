@@ -107,11 +107,6 @@ const FREQ_TOL_HZ: f32 = 4.0;
 const DT_TOL_SEC: f32 = 0.5;
 
 #[test]
-#[ignore = "WSPR host path currently 5/8 against WSJT-X golden \
-            (sub-bin demod + 2-D Δf/Δt refine + negative-dt support \
-            landed; remaining gaps: W3BI is -27 dB / hash table, \
-            W5BIT/NM7J need Fano metric bias + callsign sanity) \
-            — run with `cargo test --release -- --ignored` to track repair"]
 fn wspr_wsjtx_sample_recall_vs_golden() {
     let Some(path) = sample_path() else {
         eprintln!(

@@ -39,13 +39,21 @@ use crate::msg::Wspr50Message;
 // the FFT meta-feature. `tx` (synthesis) and `sync_vector` (a const
 // table) stay available for TX-only embedded WSPR beacons.
 #[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
+pub mod baseband;
+#[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
+pub mod coarse_baseband;
 pub mod decode;
+pub mod demod;
+#[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
+pub mod osd;
 #[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub mod rx;
 #[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub mod search;
 #[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub mod spectrogram;
+#[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
+pub mod subtract;
 pub mod sync_vector;
 pub mod tx;
 

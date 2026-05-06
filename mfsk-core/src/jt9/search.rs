@@ -250,3 +250,59 @@ mod tests {
         assert!(best.score > 0.5, "clean score was {}", best.score);
     }
 }
+
+#[cfg(test)]
+mod diag_tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    #[ignore]
+    fn jt9_coarse_diag() {
+        let path = Path::new("/home/minoru/src/WSJT-X/samples/JT9/130418_1742.wav");
+        if !path.exists() {
+            eprintln!("WAV not found");
+            return;
+        }
+        let bytes = std::fs::read(path).unwrap();
+        let data_len = u32::from_le_bytes([bytes[40], bytes[41], bytes[42], bytes[43]]) as usize;
+        let data = &bytes[44..44 + data_len];
+        let audio: Vec<f32> = data
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0)
+            .collect();
+        let params = SearchParams {
+            freq_min_hz: 1050.0,
+            freq_max_hz: 1500.0,
+            time_tolerance_symbols: 3,
+            score_threshold: 0.001,
+            max_candidates: 5000,
+        };
+        let cands = coarse_search(&audio, 12_000, 0, &params);
+        eprintln!("Total candidates above 0.001: {}", cands.len());
+        for golden_hz in &[1119.0f32, 1186.0, 1224.0, 1290.0, 1346.0] {
+            let near: Vec<_> = cands
+                .iter()
+                .filter(|c| (c.freq_hz - golden_hz).abs() < 5.0)
+                .collect();
+            eprintln!("Near {} Hz: {} cands", golden_hz, near.len());
+            for c in near.iter().take(3) {
+                eprintln!(
+                    "  freq={:.1} start_s={:.2} score={:.4}",
+                    c.freq_hz,
+                    c.start_sample as f32 / 12000.0,
+                    c.score
+                );
+            }
+        }
+        eprintln!("Top 20:");
+        for c in cands.iter().take(20) {
+            eprintln!(
+                "  freq={:.1} start_s={:.2} score={:.4}",
+                c.freq_hz,
+                c.start_sample as f32 / 12000.0,
+                c.score
+            );
+        }
+    }
+}

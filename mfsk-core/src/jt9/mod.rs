@@ -35,9 +35,13 @@ use crate::core::{FrameLayout, ModulationParams, Protocol, ProtocolId, SyncMode}
 use crate::fec::ConvFano232;
 use crate::msg::Jt72Codec;
 
+pub mod baseband;
+pub(crate) mod decode;
+pub(crate) mod demod_bb;
 pub mod interleave;
 pub mod rx;
 pub mod search;
+pub(crate) mod softsym;
 pub mod sync_pattern;
 pub mod tx;
 
@@ -74,9 +78,9 @@ pub struct Jt9Decode {
 }
 
 /// Scan an audio buffer for any JT9 frames: runs coarse (freq, time)
-/// search via [`search::coarse_search`] and tries [`decode_at`] on
-/// each candidate in score order, collapsing duplicates that decode
-/// to the same message within ±2 Hz / ±1 symbol.
+/// search via [`search::coarse_search`] and uses the baseband pipeline
+/// in [`decode`] on each candidate in score order, collapsing duplicates
+/// that decode to the same message within ±4 Hz / ±1 symbol.
 pub fn decode_scan(
     audio: &[f32],
     sample_rate: u32,
@@ -85,23 +89,55 @@ pub fn decode_scan(
 ) -> Vec<Jt9Decode> {
     use crate::core::ModulationParams;
     let nsps = (sample_rate as f32 * <Jt9 as ModulationParams>::SYMBOL_DT).round() as usize;
-    let cands = search::coarse_search(audio, sample_rate, nominal_start_sample, params);
+
+    // Collect all coarse candidates above a very low threshold (the score
+    // formula saturates near 1.0 for real JT9 signals regardless of SNR,
+    // so threshold filtering is not effective here).
+    let mut scan_params = *params;
+    scan_params.score_threshold = 0.001;
+    scan_params.max_candidates = 50_000; // no practical cap; NMS below limits processing
+
+    let all_cands = search::coarse_search(audio, sample_rate, nominal_start_sample, &scan_params);
+
+    // Frequency-domain non-maximum suppression: keep only the best-scoring
+    // candidate per 5 Hz window.  This prevents a single strong signal from
+    // filling the entire candidate list with its many time-shifted variants.
+    // 5 Hz ≈ 2.9 tone-spacings — enough to separate distinct JT9 carriers.
+    let nms_hz = 5.0f32;
+    let mut nms_map: std::collections::HashMap<i32, search::SyncCandidate> =
+        std::collections::HashMap::new();
+    for c in all_cands {
+        let bin_idx = (c.freq_hz / nms_hz).round() as i32;
+        let entry = nms_map.entry(bin_idx).or_insert(c);
+        if c.score > entry.score {
+            *entry = c;
+        }
+    }
+
+    let mut cands: Vec<search::SyncCandidate> = nms_map.into_values().collect();
+    cands.sort_unstable_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    cands.truncate(params.max_candidates.max(32));
+
+    // Build the big FFT once for the whole slot — `downsam9` extracts
+    // one baseband per candidate frequency from this cached spectrum.
+    let big_fft = softsym::AudioFft::build(audio);
+
     let mut seen: Vec<Jt9Decode> = Vec::new();
     for c in cands {
-        let Some(msg) = decode_at(audio, sample_rate, c.start_sample, c.freq_hz) else {
+        let Some(d) = decode::decode_at_baseband_with_fft(&big_fft, c.freq_hz) else {
             continue;
         };
         let dup = seen.iter().any(|prev| {
-            prev.message == msg
-                && (prev.freq_hz - c.freq_hz).abs() <= 2.0
-                && (prev.start_sample as i64 - c.start_sample as i64).abs() <= nsps as i64
+            prev.message == d.message
+                && (prev.freq_hz - d.freq_hz).abs() <= 4.0
+                && (prev.start_sample as i64 - d.start_sample as i64).abs() <= nsps as i64
         });
         if !dup {
-            seen.push(Jt9Decode {
-                message: msg,
-                freq_hz: c.freq_hz,
-                start_sample: c.start_sample,
-            });
+            seen.push(d);
         }
     }
     seen

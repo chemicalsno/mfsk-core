@@ -198,3 +198,212 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::collapsible_if, clippy::unnecessary_map_or)]
+mod diag_tests {
+    use super::*;
+    use crate::core::{DecodeContext, FecOpts, MessageCodec};
+    use crate::fec::{ConvFano232, FecCodec};
+    use crate::msg::Jt72Codec;
+    use std::path::Path;
+
+    #[test]
+    #[ignore]
+    fn test_decode_at_golden_alignment() {
+        let path = Path::new("/home/minoru/src/WSJT-X/samples/JT9/130418_1742.wav");
+        if !path.exists() {
+            return;
+        }
+        let bytes = std::fs::read(path).unwrap();
+        let dl = u32::from_le_bytes([bytes[40], bytes[41], bytes[42], bytes[43]]) as usize;
+        let data = &bytes[44..44 + dl];
+        let audio: Vec<f32> = data
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0)
+            .collect();
+
+        // Golden: K1JT KF4RWA 73 @ 1224 Hz dt=0.10
+        let llrs = demodulate_aligned(&audio, 12_000, 1200, 1224.0);
+        let codec = ConvFano232;
+        let res = codec.decode_soft(&llrs, &FecOpts::default());
+        eprintln!("1224 Hz dt=0.1: {:?}", res.as_ref().map(|r| r.hard_errors));
+        if let Some(r) = res {
+            let mut p = [0u8; 72];
+            p.copy_from_slice(&r.info);
+            eprintln!(
+                "msg: {:?}",
+                Jt72Codec::default().unpack(&p, &DecodeContext::default())
+            );
+        }
+
+        // Golden: TF3G N7MQ CN84 @ 1186 Hz dt=0.0
+        let llrs = demodulate_aligned(&audio, 12_000, 0, 1186.0);
+        let res = codec.decode_soft(&llrs, &FecOpts::default());
+        eprintln!("1186 Hz dt=0.0: {:?}", res.as_ref().map(|r| r.hard_errors));
+        if let Some(r) = res {
+            let mut p = [0u8; 72];
+            p.copy_from_slice(&r.info);
+            eprintln!(
+                "msg: {:?}",
+                Jt72Codec::default().unpack(&p, &DecodeContext::default())
+            );
+        }
+    }
+
+    /// Sweep start_sample densely around expected positions for all 5 golden signals,
+    /// using the 12 kHz FFT approach (demodulate_aligned from rx.rs).
+    /// This tells us the MAXIMUM performance possible from this recording.
+    #[test]
+    #[ignore]
+    fn rx_aligned_sweep_all_golden() {
+        let path = Path::new("/home/minoru/src/WSJT-X/samples/JT9/130418_1742.wav");
+        if !path.exists() {
+            eprintln!("WAV not found");
+            return;
+        }
+        let bytes = std::fs::read(path).unwrap();
+        let dl = u32::from_le_bytes([bytes[40], bytes[41], bytes[42], bytes[43]]) as usize;
+        let audio: Vec<f32> = bytes[44..44 + dl]
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0)
+            .collect();
+
+        let codec = ConvFano232;
+        let nsps = 6912usize;
+        let step = nsps / 8; // ⅛-symbol step
+
+        for &(nom_freq, label) in &[
+            (1224.0f32, "1224 Hz K1JT KF4RWA 73"),
+            (1346.0f32, "1346 Hz K1JT N5KDV EM41"),
+            (1186.0f32, "1186 Hz TF3G N7MQ CN84"),
+            (1290.0f32, "1290 Hz CQ M0WAY IO82"),
+            (1119.0f32, "1119 Hz CQ GM7GAX IO75"),
+        ] {
+            eprintln!("\n=== {} ===", label);
+            let mut best = None::<(usize, f32, u32, String)>;
+            // Scan start_sample 8000..16000 in ⅛-symbol steps
+            for start in (8000..=16000usize).step_by(step) {
+                if start + 85 * nsps > audio.len() {
+                    break;
+                }
+                // Try ±0.5 Hz around nominal freq
+                for df_i in -4..=4i32 {
+                    let freq = nom_freq + df_i as f32 * 0.25;
+                    let llrs = demodulate_aligned(&audio, 12_000, start, freq);
+                    if let Some(r) = codec.decode_soft(&llrs, &FecOpts::default()) {
+                        if r.hard_errors <= 50 {
+                            let mut p = [0u8; 72];
+                            p.copy_from_slice(&r.info);
+                            if let Some(msg) =
+                                Jt72Codec::default().unpack(&p, &DecodeContext::default())
+                            {
+                                let t = start as f32 / 12000.0;
+                                eprintln!(
+                                    "  freq={:.2} start={} ({:.3}s) hard={}: {:?}",
+                                    freq, start, t, r.hard_errors, msg
+                                );
+                                if best
+                                    .as_ref()
+                                    .map_or(true, |(_, _, he, _)| r.hard_errors < *he)
+                                {
+                                    best = Some((start, freq, r.hard_errors, format!("{:?}", msg)));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some((s, f, he, m)) = best {
+                eprintln!("  BEST: freq={:.2} start={} hard={}: {}", f, s, he, m);
+            } else {
+                eprintln!("  NO DECODE found for {}", label);
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore]
+#[allow(clippy::collapsible_if)]
+fn freq_sweep_1224hz() {
+    let path = std::path::Path::new("/home/minoru/src/WSJT-X/samples/JT9/130418_1742.wav");
+    if !path.exists() {
+        return;
+    }
+    let bytes = std::fs::read(path).unwrap();
+    let dl = u32::from_le_bytes([bytes[40], bytes[41], bytes[42], bytes[43]]) as usize;
+    let audio: Vec<f32> = bytes[44..44 + dl]
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0)
+        .collect();
+    use crate::core::{DecodeContext, FecOpts, MessageCodec};
+    use crate::fec::{ConvFano232, FecCodec};
+    use crate::msg::Jt72Codec;
+    let codec = ConvFano232;
+    for df_i in -10..=10i32 {
+        let freq = 1224.0 + df_i as f32 * 0.5;
+        for dt_samples in [0usize, 600, 1200, 1800] {
+            let llrs = demodulate_aligned(&audio, 12_000, dt_samples, freq);
+            if let Some(r) = codec.decode_soft(&llrs, &FecOpts::default()) {
+                let mut p = [0u8; 72];
+                p.copy_from_slice(&r.info);
+                if let Some(msg) = Jt72Codec::default().unpack(&p, &DecodeContext::default()) {
+                    if r.hard_errors < 30 {
+                        eprintln!(
+                            "freq={} dt={} hard={}: {:?}",
+                            freq, dt_samples, r.hard_errors, msg
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore]
+#[allow(clippy::collapsible_if)]
+fn wide_freq_time_sweep() {
+    let path = std::path::Path::new("/home/minoru/src/WSJT-X/samples/JT9/130418_1742.wav");
+    if !path.exists() {
+        return;
+    }
+    let bytes = std::fs::read(path).unwrap();
+    let dl = u32::from_le_bytes([bytes[40], bytes[41], bytes[42], bytes[43]]) as usize;
+    let audio: Vec<f32> = bytes[44..44 + dl]
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0)
+        .collect();
+    use crate::core::{DecodeContext, FecOpts, MessageCodec};
+    use crate::fec::{ConvFano232, FecCodec};
+    use crate::msg::Jt72Codec;
+    let codec = ConvFano232;
+    let df = 12000.0f32 / 6912.0;
+    eprintln!("df = {:.4} Hz/bin", df);
+    // Try every freq bin from 600 to 820 (= 1041 to 1423 Hz)
+    for bin in 640usize..=780 {
+        let freq = bin as f32 * df;
+        for dt_frames in 0..=6912usize {
+            if dt_frames > 0 && dt_frames % 1728 != 0 {
+                continue;
+            }
+            let llrs = demodulate_aligned(&audio, 12_000, dt_frames, freq);
+            if let Some(r) = codec.decode_soft(&llrs, &FecOpts::default()) {
+                if r.hard_errors <= 25 {
+                    let mut p = [0u8; 72];
+                    p.copy_from_slice(&r.info);
+                    eprintln!(
+                        "bin={} freq={:.1} dt={} hard={}: {:?}",
+                        bin,
+                        freq,
+                        dt_frames,
+                        r.hard_errors,
+                        Jt72Codec::default().unpack(&p, &DecodeContext::default())
+                    );
+                }
+            }
+        }
+    }
+    eprintln!("done");
+}
