@@ -88,6 +88,23 @@ pub fn decode_at_baseband(
     decode_at_baseband_with_fft(&big, freq_hz)
 }
 
+/// Convert peakdt9 lag (in 27.78 Hz baseband samples) back to a
+/// 12 kHz audio-sample index. Reverses the offsetting that peakdt9
+/// applies when slicing c3 out of c2.
+fn lag_to_audio_sample(lagpk: i64) -> usize {
+    // peakdt9 places sample 0 of c3 at c2 index `lagpk - i0 - NSPSD + 1`
+    // where i0 = 5 * NSPSD. Each 27.78 Hz sample equals NDOWN = 432
+    // audio samples at 12 kHz.
+    let i0 = 5 * 16i64;
+    let nspsd = 16i64;
+    let ndown = 432i64;
+    let c2_offset = lagpk - i0 - nspsd + 1;
+    // Audio-sample index of symbol-0 within the original audio.
+    let sample = c2_offset.max(0) * ndown;
+    let _ = FSAMPLE_DOWN; // silence unused
+    sample as usize
+}
+
 #[cfg(test)]
 #[allow(dead_code)]
 mod gate_diag {
@@ -149,8 +166,7 @@ mod gate_diag {
                         Some(r) => {
                             let mut p = [0u8; 72];
                             p.copy_from_slice(&r.info);
-                            let m = Jt72Codec::default()
-                                .unpack(&p, &DecodeContext::default());
+                            let m = Jt72Codec::default().unpack(&p, &DecodeContext::default());
                             format!(
                                 "limit={} hard={} msg={:?}",
                                 lim,
@@ -173,21 +189,4 @@ mod gate_diag {
             }
         }
     }
-}
-
-/// Convert peakdt9 lag (in 27.78 Hz baseband samples) back to a
-/// 12 kHz audio-sample index. Reverses the offsetting that peakdt9
-/// applies when slicing c3 out of c2.
-fn lag_to_audio_sample(lagpk: i64) -> usize {
-    // peakdt9 places sample 0 of c3 at c2 index `lagpk - i0 - NSPSD + 1`
-    // where i0 = 5 * NSPSD. Each 27.78 Hz sample equals NDOWN = 432
-    // audio samples at 12 kHz.
-    let i0 = 5 * 16i64;
-    let nspsd = 16i64;
-    let ndown = 432i64;
-    let c2_offset = lagpk - i0 - nspsd + 1;
-    // Audio-sample index of symbol-0 within the original audio.
-    let sample = c2_offset.max(0) * ndown;
-    let _ = FSAMPLE_DOWN; // silence unused
-    sample as usize
 }

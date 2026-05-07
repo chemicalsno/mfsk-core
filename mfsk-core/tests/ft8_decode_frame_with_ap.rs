@@ -36,7 +36,10 @@ fn synth_slot(msg77: &[u8; 77], freq_hz: f32, peak_i16: i16) -> Vec<i16> {
     audio
 }
 
-fn first_text_at(results: &[mfsk_core::ft8::decode::DecodeResult], target: [u8; 77]) -> Option<String> {
+fn first_text_at(
+    results: &[mfsk_core::ft8::decode::DecodeResult],
+    target: [u8; 77],
+) -> Option<String> {
     let r = results.iter().find(|r| r.message77 == target)?;
     wsjt77::unpack77(&r.message77)
 }
@@ -58,7 +61,9 @@ fn matching_ap_hint_decodes_clean_signal() {
         Some(&ap),
     );
     assert!(
-        first_text_at(&results, msg).unwrap_or_default().contains("K1ABC"),
+        first_text_at(&results, msg)
+            .unwrap_or_default()
+            .contains("K1ABC"),
         "matching AP hint did not produce the expected decode"
     );
 }
@@ -109,8 +114,7 @@ fn ap_none_matches_legacy_decode_frame() {
     let msg = pack_msg("CQ", "K1ABC", "FN42");
     let audio = synth_slot(&msg, 1500.0, 25_000);
 
-    let legacy =
-        decode_frame(&audio, 300.0, 2700.0, 1.5, None, DecodeDepth::BpAllOsd, 15);
+    let legacy = decode_frame(&audio, 300.0, 2700.0, 1.5, None, DecodeDepth::BpAllOsd, 15);
     let new_none = decode_frame_with_ap(
         &audio,
         300.0,
@@ -124,5 +128,8 @@ fn ap_none_matches_legacy_decode_frame() {
 
     let legacy_msgs: Vec<_> = legacy.iter().map(|r| r.message77).collect();
     let new_msgs: Vec<_> = new_none.iter().map(|r| r.message77).collect();
-    assert_eq!(legacy_msgs, new_msgs, "ap_hint=None must match decode_frame");
+    assert_eq!(
+        legacy_msgs, new_msgs,
+        "ap_hint=None must match decode_frame"
+    );
 }

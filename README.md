@@ -250,6 +250,43 @@ See `mfsk-ffi/examples/cpp_smoke/` for an end-to-end driver test
 (including multi-threaded usage) and `mfsk-ffi/examples/kotlin_jni/`
 for an Android/JNI skeleton.
 
+## Contributing
+
+PRs welcome — recent forks have shipped FT4 SIC, FT4/FST4 depth +
+strictness controls, and the FT8 wide-band AP path. The local-fence
++ CI gates are uniform across direct commits and fork PRs:
+
+- **Pre-commit hook**: `.githooks/pre-commit` runs `cargo fmt --check`,
+  `cargo clippy --workspace --all-targets --features full -- -D warnings`,
+  and `RUSTDOCFLAGS=-D warnings cargo doc -p mfsk-core --features full
+  --no-deps` (~10–20 s on a warm cache). Enable once per clone:
+
+  ```sh
+  git config core.hooksPath .githooks
+  ```
+
+  The hook deliberately skips the full `cargo test` suite (kept in
+  CI to keep commits snappy); fmt / clippy / rustdoc each catch a
+  failure mode that would otherwise trip CI after the push.
+- **CI gates** (`.github/workflows/ci.yml`): same fmt + clippy
+  fence, plus `cargo test -p mfsk-core --features full --release --
+  --include-ignored` (slow synthetic-SNR / AP / fast-fading sweeps
+  enabled), a 13-cell feature matrix that builds every protocol in
+  isolation + the embedded `alloc + ft8 + fft-extern + fixed-point`
+  preset, the C++ driver against `mfsk-ffi`, rustdoc with `-D warnings`,
+  and a `cargo publish --dry-run` for `mfsk-core`.
+- **Release**: tag-driven (`v0.5.x`). Pushing a tag that matches
+  `mfsk-core/Cargo.toml::version` and is reachable from `main`
+  triggers `release.yml`, which publishes to crates.io and cuts a
+  GitHub release with auto-generated notes. Embedded `mfsk-ffi-ft8`
+  binaries follow on the same tag.
+
+For non-trivial changes, please open an issue first so the
+WSJT-X-source-faithfulness lineage of any DSP or FEC change is
+visible in review (every protocol constant in this crate cites the
+upstream `lib/*.f90` it ports from — drift from that lineage tends
+to be the failure mode caught by the WSJT-X golden harnesses).
+
 ## Architecture & ABI reference
 
 For a deeper look at the design — trait hierarchy with worked

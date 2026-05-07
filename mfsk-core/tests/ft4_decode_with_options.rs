@@ -10,9 +10,7 @@
 //! floor would break the assertion.
 
 use mfsk_core::core::{FrameLayout, MessageCodec, MessageFields};
-use mfsk_core::ft4::decode::{
-    DecodeDepth, DecodeStrictness, decode_frame_with_options,
-};
+use mfsk_core::ft4::decode::{DecodeDepth, DecodeStrictness, decode_frame_with_options};
 use mfsk_core::ft4::{Ft4, encode};
 use mfsk_core::msg::{Wsjt77Message, wsjt77};
 
@@ -56,9 +54,8 @@ fn every_depth_strictness_combo_decodes_clean_signal() {
             DecodeStrictness::Normal,
             DecodeStrictness::Deep,
         ] {
-            let results = decode_frame_with_options(
-                &audio, 100.0, 3000.0, 0.6, None, depth, strictness, 5,
-            );
+            let results =
+                decode_frame_with_options(&audio, 100.0, 3000.0, 0.6, None, depth, strictness, 5);
             let hit = results
                 .iter()
                 .find(|r| r.message77() == msg)
@@ -72,10 +69,7 @@ fn every_depth_strictness_combo_decodes_clean_signal() {
                 });
             // Every combo on a clean signal should produce a CRC-valid
             // payload that unpacks to the input string.
-            let m77: [u8; 77] = hit
-                .message77()
-                .try_into()
-                .expect("message77 is 77 bits");
+            let m77: [u8; 77] = hit.message77().try_into().expect("message77 is 77 bits");
             let text = wsjt77::unpack77(&m77).unwrap_or_default();
             if decoded_text.is_none() {
                 decoded_text = Some(text.clone());

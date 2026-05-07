@@ -1,34 +1,98 @@
 # Changelog
 
-## Unreleased — JT9 packgrid formula fix (#19 partial: 1/5 → 2/5)
+## 0.5.10 — JT9 WSJT-X recall 5/5, FT4 SIC, depth/strictness + AP IF wiring
 
-`msg/jt72.rs::pack_grid4_plain` and the matching `unpack_grid` grid
-branch were both encoding/decoding the maidenhead → 15-bit `ng`
-field with a self-consistent but **non-WSJT-X-compatible** formula
-(`(-180 + fl*20 + sl*2 + 1)` long offset). Self-roundtrip passed,
-but real WSJT-X-encoded WAVs decoded with the wrong grid (e.g.
-`K1JT N5KDV EM41` → `K1JT N5KDV NM51`).
+### JT9 — issue [#19](https://github.com/jl1nie/mfsk-core/issues/19) closed (1/5 → 5/5)
 
-Replaced both with the integer-arithmetic equivalent of WSJT-X's
-`packgrid` (`lib/packjt.f90:341-345` + `grid2deg.f90`):
+Six load-bearing source-faithful fixes lift `decode_scan` recall on
+`samples/JT9/130418_1742.wav` from 1/5 to a full 5/5 — every
+WSJT-X golden frame (`CQ GM7GAX IO75`, `TF3G N7MQ CN84`,
+`K1JT KF4RWA 73`, `CQ M0WAY IO82`, `K1JT N5KDV EM41`) now decodes
+through the public pipeline:
 
-```text
-ng_long_part = 179 - 10*fl - sl     // for valid grids fl∈[0..17], sl∈[0..9]
-ng_lat       = 10*fla + sla
-ng           = ng_long_part * 180 + ng_lat
-```
+1. **`packgrid` formula** (`msg/jt72.rs::pack_grid4_plain`) —
+   replaced a self-consistent but non-WSJT-X-compatible long-offset
+   formula with the integer-arithmetic equivalent of `lib/packjt.f90`
+   `packgrid` + `grid2deg`: `ng = (179 − 10·fl − sl)·180 + (10·fla + sla)`.
+   Pinned canonical `ng` values for six representative grids
+   (`grid_wsjtx_canonical_ng`).
+2. **`afc9` 3-parameter chi-square AFC** — replaced the 1-D
+   `afc_simple` frequency scan with the WSJT-X parabolic line
+   search over (frequency, drift, integer-sample time shift) plus
+   the `shft` cshift+zero-fill helper, mirroring `lib/afc9.f90` +
+   `lib/fchisq.f90` exactly.
+3. **`chkss2` schk metric + two-stage gate** — added the
+   `lib/chkss2.f90` sync-quality measure and applied the WSJT-X
+   `sync ≥ 1.0 && schk ≥ 1.5` gate from `jt9_decode.f90:139` before
+   spending Fano cycles.
+4. **`jt9fano` xx0 mettab** — ported the calibrated 256-entry
+   asymmetric LUT (≈+25 max reward, −525 min penalty, slope-2
+   linear extension beyond `ib=160`) to replace the linear
+   `m = 0.5·l − bias` form for `ConvFano232`. Without this LUT,
+   Fano was latching onto plausible-looking neighbour codewords at
+   marginal SNR (`CN84` → `EH03`, `IO82` → garbage). Fano delta
+   moves to 170 = `nint(3.4·50)` to match the new mettab scale.
+5. **Pre-decode NMS removed** — the 5 Hz freq-domain non-maximum
+   suppression had no WSJT-X equivalent and was dropping real-but-
+   weak goldens that lost coarse-score competitions to phantoms in
+   the same NMS bin. WSJT-X uses post-decode `done(iaa:ibb)=.true.`
+   suppression which we already mirror via the `seen` dedup loop.
+6. **`coarse_search` per-freq collapse** — was emitting one candidate
+   per `(freq, time)` cell, letting strong signals (EM41) crowd the
+   top-N with their many time variants. Now keeps only the best-
+   scoring time alignment per freq bin, mirroring WSJT-X
+   `lib/sync9.f90` `ccfred(i) = max over lags of sum`. Total
+   candidates collapse 3393 → 261 on the golden, weak signals
+   (1119 Hz `IO75` at score 0.96) survive truncation.
 
-Pinned the canonical values for EM41 / FN42 / PM95 / JN58 / AA00 /
-RR99 in a new `grid_wsjtx_canonical_ng` test so this can't regress
-into another symmetrically-broken state.
+`FecOpts::max_cycles_per_bit` added so callers can override the
+Fano per-bit cycle budget — wires the WSJT-X depth-retry knob
+without forcing a global config change.
 
-WSJT-X golden recall (`tests/jt9_wsjtx_samples.rs`) is now 2 / 5:
-`K1JT N5KDV EM41` joins `K1JT KF4RWA 73`. The remaining three
-misses (`CQ GM7GAX IO75` @ 1119 Hz, `TF3G N7MQ CN84` @ 1186 Hz,
-`CQ M0WAY IO82` @ 1290 Hz) are not packgrid bugs — at 1186 Hz we
-decode the same callsigns at the same freq/dt but with a different
-ng (`EH03` instead of `CN84`), i.e. the LLR/Fano stage is locking
-onto a near-but-wrong codeword in the busy band. Tracked separately.
+### FT4 / FST4 / FT8 — public IF expansion (PRs from @chemicalsno)
+
+Three contributor PRs landed, each shipping a focused IF extension
+with WSJT-X provenance and unit + integration test coverage:
+
+- **PR [#20](https://github.com/jl1nie/mfsk-core/pull/20):**
+  `ft4::subtract` module — successive-interference cancellation
+  primitives mirroring `lib/ft4_subtract.f90`. Public surface:
+  `subtract_signal`, `subtract_signal_weighted`, `subtract_signal_lpf`,
+  `refine_signal_freq`. Uses the existing `FT4_SUBTRACT` config
+  (BT=2.0, hmod=1.0, nsps=576) so there's a single source of truth
+  for the GFSK-shaping constants.
+- **PR [#21](https://github.com/jl1nie/mfsk-core/pull/21):**
+  `ft4::decode::decode_frame_with_options` and
+  `fst4::decode::decode_frame_with_options` — surfaces the
+  `DecodeDepth` × `DecodeStrictness` axes that the internal generic
+  pipeline already accepted. The legacy `decode_frame` is unchanged
+  (shim using `BpAllOsd` + `Normal`), giving a clean mapping to the
+  WSJT-X Fast / Normal / Deep menu.
+- **PR [#22](https://github.com/jl1nie/mfsk-core/pull/22):**
+  `ft8::decode::decode_frame_with_ap` — wide-band counterpart to the
+  prior `decode_sniper_ap` (which scanned only ±250 Hz). Threading
+  AP hints through `process_candidate` was already supported
+  internally; this PR exposes it on the public scan.
+
+Three `tests/`-level integration tests
+(`tests/ft4_decode_with_options.rs`, `tests/ft4_subtract_pipeline.rs`,
+`tests/ft8_decode_frame_with_ap.rs`) validate the production-shape
+contract for each new API beyond the inline unit tests the PRs
+already shipped.
+
+### Other
+
+- `xsnr2_db_simple` SNR calibration narrative cleared from "embedded
+  known limitations" — `DecodeResult.snr_db` now lands within ±3 dB
+  of JTDX absolute on real silicon (was 4–12 dB low; resolved in
+  0.5.7 + 0.5.8). EMBEDDED.md / .ja.md refreshed accordingly.
+- Stale `/home/minoru/` paths in test + diag files replaced with
+  `/home/ubuntu/`, restoring
+  `ft8_qso3_apoff_recall::qso3_apoff_meets_wsjtx_golden_floor` on
+  `cargo test --features full`.
+- Outstanding scope (`FST4-15` / `FST4W` golden, JT65 erasure-aware
+  golden harness, MSK144 implementation) tracked in
+  [#23](https://github.com/jl1nie/mfsk-core/issues/23) / [#24](https://github.com/jl1nie/mfsk-core/issues/24) / [#25](https://github.com/jl1nie/mfsk-core/issues/25).
 
 ## 0.5.9 — WSJT-X golden recall: WSPR 8/8, FT4 6/6, JT9 1/5 (encoder bug #19)
 
