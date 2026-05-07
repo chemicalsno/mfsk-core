@@ -4,9 +4,9 @@
 //!
 //! The 8-entry golden in [`WSJTX_GOLDEN`] is what WSJT-X normal mode
 //! produces with **a-priori decoding disabled** (the canonical
-//! reproducible reference). The companion AP-on regression
-//! (`ft8_qso3_apon_recall.rs`) gates a different superset and is
-//! marked `#[ignore]` until AP-list (ft8b.f90 ipass 5..8) is ported.
+//! reproducible reference). A companion AP-on regression will be
+//! added when AP-list (ft8b.f90 ipass 5..8) is ported — tracked in
+//! https://github.com/jl1nie/mfsk-core/issues/31.
 //!
 //! Run:
 //! ```sh
@@ -23,7 +23,10 @@ use mfsk_core::ft8::decode::DecodeDepth;
 use mfsk_core::ft8::decode_block::decode_block;
 use mfsk_core::msg::wsjt77::unpack77;
 
-const QSO3_PATH: &str = "/home/ubuntu/src/mfsk-core/embedded-poc/assets/qso3_busy.wav";
+#[allow(dead_code)]
+mod common;
+
+const QSO3_PATH: &str = asset_path!("qso3_busy.wav");
 
 /// WSJT-X **AP-off** decode of the official sample WAV
 /// (`samples/FT8/210703_133430.wav`). 8 entries — this is the ground
