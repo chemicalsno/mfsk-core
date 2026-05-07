@@ -51,16 +51,54 @@ pub fn decode_frame(
     sync_min: f32,
     max_cand: usize,
 ) -> Vec<DecodeResult> {
+    decode_frame_with_options(
+        audio,
+        freq_min,
+        freq_max,
+        sync_min,
+        None,
+        DecodeDepth::BpAllOsd,
+        DecodeStrictness::Normal,
+        max_cand,
+    )
+}
+
+/// Decode one FST4-60A slot with explicit `depth` + `strictness` knobs.
+///
+/// Mirrors [`crate::ft4::decode::decode_frame_with_options`] and
+/// [`crate::ft8::decode::decode_frame`]'s `depth` parameter. Adds the
+/// `strictness` axis (which the public shim hardcodes to
+/// [`DecodeStrictness::Normal`]). Useful for matching WSJT-X's
+/// Fast / Normal / Deep menu in downstream applications:
+///
+/// | WSJT-X menu | depth        | strictness |
+/// |---|---|---|
+/// | Fast        | `Bp`         | `Strict`   |
+/// | Normal      | `BpAll`      | `Normal`   |
+/// | Deep        | `BpAllOsd`   | `Deep`     |
+///
+/// `freq_hint`: when `Some(f)`, narrows the coarse-sync to candidates
+/// near `f`. Pass `None` for full-band scan.
+pub fn decode_frame_with_options(
+    audio: &[i16],
+    freq_min: f32,
+    freq_max: f32,
+    sync_min: f32,
+    freq_hint: Option<f32>,
+    depth: DecodeDepth,
+    strictness: DecodeStrictness,
+    max_cand: usize,
+) -> Vec<DecodeResult> {
     pipeline::decode_frame::<Fst4s60>(
         audio,
         &FST4_60A_DOWNSAMPLE,
         freq_min,
         freq_max,
         sync_min,
-        /*freq_hint*/ None,
-        DecodeDepth::BpAllOsd,
+        freq_hint,
+        depth,
         max_cand,
-        DecodeStrictness::Normal,
+        strictness,
         EqMode::Off,
         REFINE_STEPS,
         SYNC_Q_MIN,
@@ -78,6 +116,32 @@ pub fn decode_frame_with_cache(
     sync_min: f32,
     max_cand: usize,
 ) -> (Vec<DecodeResult>, FftCache) {
+    decode_frame_with_cache_and_options(
+        audio,
+        freq_min,
+        freq_max,
+        sync_min,
+        DecodeDepth::BpAllOsd,
+        DecodeStrictness::Normal,
+        max_cand,
+    )
+}
+
+/// Same as [`decode_frame_with_cache`] but with explicit `depth` +
+/// `strictness` knobs (see [`decode_frame_with_options`]).
+///
+/// Added per Gemini's review on PR #21 (Tier 1.3) so callers driving
+/// pipelined SIC / narrow-band rescan can match the Fast / Normal /
+/// Deep menu without going through the legacy hardcoded shim.
+pub fn decode_frame_with_cache_and_options(
+    audio: &[i16],
+    freq_min: f32,
+    freq_max: f32,
+    sync_min: f32,
+    depth: DecodeDepth,
+    strictness: DecodeStrictness,
+    max_cand: usize,
+) -> (Vec<DecodeResult>, FftCache) {
     pipeline::decode_frame::<Fst4s60>(
         audio,
         &FST4_60A_DOWNSAMPLE,
@@ -85,9 +149,9 @@ pub fn decode_frame_with_cache(
         freq_max,
         sync_min,
         None,
-        DecodeDepth::BpAllOsd,
+        depth,
         max_cand,
-        DecodeStrictness::Normal,
+        strictness,
         EqMode::Off,
         REFINE_STEPS,
         SYNC_Q_MIN,
@@ -141,5 +205,43 @@ mod tests {
             "expected to recover 'JA1ABC PM95', got {:?}",
             texts
         );
+    }
+
+    /// Compile-time check that `decode_frame_with_options` accepts every
+    /// combination of `DecodeDepth` × `DecodeStrictness`. No actual
+    /// decoding happens — empty audio returns no candidates fast — but
+    /// this guards against future signature drift breaking downstream
+    /// callers that do parameterised dispatch.
+    #[test]
+    fn decode_frame_with_options_accepts_all_param_combos() {
+        let empty = vec![0i16; 12 * 60 * 1000]; // 60 s of silence
+        for &depth in &[DecodeDepth::Bp, DecodeDepth::BpAll, DecodeDepth::BpAllOsd] {
+            for &strict in &[
+                DecodeStrictness::Strict,
+                DecodeStrictness::Normal,
+                DecodeStrictness::Deep,
+            ] {
+                let _ =
+                    decode_frame_with_options(&empty, 100.0, 3000.0, 0.8, None, depth, strict, 5);
+            }
+        }
+    }
+
+    /// Compile-time check that `decode_frame_with_cache_and_options`
+    /// accepts every combination of `DecodeDepth` × `DecodeStrictness`.
+    #[test]
+    fn decode_frame_with_cache_and_options_accepts_all_param_combos() {
+        let empty = vec![0i16; 12 * 60 * 1000]; // 60 s of silence
+        for &depth in &[DecodeDepth::Bp, DecodeDepth::BpAll, DecodeDepth::BpAllOsd] {
+            for &strict in &[
+                DecodeStrictness::Strict,
+                DecodeStrictness::Normal,
+                DecodeStrictness::Deep,
+            ] {
+                let _ = decode_frame_with_cache_and_options(
+                    &empty, 100.0, 3000.0, 0.8, depth, strict, 5,
+                );
+            }
+        }
     }
 }
