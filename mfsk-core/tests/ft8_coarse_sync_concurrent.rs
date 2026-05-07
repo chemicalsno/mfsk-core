@@ -29,11 +29,14 @@ use mfsk_core::ft8::decode_block::{
     process_candidates_into, process_candidates_into_with_cs_scratch, refine_candidates_into,
 };
 
-const QSO_WAV: &str = "/home/ubuntu/src/mfsk-core/embedded-poc/assets/qso3_busy.wav";
+#[allow(dead_code)]
+mod common;
+
+const QSO_WAV: &str = asset_path!("qso3_busy.wav");
 const QSO_WAVS: &[&str] = &[
-    "/home/ubuntu/src/mfsk-core/embedded-poc/assets/qso1.wav",
-    "/home/ubuntu/src/mfsk-core/embedded-poc/assets/qso2.wav",
-    "/home/ubuntu/src/mfsk-core/embedded-poc/assets/qso3_busy.wav",
+    asset_path!("qso1.wav"),
+    asset_path!("qso2.wav"),
+    asset_path!("qso3_busy.wav"),
 ];
 const PASS1_LIMIT: usize = 30;
 const FREQ_MIN: f32 = 100.0;
