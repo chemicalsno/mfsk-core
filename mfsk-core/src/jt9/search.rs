@@ -196,28 +196,38 @@ pub fn coarse_search_on_spec(
     let fmin_bin = (params.freq_min_hz / df).floor() as i64;
     let fmax_bin = (params.freq_max_hz / df).ceil() as i64;
 
+    // For each freq bin, keep ONLY the best-scoring time alignment —
+    // mirrors WSJT-X `sync9` `ccfred(i)=max over lags of sum`. Without
+    // this collapse, a single strong signal's many time variants
+    // would crowd out lower-scoring real signals at other carriers
+    // when we apply `max_candidates`.
     let mut out: Vec<SyncCandidate> = Vec::new();
-    for row in row_min..=row_max {
-        if row < 0 {
+    for fb in fmin_bin..=fmax_bin {
+        if fb < 0 || (fb as usize) + 9 > spec.n_freq {
             continue;
         }
-        let row = row as usize;
-        // Need row + 84 symbols × 4 rows/symbol room.
-        if row + 84 * rows_per_symbol >= spec.n_time {
-            continue;
-        }
-        for fb in fmin_bin..=fmax_bin {
-            if fb < 0 || (fb as usize) + 9 > spec.n_freq {
+        let mut best_row: i64 = -1;
+        let mut best_score = f32::NEG_INFINITY;
+        for row in row_min..=row_max {
+            if row < 0 {
                 continue;
             }
-            let score = score_candidate(spec, row, fb as usize);
-            if score >= params.score_threshold {
-                out.push(SyncCandidate {
-                    start_sample: row * spec.t_step,
-                    freq_hz: fb as f32 * df,
-                    score,
-                });
+            let row_u = row as usize;
+            if row_u + 84 * rows_per_symbol >= spec.n_time {
+                continue;
             }
+            let score = score_candidate(spec, row_u, fb as usize);
+            if score > best_score {
+                best_score = score;
+                best_row = row;
+            }
+        }
+        if best_row >= 0 && best_score >= params.score_threshold {
+            out.push(SyncCandidate {
+                start_sample: best_row as usize * spec.t_step,
+                freq_hz: fb as f32 * df,
+                score: best_score,
+            });
         }
     }
     out.sort_unstable_by(|a, b| {
@@ -259,7 +269,7 @@ mod diag_tests {
     #[test]
     #[ignore]
     fn jt9_coarse_diag() {
-        let path = Path::new("/home/minoru/src/WSJT-X/samples/JT9/130418_1742.wav");
+        let path = Path::new("/home/ubuntu/src/WSJT-X/samples/JT9/130418_1742.wav");
         if !path.exists() {
             eprintln!("WAV not found");
             return;
