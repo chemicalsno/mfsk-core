@@ -63,16 +63,54 @@ pub fn decode_frame(
     sync_min: f32,
     max_cand: usize,
 ) -> Vec<DecodeResult> {
+    decode_frame_with_options(
+        audio,
+        freq_min,
+        freq_max,
+        sync_min,
+        None,
+        DecodeDepth::BpAllOsd,
+        DecodeStrictness::Normal,
+        max_cand,
+    )
+}
+
+/// Decode one FT4 slot with explicit `depth` + `strictness` knobs.
+///
+/// Mirrors [`crate::ft8::decode::decode_frame`]'s `depth` parameter and
+/// adds the `strictness` axis (which FT8's public shim hardcodes to
+/// [`DecodeStrictness::Normal`]). Useful for matching WSJT-X's
+/// Fast / Normal / Deep menu in downstream applications:
+///
+/// | WSJT-X menu | depth        | strictness |
+/// |---|---|---|
+/// | Fast        | `Bp`         | `Strict`   |
+/// | Normal      | `BpAll`      | `Normal`   |
+/// | Deep        | `BpAllOsd`   | `Deep`     |
+///
+/// `freq_hint` is the same as in `ft8::decode::decode_frame`: when
+/// `Some(f)`, narrows the coarse-sync to candidates near `f` ± a few Hz.
+/// Pass `None` for full-band scan.
+pub fn decode_frame_with_options(
+    audio: &[i16],
+    freq_min: f32,
+    freq_max: f32,
+    sync_min: f32,
+    freq_hint: Option<f32>,
+    depth: DecodeDepth,
+    strictness: DecodeStrictness,
+    max_cand: usize,
+) -> Vec<DecodeResult> {
     pipeline::decode_frame::<Ft4>(
         audio,
         &FT4_DOWNSAMPLE,
         freq_min,
         freq_max,
         sync_min,
-        None,
-        DecodeDepth::BpAllOsd,
+        freq_hint,
+        depth,
         max_cand,
-        DecodeStrictness::Normal,
+        strictness,
         EqMode::Off,
         REFINE_STEPS,
         SYNC_Q_MIN,
@@ -162,4 +200,28 @@ pub fn decode_sniper_ap(
         SYNC_Q_MIN / 2,
         ap_hint,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Compile-time check that `decode_frame_with_options` accepts every
+    /// combination of `DecodeDepth` × `DecodeStrictness`. No actual
+    /// decoding happens — empty audio returns no candidates fast — but
+    /// this guards against future signature drift.
+    #[test]
+    fn decode_frame_with_options_accepts_all_param_combos() {
+        let empty = vec![0i16; 12 * 7500]; // 7.5 s of silence at 12 kHz
+        for &depth in &[DecodeDepth::Bp, DecodeDepth::BpAll, DecodeDepth::BpAllOsd] {
+            for &strict in &[
+                DecodeStrictness::Strict,
+                DecodeStrictness::Normal,
+                DecodeStrictness::Deep,
+            ] {
+                let _ =
+                    decode_frame_with_options(&empty, 100.0, 3000.0, 1.0, None, depth, strict, 5);
+            }
+        }
+    }
 }
