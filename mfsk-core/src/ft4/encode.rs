@@ -11,12 +11,13 @@ use crate::core::dsp::gfsk::{GfskCfg, synth_f32, synth_f32_into, synth_i16, synt
 use crate::core::{FecCodec, FrameLayout, ModulationParams};
 use crate::fec::Ldpc174_91;
 
-/// FT4 GFSK configuration: 12 kHz, 576 samples/symbol, BT=2.0, hmod=1.0,
-/// 72-sample (NSPS/8) cosine ramp.
+/// FT4 GFSK configuration: 12 kHz, 576 samples/symbol, BT=1.0, hmod=1.0,
+/// 72-sample (NSPS/8) cosine ramp. BT=1.0 matches WSJT-X
+/// `lib/ft4/gen_ft4wave.f90` (`gfsk_pulse(1.0, tt)`).
 pub const FT4_GFSK: GfskCfg = GfskCfg {
     sample_rate: 12_000.0,
     samples_per_symbol: 576,
-    bt: 2.0,
+    bt: 1.0,
     hmod: 1.0,
     ramp_samples: 576 / 8,
 };

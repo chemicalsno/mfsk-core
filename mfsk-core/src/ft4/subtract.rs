@@ -13,14 +13,17 @@
 //!
 //! ## WSJT-X reference
 //!
-//! Algorithm and constants ported from WSJT-X `lib/ft4_subtract.f90`
-//! (and the GFSK shaping it shares with `lib/genft4.f90`):
+//! Algorithm and constants ported from WSJT-X `lib/ft4/subtractft4.f90`
+//! (and the GFSK shaping it shares with `lib/ft4/genft4.f90`):
 //!
-//! - `bt = 2.0`, `hmod = 1.0` — `genft4.f90` GFSK shaping pulse.
+//! - `bt = 1.0`, `hmod = 1.0` — `lib/ft4/gen_ft4wave.f90`
+//!   `gfsk_pulse(1.0, tt)`; `lib/ft4/subtractft4.f90` declares `bt=1.0`.
 //! - `samples_per_symbol = 576` — `genft4.f90` `nsps = 576` at 12 kHz.
 //! - `tone_spacing_hz = 20.833` — `12000 / nsps`.
 //! - `base_offset_s = 0.5` — frame origin offset, `genft4.f90` `tt0 = 0.5`.
-//! - `lpf_half = 2000` Hz — matches WSJT-X `NFILT = 4000` (half-bandwidth).
+//! - `lpf_half = 700` samples — matches WSJT-X `NFILT = 1400` from
+//!   `lib/ft4/subtractft4.f90`. Half-window = NFILT/2 = 700 samples
+//!   (≈58 ms at 12 kHz); full window of 1401 samples is ≈117 ms.
 //!
 //! All values are reused from [`super::decode::FT4_SUBTRACT`] so any
 //! retuning lands in one place.
@@ -41,6 +44,21 @@ fn get_tones(result: &DecodeResult) -> Option<Vec<u8>> {
     let m77 = <[u8; 77]>::try_from(result.message77()).ok()?;
     Some(message_to_tones(&m77))
 }
+
+/// LPF half-window for [`subtract_signal_lpf`], matching WSJT-X
+/// `NFILT = 1400` from `lib/ft4/subtractft4.f90` (i.e. half = 700 samples
+/// at 12 kHz, ≈58.3 ms).
+const LPF_HALF_SAMPLES: usize = 700;
+
+/// Frequency-search half-radius for [`refine_signal_freq`]. ±5 Hz ≈
+/// ±1 FT4 sync bin (12000 / 2304 ≈ 5.21 Hz/bin). See the function's
+/// docstring for the bin-coverage derivation.
+const REFINE_RADIUS_HZ: f32 = 5.0;
+
+/// Frequency step inside the [`REFINE_RADIUS_HZ`] window — fine enough
+/// to resolve well below the GFSK matched-filter bandwidth without
+/// blowing up the LS rebuild count (≈ 100 evaluations per call).
+const REFINE_STEP_HZ: f32 = 0.1;
 
 /// Subtract a decoded FT4 signal from `audio` in-place (full amplitude).
 #[inline]
@@ -69,9 +87,10 @@ pub fn subtract_signal_weighted(audio: &mut [i16], result: &DecodeResult, gain: 
 
 /// WSJT-X-style channel-aware subtract for FT4. Wraps
 /// [`crate::core::dsp::subtract::subtract_tones_lpf`] with the FT4 cfg
-/// and `lpf_half = 2000` (matching the FT8 NFILT=4000 convention; FT4
-/// frames are narrower in time but the audio LPF half-bandwidth is
-/// the same).
+/// and `lpf_half = 700` (matching WSJT-X `NFILT = 1400` from
+/// `lib/ft4/subtractft4.f90`; full window ≈ 116 ms / half ≈ 58 ms).
+/// Note: this is narrower than FT8's NFILT=4000 — the original PR's
+/// `lpf_half = 2000` was based on confusing FT8's NFILT with FT4's.
 ///
 /// Use this on real-WAV decodes after [`refine_signal_freq`] to get
 /// near-clean signal removal. Falls back to a no-op when audio is
@@ -87,23 +106,28 @@ pub fn subtract_signal_lpf(audio: &mut [i16], result: &DecodeResult) {
         result.freq_hz,
         result.dt_sec,
         &FT4_SUBTRACT,
-        2000,
+        LPF_HALF_SAMPLES,
     );
 }
 
-/// Refine `result.freq_hz` by grid-searching ±2.5 Hz at 0.1 Hz resolution
+/// Refine `result.freq_hz` by grid-searching ±5 Hz at 0.1 Hz resolution
 /// for the carrier that maximises the LS amplitude of the GFSK reference
 /// against `audio`. Returns the refined frequency.
 ///
 /// Use this before [`subtract_signal`] / [`subtract_signal_weighted`]
 /// when the input is a real-WAV decode (not a self-synthesised signal).
-/// FT4's coarse sync reports carriers on ~5.2 Hz bins (NFFT1 = 4 × NSPS);
-/// real signals routinely sit ±0.5..2 Hz off-bin and the resulting phase
-/// drift over the 4.94 s frame defeats the constant-amplitude LS in
-/// `subtract_tones`.
+/// FT4's coarse sync reports carriers on ~5.21 Hz bins (NFFT1 = 4 × NSPS
+/// = 2304 at 12 kHz, giving 12000/2304 ≈ 5.208 Hz/bin); real signals
+/// routinely sit ±0.5..2 Hz off-bin and the resulting phase drift over
+/// the 4.94 s frame defeats the constant-amplitude LS in `subtract_tones`.
 ///
-/// Cost: ~50 GFSK reference builds × ~60 k samples each. On host f32
-/// this is ~1 ms per signal — call once per decoded result rather than
+/// The half-window is **±5 Hz** (≈ ±1 bin) rather than the ±2.5 Hz used
+/// for FT8: FT8's coarse-sync grid is 2.93 Hz/bin (NFFT_SPEC=4096), so
+/// ±2.5 Hz already covers ±0.85 bin. FT4's bin is ~78% wider, so the
+/// matching coverage in bins requires ~±5 Hz.
+///
+/// Cost: ~100 GFSK reference builds × ~60 k samples each. On host f32
+/// this is ~2 ms per signal — call once per decoded result rather than
 /// per pass-2 candidate.
 pub fn refine_signal_freq(audio: &[i16], result: &DecodeResult) -> f32 {
     // info shorter than 77 bits — shouldn't happen for FT4. Fall back
@@ -118,8 +142,8 @@ pub fn refine_signal_freq(audio: &[i16], result: &DecodeResult) -> f32 {
         result.freq_hz,
         result.dt_sec,
         &FT4_SUBTRACT,
-        2.5,
-        0.1,
+        REFINE_RADIUS_HZ,
+        REFINE_STEP_HZ,
     )
 }
 
@@ -164,12 +188,15 @@ mod tests {
         let len = samples.len().min(90_000 - offset);
         audio[offset..offset + len].copy_from_slice(&samples[..len]);
 
-        let power_before: f32 = audio.iter().map(|&s| (s as f32).powi(2)).sum::<f32>();
+        // f64 accumulator: summing ~90_000 squared-i16 (max ~2^30) values
+        // in f32 loses precision once the partial sum exceeds ~2^24, which
+        // can produce a non-deterministic `power_before` and a flaky ratio.
+        let power_before: f64 = audio.iter().map(|&s| (s as f64).powi(2)).sum::<f64>();
 
         let result = synthetic_result(msg, 1500.0, 0.0);
         subtract_signal(&mut audio, &result);
 
-        let power_after: f32 = audio.iter().map(|&s| (s as f32).powi(2)).sum::<f32>();
+        let power_after: f64 = audio.iter().map(|&s| (s as f64).powi(2)).sum::<f64>();
         assert!(
             power_after < power_before * 0.02,
             "power before={power_before:.0} after={power_after:.0}"
@@ -189,14 +216,16 @@ mod tests {
         let len = samples.len().min(90_000 - offset);
         audio[offset..offset + len].copy_from_slice(&samples[..len]);
 
-        let power_before: f32 =
-            audio.iter().map(|&s| (s as f32).powi(2)).sum::<f32>() / audio.len() as f32;
+        // f64 accumulator: see note in the test above — keep the running
+        // sum in f64 to avoid catastrophic precision loss before dividing.
+        let power_before: f64 =
+            audio.iter().map(|&s| (s as f64).powi(2)).sum::<f64>() / audio.len() as f64;
 
         let result = synthetic_result(msg, 1500.0, 0.0);
         subtract_signal(&mut audio, &result);
 
-        let power_after: f32 =
-            audio.iter().map(|&s| (s as f32).powi(2)).sum::<f32>() / audio.len() as f32;
+        let power_after: f64 =
+            audio.iter().map(|&s| (s as f64).powi(2)).sum::<f64>() / audio.len() as f64;
 
         assert!(
             power_after < power_before * 0.10,
