@@ -206,15 +206,13 @@ mod diag_tests {
     use crate::core::{DecodeContext, FecOpts, MessageCodec};
     use crate::fec::{ConvFano232, FecCodec};
     use crate::msg::Jt72Codec;
-    use std::path::Path;
 
     #[test]
     #[ignore]
     fn test_decode_at_golden_alignment() {
-        let path = Path::new("/home/ubuntu/src/WSJT-X/samples/JT9/130418_1742.wav");
-        if !path.exists() {
+        let Some(path) = crate::jt9::wsjtx_sample("JT9/130418_1742.wav") else {
             return;
-        }
+        };
         let bytes = std::fs::read(path).unwrap();
         let dl = u32::from_le_bytes([bytes[40], bytes[41], bytes[42], bytes[43]]) as usize;
         let data = &bytes[44..44 + dl];
@@ -257,11 +255,9 @@ mod diag_tests {
     #[test]
     #[ignore]
     fn rx_aligned_sweep_all_golden() {
-        let path = Path::new("/home/ubuntu/src/WSJT-X/samples/JT9/130418_1742.wav");
-        if !path.exists() {
-            eprintln!("WAV not found");
+        let Some(path) = crate::jt9::wsjtx_sample("JT9/130418_1742.wav") else {
             return;
-        }
+        };
         let bytes = std::fs::read(path).unwrap();
         let dl = u32::from_le_bytes([bytes[40], bytes[41], bytes[42], bytes[43]]) as usize;
         let audio: Vec<f32> = bytes[44..44 + dl]
@@ -327,10 +323,9 @@ mod diag_tests {
 #[ignore]
 #[allow(clippy::collapsible_if)]
 fn freq_sweep_1224hz() {
-    let path = std::path::Path::new("/home/ubuntu/src/WSJT-X/samples/JT9/130418_1742.wav");
-    if !path.exists() {
+    let Some(path) = crate::jt9::wsjtx_sample("JT9/130418_1742.wav") else {
         return;
-    }
+    };
     let bytes = std::fs::read(path).unwrap();
     let dl = u32::from_le_bytes([bytes[40], bytes[41], bytes[42], bytes[43]]) as usize;
     let audio: Vec<f32> = bytes[44..44 + dl]
@@ -365,10 +360,9 @@ fn freq_sweep_1224hz() {
 #[ignore]
 #[allow(clippy::collapsible_if)]
 fn wide_freq_time_sweep() {
-    let path = std::path::Path::new("/home/ubuntu/src/WSJT-X/samples/JT9/130418_1742.wav");
-    if !path.exists() {
+    let Some(path) = crate::jt9::wsjtx_sample("JT9/130418_1742.wav") else {
         return;
-    }
+    };
     let bytes = std::fs::read(path).unwrap();
     let dl = u32::from_le_bytes([bytes[40], bytes[41], bytes[42], bytes[43]]) as usize;
     let audio: Vec<f32> = bytes[44..44 + dl]

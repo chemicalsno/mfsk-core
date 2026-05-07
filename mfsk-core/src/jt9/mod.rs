@@ -51,6 +51,41 @@ pub use search::{SearchParams, SyncCandidate, coarse_search};
 pub use sync_pattern::{JT9_ISYNC, JT9_SYNC_BLOCKS, JT9_SYNC_POSITIONS};
 pub use tx::{encode_channel_symbols, synthesize_audio, synthesize_standard};
 
+/// Resolve a path under the WSJT-X samples directory for diagnostic
+/// tests. Returns `Some(path)` only when `WSJTX_SAMPLES_DIR` is set in
+/// the test process's environment **and** the resolved file exists on
+/// disk. In every other case logs a `skipping —` line via `eprintln!`
+/// and returns `None`, so callers can early-return with a single
+/// `let Some(path) = ... else { return; };` and produce no
+/// false-positive "passed" without ever having read a sample.
+///
+/// The WSJT-X sample tarball is not redistributable in-tree, so these
+/// paths can only be resolved on a developer machine that already has
+/// it cloned out. Run with the env var set:
+///
+/// ```sh
+/// WSJTX_SAMPLES_DIR=/path/to/WSJT-X/samples \
+///     cargo test -p mfsk-core --features full --release \
+///     -- --include-ignored --nocapture
+/// ```
+///
+/// Resolved at runtime via [`std::env::var`], so the same compiled
+/// test binary works against different sample trees without
+/// recompilation.
+#[cfg(test)]
+pub(crate) fn wsjtx_sample(rel: &str) -> Option<std::path::PathBuf> {
+    let Ok(dir) = std::env::var("WSJTX_SAMPLES_DIR") else {
+        eprintln!("skipping {rel} — WSJTX_SAMPLES_DIR not set");
+        return None;
+    };
+    let path = std::path::Path::new(&dir).join(rel);
+    if !path.exists() {
+        eprintln!("skipping {rel} — sample not found at {}", path.display());
+        return None;
+    }
+    Some(path)
+}
+
 /// Top-level convenience: decode a JT9 signal at a known (start_sample,
 /// base_freq) and return the recovered message if Fano converges.
 pub fn decode_at(

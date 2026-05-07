@@ -111,7 +111,6 @@ mod gate_diag {
     use super::*;
     use crate::core::DecodeContext;
     use crate::msg::Jt72Codec;
-    use std::path::Path;
 
     /// Walk specific frequencies (the missing JT9 goldens) through the
     /// pipeline manually so we can see *where* they drop: peakdt9
@@ -120,11 +119,9 @@ mod gate_diag {
     #[test]
     #[ignore]
     fn probe_missing_goldens() {
-        let path = Path::new("/home/ubuntu/src/WSJT-X/samples/JT9/130418_1742.wav");
-        if !path.exists() {
-            eprintln!("skipping — sample not found");
+        let Some(path) = crate::jt9::wsjtx_sample("JT9/130418_1742.wav") else {
             return;
-        }
+        };
         let bytes = std::fs::read(path).unwrap();
         let dl = u32::from_le_bytes([bytes[40], bytes[41], bytes[42], bytes[43]]) as usize;
         let audio: Vec<f32> = bytes[44..44 + dl]

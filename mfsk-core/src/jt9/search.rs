@@ -264,16 +264,13 @@ mod tests {
 #[cfg(test)]
 mod diag_tests {
     use super::*;
-    use std::path::Path;
 
     #[test]
     #[ignore]
     fn jt9_coarse_diag() {
-        let path = Path::new("/home/ubuntu/src/WSJT-X/samples/JT9/130418_1742.wav");
-        if !path.exists() {
-            eprintln!("WAV not found");
+        let Some(path) = crate::jt9::wsjtx_sample("JT9/130418_1742.wav") else {
             return;
-        }
+        };
         let bytes = std::fs::read(path).unwrap();
         let data_len = u32::from_le_bytes([bytes[40], bytes[41], bytes[42], bytes[43]]) as usize;
         let data = &bytes[44..44 + data_len];

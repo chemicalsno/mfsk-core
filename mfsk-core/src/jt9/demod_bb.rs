@@ -269,12 +269,10 @@ mod sync_diag {
     #[test]
     #[ignore]
     fn print_sync_scores_dense() {
-        let path = Path::new("/home/ubuntu/src/WSJT-X/samples/JT9/130418_1742.wav");
-        if !path.exists() {
-            eprintln!("WAV not found");
+        let Some(path) = crate::jt9::wsjtx_sample("JT9/130418_1742.wav") else {
             return;
-        }
-        let audio = load_wav(path).unwrap();
+        };
+        let audio = load_wav(&path).unwrap();
 
         // For 1346 Hz: compare mixing at 1345.5 (coarse) vs 1345.5+0.434=1345.934 Hz
         eprintln!("=== 1346 Hz: score at start_bb=1296..1566 for different mix freqs ===");
@@ -395,12 +393,10 @@ mod sync_diag {
         }
 
         // 3) Now do same for WAV at 1346 Hz, best position
-        let wav_path = Path::new("/home/ubuntu/src/WSJT-X/samples/JT9/130418_1742.wav");
-        if !wav_path.exists() {
-            eprintln!("WAV not found");
+        let Some(wav_path) = crate::jt9::wsjtx_sample("JT9/130418_1742.wav") else {
             return;
-        }
-        let audio = load_wav(wav_path).unwrap();
+        };
+        let audio = load_wav(&wav_path).unwrap();
         let (wav_id, wav_qd) = mix_to_baseband(&audio, 1346.0);
 
         // Scan widely for: (a) sync_score peak; (b) max signal energy in tone bins
@@ -548,12 +544,10 @@ mod sync_diag {
         use crate::fec::{ConvFano232, FecCodec};
         use crate::msg::Jt72Codec;
 
-        let path = Path::new("/home/ubuntu/src/WSJT-X/samples/JT9/130418_1742.wav");
-        if !path.exists() {
-            eprintln!("WAV not found");
+        let Some(path) = crate::jt9::wsjtx_sample("JT9/130418_1742.wav") else {
             return;
-        }
-        let audio = load_wav(path).unwrap();
+        };
+        let audio = load_wav(&path).unwrap();
 
         for &(nom_freq, label) in &[
             (1224.0f32, "1224 Hz K1JT KF4RWA 73 dt=0.1"),
