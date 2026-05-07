@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.5.11 — embedded-build hotfix on top of 0.5.10
+
+`mfsk-core` 0.5.10 published cleanly to crates.io (the `--features full`
+build used by the publish step has `std`), but the release-artifact
+jobs for `mfsk-ffi-ft8` on Xtensa ESP32 / ESP32-S3 failed: the new
+`build_jt9_mettab` / `jt9_branch_metrics` helpers in `fec/conv/mod.rs`
+called `f32::round`, which lives in `std`, not `core`. Under the
+embedded `no_std + alloc` configuration that compiled against the
+stale `(crates.io: 0.5.10)` mfsk-core lib, that resolves to an
+unresolved-method error.
+
+Fix: import `num_traits::Float` under `#[cfg(not(feature = "std"))]`
+in `fec/conv/mod.rs`, matching the pattern already used in
+`fec/conv/fano.rs`. Also gates `wspr::decode` / `wspr::demod` and
+`ft8::subtract` behind the FFT-backend features so the
+single-protocol matrix entries (`--features wspr`, `--features ft8`,
+etc.) actually build — these were three pre-existing breakages
+that ci.yml had been catching since 0.5.5 but were silently
+tolerated under the `--features full` umbrella that local testing
+covered. 13/13 matrix entries now green.
+
+No semantic changes vs 0.5.10. The crates.io 0.5.10 publish stays
+as-is (libcore consumers were unaffected); 0.5.11 supersedes it
+for everyone, and the embedded `mfsk-ffi-ft8` 0.5.10 binaries that
+0.5.10's release CD never produced are first published at 0.5.11.
+
 ## 0.5.10 — JT9 WSJT-X recall 5/5, FT4 SIC, depth/strictness + AP IF wiring
 
 ### JT9 — issue [#19](https://github.com/jl1nie/mfsk-core/issues/19) closed (1/5 → 5/5)
