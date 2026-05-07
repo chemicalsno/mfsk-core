@@ -32,6 +32,16 @@ use crate::core::dsp::subtract::{subtract_tones, subtract_tones_lpf};
 // behavioural tuning lands in one place.
 use super::decode::FT4_SUBTRACT;
 
+/// Reconstruct the 4-GFSK channel symbols for a decoded FT4 result.
+///
+/// Returns `None` if `result.message77()` is shorter than 77 bits, which
+/// shouldn't happen for an FT4 decode but is handled defensively so the
+/// public subtract APIs become no-ops rather than panicking.
+fn get_tones(result: &DecodeResult) -> Option<Vec<u8>> {
+    let m77 = <[u8; 77]>::try_from(result.message77()).ok()?;
+    Some(message_to_tones(&m77))
+}
+
 /// Subtract a decoded FT4 signal from `audio` in-place (full amplitude).
 #[inline]
 pub fn subtract_signal(audio: &mut [i16], result: &DecodeResult) {
@@ -43,11 +53,10 @@ pub fn subtract_signal(audio: &mut [i16], result: &DecodeResult) {
 /// variation that would otherwise leave a negative residual.
 #[inline]
 pub fn subtract_signal_weighted(audio: &mut [i16], result: &DecodeResult, gain: f32) {
-    let m77 = match <[u8; 77]>::try_from(result.message77()) {
-        Ok(arr) => arr,
-        Err(_) => return, // info shorter than 77 bits — shouldn't happen for FT4
+    let tones = match get_tones(result) {
+        Some(t) => t,
+        None => return,
     };
-    let tones = message_to_tones(&m77);
     subtract_tones(
         audio,
         &tones,
@@ -68,11 +77,10 @@ pub fn subtract_signal_weighted(audio: &mut [i16], result: &DecodeResult, gain: 
 /// near-clean signal removal. Falls back to a no-op when audio is
 /// shorter than the FT4 frame.
 pub fn subtract_signal_lpf(audio: &mut [i16], result: &DecodeResult) {
-    let m77 = match <[u8; 77]>::try_from(result.message77()) {
-        Ok(arr) => arr,
-        Err(_) => return, // info shorter than 77 bits — shouldn't happen for FT4
+    let tones = match get_tones(result) {
+        Some(t) => t,
+        None => return,
     };
-    let tones = message_to_tones(&m77);
     subtract_tones_lpf(
         audio,
         &tones,
@@ -98,13 +106,12 @@ pub fn subtract_signal_lpf(audio: &mut [i16], result: &DecodeResult) {
 /// this is ~1 ms per signal — call once per decoded result rather than
 /// per pass-2 candidate.
 pub fn refine_signal_freq(audio: &[i16], result: &DecodeResult) -> f32 {
-    let m77 = match <[u8; 77]>::try_from(result.message77()) {
-        Ok(arr) => arr,
-        // info shorter than 77 bits — shouldn't happen for FT4. Fall back
-        // to the unrefined freq so callers see a stable result.
-        Err(_) => return result.freq_hz,
+    // info shorter than 77 bits — shouldn't happen for FT4. Fall back
+    // to the unrefined freq so callers see a stable result.
+    let tones = match get_tones(result) {
+        Some(t) => t,
+        None => return result.freq_hz,
     };
-    let tones = message_to_tones(&m77);
     crate::core::dsp::subtract::refine_freq(
         audio,
         &tones,
