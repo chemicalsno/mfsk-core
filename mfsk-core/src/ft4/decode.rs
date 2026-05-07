@@ -131,6 +131,7 @@ pub fn decode_frame_with_cache(
         freq_min,
         freq_max,
         sync_min,
+        None,
         DecodeDepth::BpAllOsd,
         DecodeStrictness::Normal,
         max_cand,
@@ -143,11 +144,16 @@ pub fn decode_frame_with_cache(
 /// Added per Gemini's review on PR #21 (Tier 1.3) so callers driving
 /// pipelined subtraction can match the Fast / Normal / Deep menu
 /// without going through the legacy hardcoded shim.
+///
+/// `freq_hint`: when `Some(f)`, narrows the coarse-sync to candidates
+/// near `f`. Pass `None` for full-band scan. Mirrors
+/// [`decode_frame_with_options`] for parity.
 pub fn decode_frame_with_cache_and_options(
     audio: &[i16],
     freq_min: f32,
     freq_max: f32,
     sync_min: f32,
+    freq_hint: Option<f32>,
     depth: DecodeDepth,
     strictness: DecodeStrictness,
     max_cand: usize,
@@ -158,7 +164,7 @@ pub fn decode_frame_with_cache_and_options(
         freq_min,
         freq_max,
         sync_min,
-        None,
+        freq_hint,
         depth,
         max_cand,
         strictness,
@@ -181,6 +187,7 @@ pub fn decode_frame_subtract(
         freq_min,
         freq_max,
         sync_min,
+        None,
         DecodeDepth::BpAllOsd,
         DecodeStrictness::Normal,
         max_cand,
@@ -193,11 +200,16 @@ pub fn decode_frame_subtract(
 /// Added per Gemini's review on PR #21 (Tier 1.3) so SIC callers can
 /// match the Fast / Normal / Deep menu without going through the
 /// legacy hardcoded shim.
+///
+/// `freq_hint`: when `Some(f)`, narrows the coarse-sync to candidates
+/// near `f`. Pass `None` for full-band scan. Mirrors
+/// [`decode_frame_with_options`] for parity.
 pub fn decode_frame_subtract_with_options(
     audio: &[i16],
     freq_min: f32,
     freq_max: f32,
     sync_min: f32,
+    freq_hint: Option<f32>,
     depth: DecodeDepth,
     strictness: DecodeStrictness,
     max_cand: usize,
@@ -209,7 +221,7 @@ pub fn decode_frame_subtract_with_options(
         freq_min,
         freq_max,
         sync_min,
-        None,
+        freq_hint,
         depth,
         max_cand,
         strictness,
@@ -315,7 +327,7 @@ mod tests {
                 DecodeStrictness::Deep,
             ] {
                 let _ = decode_frame_with_cache_and_options(
-                    &empty, 100.0, 3000.0, 1.0, depth, strict, 5,
+                    &empty, 100.0, 3000.0, 1.0, None, depth, strict, 5,
                 );
             }
         }
@@ -333,7 +345,7 @@ mod tests {
                 DecodeStrictness::Deep,
             ] {
                 let _ = decode_frame_subtract_with_options(
-                    &empty, 100.0, 3000.0, 1.0, depth, strict, 5,
+                    &empty, 100.0, 3000.0, 1.0, None, depth, strict, 5,
                 );
             }
         }
