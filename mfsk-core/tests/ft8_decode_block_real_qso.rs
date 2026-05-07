@@ -24,17 +24,12 @@ use mfsk_core::ft8::decode::{DecodeDepth, DecodeResult, decode_frame};
 use mfsk_core::ft8::decode_block::decode_block;
 use mfsk_core::msg::wsjt77::unpack77;
 
-/// On-air recordings — 12 kHz / mono / i16. Paths are absolute so
-/// the test runs from any CWD.
-///   - Two consecutive slots from `jl1nie/rs-ft8n`'s benchmark data
-///     (4–5 stations each, mid-band)
-///   - WSJT-X reference recording (busy band, 13 stations including
-///     several below −15 dB SNR — stress case)
-const QSO_WAVS: &[&str] = &[
-    "/home/ubuntu/src/rs-ft8n/ft8-bench/testdata/191111_110130.wav",
-    "/home/ubuntu/src/rs-ft8n/ft8-bench/testdata/191111_110200.wav",
-    "/home/ubuntu/src/WSJT-X/samples/FT8/210703_133430.wav",
-];
+#[allow(dead_code)]
+mod common;
+
+/// On-air recordings — 12 kHz / mono / i16. See
+/// [`common::REAL_QSO_WAVS`] for provenance and bit-identity notes.
+const QSO_WAVS: &[&str] = common::REAL_QSO_WAVS;
 
 /// Minimal RIFF/WAVE loader — parses the standard `fmt ` + `data`
 /// chunks and returns mono i16 samples. Bails on anything but

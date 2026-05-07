@@ -31,6 +31,9 @@ use mfsk_core::ft8::decode::{DecodeDepth, decode_frame};
 use mfsk_core::ft8::decode_block::decode_block;
 use mfsk_core::msg::wsjt77::unpack77;
 
+#[allow(dead_code)]
+mod common;
+
 /// (label, path, hardware timing if measured for this WAV).
 type Entry = (&'static str, &'static str, Option<HwTiming>);
 
@@ -53,7 +56,7 @@ const ENTRIES: &[Entry] = &[
     // WSJT-X reference recording (busy band, 7 stations).
     (
         "qso3 busy band  (WSJT-X 210703_133430.wav)",
-        "/home/ubuntu/src/mfsk-core/embedded-poc/assets/qso3_busy.wav",
+        asset_path!("qso3_busy.wav"),
         Some(HwTiming {
             core2_post_slotend_ms: 1434,
             s3_post_slotend_ms: 707,
@@ -61,7 +64,7 @@ const ENTRIES: &[Entry] = &[
     ),
     (
         "qso1 mid-band   (informational, on-air capture)",
-        "/home/ubuntu/src/mfsk-core/embedded-poc/assets/qso1.wav",
+        asset_path!("qso1.wav"),
         Some(HwTiming {
             core2_post_slotend_ms: 1303,
             s3_post_slotend_ms: 574,
@@ -69,7 +72,7 @@ const ENTRIES: &[Entry] = &[
     ),
     (
         "qso2 mid-band   (informational, on-air capture)",
-        "/home/ubuntu/src/mfsk-core/embedded-poc/assets/qso2.wav",
+        asset_path!("qso2.wav"),
         Some(HwTiming {
             core2_post_slotend_ms: 632,
             s3_post_slotend_ms: 370,
