@@ -355,6 +355,42 @@ pub fn decode_frame_with_ap(
     max_cand: usize,
     ap_hint: Option<&ApHint>,
 ) -> Vec<DecodeResult> {
+    decode_frame_with_ap_full(
+        audio,
+        freq_min,
+        freq_max,
+        sync_min,
+        freq_hint,
+        depth,
+        DecodeStrictness::Normal,
+        max_cand,
+        ap_hint,
+    )
+    .0
+}
+
+/// Wide-band decode with AP hint plus configurable strictness, returning
+/// the FFT cache for downstream pipelined passes.
+///
+/// This is the "full" form of [`decode_frame_with_ap`]: it exposes the
+/// [`DecodeStrictness`] knob and returns the 192 k-point FFT cache so a
+/// follow-up [`decode_frame_subtract_with_known`] (or
+/// [`decode_frame_subtract_with_known_and_ap`]) call can reuse it without
+/// recomputing.
+///
+/// `ap_hint = None` reproduces the legacy [`decode_frame_with_cache`]
+/// pipeline bit-for-bit (no AP bits locked).
+pub fn decode_frame_with_ap_full(
+    audio: &[i16],
+    freq_min: f32,
+    freq_max: f32,
+    sync_min: f32,
+    freq_hint: Option<f32>,
+    depth: DecodeDepth,
+    strictness: DecodeStrictness,
+    max_cand: usize,
+    ap_hint: Option<&ApHint>,
+) -> (Vec<DecodeResult>, FftCache) {
     decode_frame_inner(
         audio,
         freq_min,
@@ -363,13 +399,12 @@ pub fn decode_frame_with_ap(
         freq_hint,
         depth,
         max_cand,
-        DecodeStrictness::Normal,
+        strictness,
         &[],
         EqMode::Off,
         None,
         ap_hint,
     )
-    .0
 }
 
 /// Like [`decode_frame`] but also returns the 192k-point FFT cache for
@@ -704,6 +739,13 @@ fn process_candidate(
 /// `known`           — messages already decoded in earlier passes (skipped).
 /// `precomputed_fft` — optional pre-computed 192k-point FFT cache; when `None`
 ///                     the cache is built internally from `audio`.
+/// `ap_hint`         — optional a-priori callsign / grid hint forwarded to
+///                     every per-candidate BP/OSD decode.  When `Some(_)` the
+///                     BP decoder locks the high-confidence AP bits prior to
+///                     iteration, yielding ~1–3 dB gain at threshold when the
+///                     hint matches a station actually on air. Passing `None`
+///                     preserves legacy behavior bit-for-bit (identical LLR
+///                     pipeline; no AP bits are locked).
 ///
 /// Returns `(decoded_results, fft_cache)`.  Callers that don't need the cache
 /// can simply ignore the second element.
@@ -795,6 +837,26 @@ pub fn decode_frame_subtract(
     max_cand: usize,
     strictness: DecodeStrictness,
 ) -> Vec<DecodeResult> {
+    decode_frame_subtract_with_ap(
+        audio, freq_min, freq_max, sync_min, freq_hint, depth, max_cand, strictness, None,
+    )
+}
+
+/// Like [`decode_frame_subtract`] but forwards an `ap_hint` to every
+/// per-candidate decode in every subtract pass.
+///
+/// `ap_hint = None` reproduces [`decode_frame_subtract`] bit-for-bit.
+pub fn decode_frame_subtract_with_ap(
+    audio: &[i16],
+    freq_min: f32,
+    freq_max: f32,
+    sync_min: f32,
+    freq_hint: Option<f32>,
+    depth: DecodeDepth,
+    max_cand: usize,
+    strictness: DecodeStrictness,
+    ap_hint: Option<&ApHint>,
+) -> Vec<DecodeResult> {
     let mut residual = audio.to_vec();
     let mut all_results: Vec<DecodeResult> = Vec::new();
 
@@ -813,7 +875,7 @@ pub fn decode_frame_subtract(
             &all_results,
             EqMode::Off,
             None,
-            None,
+            ap_hint,
         );
 
         for r in &new {
@@ -849,6 +911,40 @@ pub fn decode_frame_subtract_with_known(
     known: &[DecodeResult],
     precomputed_fft: Option<FftCache>,
 ) -> Vec<DecodeResult> {
+    decode_frame_subtract_with_known_and_ap(
+        audio,
+        freq_min,
+        freq_max,
+        sync_min,
+        freq_hint,
+        depth,
+        max_cand,
+        strictness,
+        known,
+        precomputed_fft,
+        None,
+    )
+}
+
+/// Like [`decode_frame_subtract_with_known`] but also forwards an
+/// `ap_hint` to every per-candidate decode in every subtract pass.
+///
+/// `ap_hint = None` reproduces [`decode_frame_subtract_with_known`]
+/// bit-for-bit.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_frame_subtract_with_known_and_ap(
+    audio: &[i16],
+    freq_min: f32,
+    freq_max: f32,
+    sync_min: f32,
+    freq_hint: Option<f32>,
+    depth: DecodeDepth,
+    max_cand: usize,
+    strictness: DecodeStrictness,
+    known: &[DecodeResult],
+    precomputed_fft: Option<FftCache>,
+    ap_hint: Option<&ApHint>,
+) -> Vec<DecodeResult> {
     let mut residual = audio.to_vec();
     let mut all_results: Vec<DecodeResult> = known.to_vec();
     let known_count = known.len();
@@ -876,7 +972,7 @@ pub fn decode_frame_subtract_with_known(
             &all_results,
             EqMode::Off,
             fft,
-            None,
+            ap_hint,
         );
 
         for r in &new {
@@ -1169,6 +1265,120 @@ mod tests {
             r_ap_none.iter().map(|r| r.message77).collect::<Vec<_>>(),
             "ap_hint=None must match legacy decode_frame exactly"
         );
+    }
+
+    /// Compile-shape: `decode_frame_with_ap_full` accepts all parameter
+    /// combinations and returns the FFT cache alongside the decode list.
+    /// On a silent buffer the result list must be empty and the cache
+    /// must be non-empty (FFT is built unconditionally).
+    #[test]
+    fn decode_frame_with_ap_full_silence_shape() {
+        let audio = vec![0i16; 15 * 12_000];
+        let ap = ApHint::new().with_call1("CQ").with_call2("K1ABC");
+
+        // ap_hint = None
+        let (r0, c0) = decode_frame_with_ap_full(
+            &audio,
+            200.0,
+            2800.0,
+            1.0,
+            None,
+            DecodeDepth::Bp,
+            DecodeStrictness::Normal,
+            10,
+            None,
+        );
+        assert!(r0.is_empty());
+        assert!(!c0.is_empty(), "FFT cache should be returned");
+
+        // ap_hint = Some, strictness = Strict
+        let (r1, c1) = decode_frame_with_ap_full(
+            &audio,
+            200.0,
+            2800.0,
+            1.0,
+            Some(1500.0),
+            DecodeDepth::BpAllOsd,
+            DecodeStrictness::Strict,
+            10,
+            Some(&ap),
+        );
+        assert!(r1.is_empty());
+        assert!(!c1.is_empty());
+    }
+
+    /// Compile-shape: `decode_frame_subtract_with_ap` accepts an AP hint
+    /// and returns no decodes on silence.
+    #[test]
+    fn decode_frame_subtract_with_ap_silence_shape() {
+        let audio = vec![0i16; 15 * 12_000];
+        let ap = ApHint::new().with_call1("CQ").with_call2("W7VV");
+
+        let r_none = decode_frame_subtract_with_ap(
+            &audio,
+            200.0,
+            2800.0,
+            1.0,
+            None,
+            DecodeDepth::Bp,
+            10,
+            DecodeStrictness::Normal,
+            None,
+        );
+        assert!(r_none.is_empty());
+
+        let r_some = decode_frame_subtract_with_ap(
+            &audio,
+            200.0,
+            2800.0,
+            1.0,
+            None,
+            DecodeDepth::Bp,
+            10,
+            DecodeStrictness::Normal,
+            Some(&ap),
+        );
+        assert!(r_some.is_empty());
+    }
+
+    /// Compile-shape: `decode_frame_subtract_with_known_and_ap` accepts
+    /// the full parameter set (known list + FFT cache + AP hint) and
+    /// returns no decodes on silence.
+    #[test]
+    fn decode_frame_subtract_with_known_and_ap_silence_shape() {
+        let audio = vec![0i16; 15 * 12_000];
+        let ap = ApHint::new().with_call1("CQ").with_call2("JA1ABC");
+        let known: Vec<DecodeResult> = Vec::new();
+
+        let r_none = decode_frame_subtract_with_known_and_ap(
+            &audio,
+            200.0,
+            2800.0,
+            1.0,
+            None,
+            DecodeDepth::Bp,
+            10,
+            DecodeStrictness::Normal,
+            &known,
+            None,
+            None,
+        );
+        assert!(r_none.is_empty());
+
+        let r_some = decode_frame_subtract_with_known_and_ap(
+            &audio,
+            200.0,
+            2800.0,
+            1.0,
+            None,
+            DecodeDepth::Bp,
+            10,
+            DecodeStrictness::Normal,
+            &known,
+            None,
+            Some(&ap),
+        );
+        assert!(r_some.is_empty());
     }
 
     /// Silence produces no decoded messages and does not panic.
