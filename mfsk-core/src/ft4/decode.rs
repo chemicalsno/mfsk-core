@@ -126,6 +126,32 @@ pub fn decode_frame_with_cache(
     sync_min: f32,
     max_cand: usize,
 ) -> (Vec<DecodeResult>, FftCache) {
+    decode_frame_with_cache_and_options(
+        audio,
+        freq_min,
+        freq_max,
+        sync_min,
+        DecodeDepth::BpAllOsd,
+        DecodeStrictness::Normal,
+        max_cand,
+    )
+}
+
+/// Same as [`decode_frame_with_cache`] but with explicit `depth` +
+/// `strictness` knobs (see [`decode_frame_with_options`]).
+///
+/// Added per Gemini's review on PR #21 (Tier 1.3) so callers driving
+/// pipelined subtraction can match the Fast / Normal / Deep menu
+/// without going through the legacy hardcoded shim.
+pub fn decode_frame_with_cache_and_options(
+    audio: &[i16],
+    freq_min: f32,
+    freq_max: f32,
+    sync_min: f32,
+    depth: DecodeDepth,
+    strictness: DecodeStrictness,
+    max_cand: usize,
+) -> (Vec<DecodeResult>, FftCache) {
     pipeline::decode_frame::<Ft4>(
         audio,
         &FT4_DOWNSAMPLE,
@@ -133,9 +159,9 @@ pub fn decode_frame_with_cache(
         freq_max,
         sync_min,
         None,
-        DecodeDepth::BpAllOsd,
+        depth,
         max_cand,
-        DecodeStrictness::Normal,
+        strictness,
         EqMode::Off,
         REFINE_STEPS,
         SYNC_Q_MIN,
@@ -150,6 +176,32 @@ pub fn decode_frame_subtract(
     sync_min: f32,
     max_cand: usize,
 ) -> Vec<DecodeResult> {
+    decode_frame_subtract_with_options(
+        audio,
+        freq_min,
+        freq_max,
+        sync_min,
+        DecodeDepth::BpAllOsd,
+        DecodeStrictness::Normal,
+        max_cand,
+    )
+}
+
+/// Same as [`decode_frame_subtract`] but with explicit `depth` +
+/// `strictness` knobs (see [`decode_frame_with_options`]).
+///
+/// Added per Gemini's review on PR #21 (Tier 1.3) so SIC callers can
+/// match the Fast / Normal / Deep menu without going through the
+/// legacy hardcoded shim.
+pub fn decode_frame_subtract_with_options(
+    audio: &[i16],
+    freq_min: f32,
+    freq_max: f32,
+    sync_min: f32,
+    depth: DecodeDepth,
+    strictness: DecodeStrictness,
+    max_cand: usize,
+) -> Vec<DecodeResult> {
     pipeline::decode_frame_subtract::<Ft4>(
         audio,
         &FT4_DOWNSAMPLE,
@@ -158,9 +210,9 @@ pub fn decode_frame_subtract(
         freq_max,
         sync_min,
         None,
-        DecodeDepth::BpAllOsd,
+        depth,
         max_cand,
-        DecodeStrictness::Normal,
+        strictness,
         REFINE_STEPS,
         SYNC_Q_MIN,
     )
@@ -172,6 +224,32 @@ pub fn decode_frame_subtract(
 pub fn decode_sniper_ap(
     audio: &[i16],
     target_freq: f32,
+    max_cand: usize,
+    eq_mode: EqMode,
+    ap_hint: Option<&ApHint>,
+) -> Vec<DecodeResult> {
+    decode_sniper_ap_with_options(
+        audio,
+        target_freq,
+        DecodeDepth::BpAllOsd,
+        DecodeStrictness::Normal,
+        max_cand,
+        eq_mode,
+        ap_hint,
+    )
+}
+
+/// Same as [`decode_sniper_ap`] but with explicit `depth` +
+/// `strictness` knobs (see [`decode_frame_with_options`]).
+///
+/// Added per Gemini's review on PR #21 (Tier 1.3) so sniper + AP
+/// callers can match the Fast / Normal / Deep menu without going
+/// through the legacy hardcoded shim.
+pub fn decode_sniper_ap_with_options(
+    audio: &[i16],
+    target_freq: f32,
+    depth: DecodeDepth,
+    strictness: DecodeStrictness,
     max_cand: usize,
     eq_mode: EqMode,
     ap_hint: Option<&ApHint>,
@@ -190,9 +268,9 @@ pub fn decode_sniper_ap(
         // can recover signals whose coarse-sync score wouldn't qualify for
         // a bare decode — we still need candidates to attempt the lock on.
         0.5,
-        DecodeDepth::BpAllOsd,
+        depth,
         max_cand,
-        DecodeStrictness::Normal,
+        strictness,
         eq_mode,
         REFINE_STEPS,
         // Halve the sync-quality gate for AP: locked bits carry the
@@ -221,6 +299,66 @@ mod tests {
             ] {
                 let _ =
                     decode_frame_with_options(&empty, 100.0, 3000.0, 1.0, None, depth, strict, 5);
+            }
+        }
+    }
+
+    /// Compile-time check that `decode_frame_with_cache_and_options`
+    /// accepts every combination of `DecodeDepth` × `DecodeStrictness`.
+    #[test]
+    fn decode_frame_with_cache_and_options_accepts_all_param_combos() {
+        let empty = vec![0i16; 12 * 7500];
+        for &depth in &[DecodeDepth::Bp, DecodeDepth::BpAll, DecodeDepth::BpAllOsd] {
+            for &strict in &[
+                DecodeStrictness::Strict,
+                DecodeStrictness::Normal,
+                DecodeStrictness::Deep,
+            ] {
+                let _ = decode_frame_with_cache_and_options(
+                    &empty, 100.0, 3000.0, 1.0, depth, strict, 5,
+                );
+            }
+        }
+    }
+
+    /// Compile-time check that `decode_frame_subtract_with_options`
+    /// accepts every combination of `DecodeDepth` × `DecodeStrictness`.
+    #[test]
+    fn decode_frame_subtract_with_options_accepts_all_param_combos() {
+        let empty = vec![0i16; 12 * 7500];
+        for &depth in &[DecodeDepth::Bp, DecodeDepth::BpAll, DecodeDepth::BpAllOsd] {
+            for &strict in &[
+                DecodeStrictness::Strict,
+                DecodeStrictness::Normal,
+                DecodeStrictness::Deep,
+            ] {
+                let _ = decode_frame_subtract_with_options(
+                    &empty, 100.0, 3000.0, 1.0, depth, strict, 5,
+                );
+            }
+        }
+    }
+
+    /// Compile-time check that `decode_sniper_ap_with_options` accepts
+    /// every combination of `DecodeDepth` × `DecodeStrictness`.
+    #[test]
+    fn decode_sniper_ap_with_options_accepts_all_param_combos() {
+        let empty = vec![0i16; 12 * 7500];
+        for &depth in &[DecodeDepth::Bp, DecodeDepth::BpAll, DecodeDepth::BpAllOsd] {
+            for &strict in &[
+                DecodeStrictness::Strict,
+                DecodeStrictness::Normal,
+                DecodeStrictness::Deep,
+            ] {
+                let _ = decode_sniper_ap_with_options(
+                    &empty,
+                    1500.0,
+                    depth,
+                    strict,
+                    5,
+                    EqMode::Off,
+                    None,
+                );
             }
         }
     }
