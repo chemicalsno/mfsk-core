@@ -36,14 +36,15 @@ pub const FT4_DOWNSAMPLE: DownsampleCfg = DownsampleCfg {
 };
 
 /// FT4 subtract configuration: 48 ms symbols, frame origin at 0.5 s.
-/// GFSK shaping matches WSJT-X FT4 transmitter (BT=2.0, hmod=1.0).
+/// GFSK shaping matches WSJT-X FT4 (`lib/ft4/subtractft4.f90` declares
+/// `bt=1.0`; `lib/ft4/gen_ft4wave.f90` calls `gfsk_pulse(1.0, tt)`).
 pub const FT4_SUBTRACT: SubtractCfg = SubtractCfg {
     sample_rate: 12_000.0,
     tone_spacing_hz: 20.833,
     samples_per_symbol: 576,
     base_offset_s: 0.5,
     gfsk: Some(crate::core::dsp::subtract::GfskParams {
-        bt: 2.0,
+        bt: 1.0,
         hmod: 1.0,
         ramp_samples: 576 / 8,
     }),

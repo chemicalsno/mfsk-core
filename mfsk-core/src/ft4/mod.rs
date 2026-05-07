@@ -51,7 +51,7 @@ impl ModulationParams for Ft4 {
     const SYMBOL_DT: f32 = 0.048;
     const TONE_SPACING_HZ: f32 = 20.833;
     const GRAY_MAP: &'static [u8] = &[0, 1, 3, 2];
-    const GFSK_BT: f32 = 2.0;
+    const GFSK_BT: f32 = 1.0;
     const GFSK_HMOD: f32 = 1.0;
     const NFFT_PER_SYMBOL_FACTOR: u32 = 4; // NFFT1 = 4 × NSPS = 2304
     const NSTEP_PER_SYMBOL: u32 = 2; // half-symbol coarse-sync step (24 ms)
