@@ -18,9 +18,9 @@ use mfsk_core::ft8::decode_block::decode_block;
 use mfsk_core::msg::wsjt77::unpack77;
 
 const QSO_WAVS: &[&str] = &[
-    "/home/minoru/src/rs-ft8n/ft8-bench/testdata/191111_110130.wav",
-    "/home/minoru/src/rs-ft8n/ft8-bench/testdata/191111_110200.wav",
-    "/home/minoru/src/WSJT-X/samples/FT8/210703_133430.wav",
+    "/home/ubuntu/src/rs-ft8n/ft8-bench/testdata/191111_110130.wav",
+    "/home/ubuntu/src/rs-ft8n/ft8-bench/testdata/191111_110200.wav",
+    "/home/ubuntu/src/WSJT-X/samples/FT8/210703_133430.wav",
 ];
 
 fn load_wav_i16(path: &Path) -> Vec<i16> {

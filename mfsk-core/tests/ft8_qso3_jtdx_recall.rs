@@ -26,7 +26,7 @@ use mfsk_core::ft8::decode::DecodeDepth;
 use mfsk_core::ft8::decode_block::decode_block;
 use mfsk_core::msg::wsjt77::unpack77;
 
-const QSO3_PATH: &str = "/home/minoru/src/mfsk-core/embedded-poc/assets/qso3_busy.wav";
+const QSO3_PATH: &str = "/home/ubuntu/src/mfsk-core/embedded-poc/assets/qso3_busy.wav";
 
 /// JTDX **AP-off** decode of the official sample WAV (= more
 /// aggressive reference than WSJT-X). 18 entries. F5RXL CQ @1197 is

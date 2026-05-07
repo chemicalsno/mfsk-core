@@ -31,9 +31,9 @@ use mfsk_core::msg::wsjt77::unpack77;
 ///   - WSJT-X reference recording (busy band, 13 stations including
 ///     several below −15 dB SNR — stress case)
 const QSO_WAVS: &[&str] = &[
-    "/home/minoru/src/rs-ft8n/ft8-bench/testdata/191111_110130.wav",
-    "/home/minoru/src/rs-ft8n/ft8-bench/testdata/191111_110200.wav",
-    "/home/minoru/src/WSJT-X/samples/FT8/210703_133430.wav",
+    "/home/ubuntu/src/rs-ft8n/ft8-bench/testdata/191111_110130.wav",
+    "/home/ubuntu/src/rs-ft8n/ft8-bench/testdata/191111_110200.wav",
+    "/home/ubuntu/src/WSJT-X/samples/FT8/210703_133430.wav",
 ];
 
 /// Minimal RIFF/WAVE loader — parses the standard `fmt ` + `data`

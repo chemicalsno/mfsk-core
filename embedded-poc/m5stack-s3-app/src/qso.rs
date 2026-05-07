@@ -1,6 +1,6 @@
 //! QSO finite state machine (Phase 4).
 //!
-//! 参照: `/home/minoru/src/rs-ft8n/docs/qso.js` クラス `QsoManager`。
+//! 参照: `/home/ubuntu/src/rs-ft8n/docs/qso.js` クラス `QsoManager`。
 //! 状態遷移: IDLE → CALLING → REPORT → FINAL → DONE → IDLE
 //!
 //! - CALLING: 自局 CQ または指定局呼出。retry 5 × 15 s

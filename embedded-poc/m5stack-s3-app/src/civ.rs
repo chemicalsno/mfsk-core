@@ -1,6 +1,6 @@
 //! BLE GATT CI-V transport for IC-705 (Phase 2).
 //!
-//! 参照実装: `/home/minoru/src/rs-ft8n/docs/ble-transport.js` (K7MDL2 方式)。
+//! 参照実装: `/home/ubuntu/src/rs-ft8n/docs/ble-transport.js` (K7MDL2 方式)。
 //! Service UUID: 14cf8001-1ec2-d408-1b04-2eb270f14203
 //! Char UUID:    14cf8002-1ec2-d408-1b04-2eb270f14203
 //!
