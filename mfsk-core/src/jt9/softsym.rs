@@ -192,26 +192,11 @@ pub fn peakdt9(c2: &[Complex<f32>]) -> (i64, f32, Vec<Complex<f32>>) {
     (lagpk, smax, c3)
 }
 
-/// `twkfreq` (constant-frequency variant): apply a frequency shift of
-/// `df_hz` Hz to the complex signal at `FSAMPLE_DOWN` rate. Mirrors
-/// WSJT-X's polynomial form with only `a(1)` non-zero.
-pub fn twkfreq_const(buf: &mut [Complex<f32>], df_hz: f32) {
-    let dphi = -2.0 * std::f32::consts::PI * df_hz / FSAMPLE_DOWN;
-    let step = Complex::new(dphi.cos(), dphi.sin());
-    let mut w = Complex::new(1.0f32, 0.0);
-    for s in buf.iter_mut() {
-        *s = w * *s;
-        w *= step;
-    }
-}
-
-/// `symspec2`: tone-shift c5 by 1.736 Hz × i for i=0..8, coherent-sum
-/// `NSPSD` samples per symbol, then compute max-log-MAP LLRs from
-/// the resulting `ss3[0..7][0..69]` table. Returns 207 LLRs in
-/// channel-symbol (interleaved) order.
-pub fn symspec2(c5: &[Complex<f32>]) -> [f32; 207] {
+/// Compute the WSJT-X `ss2[0..8][0..84]` table — coherent-sum power
+/// per (tone, symbol) over 16-sample windows. Used both for LLRs in
+/// [`symspec2`] and for the [`chkss2`] sync-quality check.
+fn compute_ss2(c5: &[Complex<f32>]) -> [[f32; 85]; 9] {
     assert_eq!(c5.len(), NZ3);
-
     let mut ss2 = [[0.0f32; 85]; 9];
     let mut work: Vec<Complex<f32>> = c5.to_vec();
     let dphi = -2.0 * std::f32::consts::PI * TONE_SPACING / FSAMPLE_DOWN;
@@ -219,8 +204,6 @@ pub fn symspec2(c5: &[Complex<f32>]) -> [f32; 207] {
 
     for i in 0..9usize {
         if i >= 1 {
-            // Shift work down by one tone spacing relative to its
-            // current state: work[k] *= e^{-j 2π Δf k / fs}.
             let mut w = Complex::new(1.0f32, 0.0);
             for s in work.iter_mut() {
                 *s = w * *s;
@@ -236,7 +219,34 @@ pub fn symspec2(c5: &[Complex<f32>]) -> [f32; 207] {
             ss2[i][j] = z.norm_sqr();
         }
     }
+    ss2
+}
 
+/// `chkss2`: average normalised tone-0 power at the 16 sync
+/// positions. Mirrors `lib/chkss2.f90`. Higher = stronger sync
+/// alignment; WSJT-X gates with `schk ≥ 1.5` for non-narrow decode.
+pub fn chkss2(ss2: &[[f32; 85]; 9]) -> f32 {
+    let mut total = 0.0f32;
+    for col in ss2.iter() {
+        for &v in col {
+            total += v;
+        }
+    }
+    let ave = (total / (9.0 * 85.0)).max(1e-9);
+    let mut s1 = 0.0f32;
+    for j in 0..85 {
+        if JT9_ISYNC[j] == 1 {
+            s1 += ss2[0][j] / ave - 1.0;
+        }
+    }
+    s1 / 16.0
+}
+
+/// `symspec2`: tone-shift c5 by 1.736 Hz × i for i=0..8, coherent-sum
+/// `NSPSD` samples per symbol, then compute max-log-MAP LLRs from
+/// the resulting `ss3[0..7][0..69]` table. Returns 207 LLRs in
+/// channel-symbol (interleaved) order.
+fn symspec2_from_ss2(ss2: &[[f32; 85]; 9]) -> [f32; 207] {
     // Build ss3[0..7][0..69] = power for data-tone i+1, data-symbol m+1.
     let mut ss3 = [[0.0f32; 69]; 8];
     for i in 1..9usize {
@@ -322,53 +332,212 @@ pub fn symspec2(c5: &[Complex<f32>]) -> [f32; 207] {
 
 /// Full pipeline: feed `c5` into `symspec2`, deinterleave the
 /// resulting 207 LLRs in place, drop the padding bit, and return
-/// the 206 LLRs ready for `ConvFano232::decode_soft`.
-pub fn llrs_from_c5(c5: &[Complex<f32>]) -> [f32; 206] {
-    let mut s207 = symspec2(c5);
-    // Drop the padding LLR (index 206 in 0-based) and deinterleave
-    // the first 206 in place.
+/// the 206 LLRs ready for `ConvFano232::decode_soft`. Also returns
+/// the [`chkss2`] sync-quality score so callers can apply the
+/// WSJT-X two-stage gate before invoking the Fano decoder.
+pub fn llrs_from_c5(c5: &[Complex<f32>]) -> (f32, [f32; 206]) {
+    let ss2 = compute_ss2(c5);
+    let schk = chkss2(&ss2);
+    let s207 = symspec2_from_ss2(&ss2);
     let mut s206 = [0f32; 206];
     s206.copy_from_slice(&s207[..206]);
     deinterleave_llrs(&mut s206);
-    let _ = &mut s207[206]; // padding ignored
-    s206
+    (schk, s206)
 }
 
-/// Simple AFC: measure residual frequency offset from sync symbols
-/// and return (df_hz). Coarse 1-D parabolic search around 0.
+/// `twkfreq` (polynomial WSJT-X form): apply
+/// `dphi(k) = (a0 + x*a1 + (1.5 x² − 0.5)*a2) * 2π/fs` where
+/// `x = 2*(k − (N+1)/2) / N` runs over [−1, +1] across the buffer.
+/// `a0` is the constant frequency offset in Hz, `a1` is linear drift
+/// (Hz across half the buffer, matching WSJT-X's
+/// "Hz/(0.5·TxT)" units), and `a2` is the parabolic chirp term used
+/// by `afc9` for sync-power optimisation.
 ///
-/// We test mixing offsets in ±1 tone spacing in 0.1-tone steps,
-/// score each by the sync-symbol coherent-sum power, and parabolic-
-/// fit the peak. This is much simpler than the full `afc9` 3-D
-/// chi-square minimisation but captures the dominant contribution.
-pub fn afc_simple(c3: &[Complex<f32>]) -> f32 {
-    let mut best_df = 0.0f32;
-    let mut best_score = f32::NEG_INFINITY;
-    let mut work: Vec<Complex<f32>> = vec![Complex::new(0.0, 0.0); NZ3];
-    let trial: Vec<f32> = (-20i32..=20)
-        .map(|k| k as f32 * 0.1 * TONE_SPACING)
-        .collect();
-    for &df in &trial {
-        work.copy_from_slice(c3);
-        twkfreq_const(&mut work, df);
-        let mut s = 0.0f32;
-        for j in 0..85usize {
-            if JT9_ISYNC[j] == 0 {
-                continue;
-            }
-            let lo = j * NSPSD;
-            let mut z = Complex::new(0.0f32, 0.0);
-            for k in 0..NSPSD {
-                z += work[lo + k];
-            }
-            s += z.norm_sqr();
+/// Sign matches WSJT-X `lib/twkfreq.f90`: positive `a0` shifts the
+/// signal **up** in frequency.
+pub fn twkfreq_poly(buf: &mut [Complex<f32>], a: [f32; 3]) {
+    let n = buf.len() as f32;
+    let x0 = 0.5 * (n + 1.0);
+    let s = 2.0 / n;
+    let two_pi_over_fs = 2.0 * std::f32::consts::PI / FSAMPLE_DOWN;
+    let mut w = Complex::new(1.0f32, 0.0);
+    for (i, slot) in buf.iter_mut().enumerate() {
+        // Fortran is 1-indexed (i = 1..N) — match exactly.
+        let xi = s * ((i as f32 + 1.0) - x0);
+        let p2 = 1.5 * xi * xi - 0.5;
+        let dphi = (a[0] + xi * a[1] + p2 * a[2]) * two_pi_over_fs;
+        let wstep = Complex::new(dphi.cos(), dphi.sin());
+        w *= wstep;
+        *slot = w * *slot;
+    }
+}
+
+/// `shft`: integer-sample circular shift of `c3a` by `n` samples,
+/// zero-filling the wraparound region. Mirrors
+/// `lib/afc9.f90::shft`.
+///
+/// For `n > 0`, samples shift toward lower indices (Fortran `cshift`
+/// convention) and the last `n` samples are zeroed. For `n < 0`,
+/// samples shift toward higher indices and the first `|n|` samples
+/// are zeroed.
+fn shft(c3a: &[Complex<f32>], n: i32) -> Vec<Complex<f32>> {
+    let len = c3a.len();
+    let mut c3 = vec![Complex::new(0.0, 0.0); len];
+    if n == 0 {
+        c3.copy_from_slice(c3a);
+        return c3;
+    }
+    let abs_n = n.unsigned_abs() as usize;
+    if abs_n >= len {
+        return c3; // entirely zeroed
+    }
+    if n > 0 {
+        // c3[i] = c3a[i + n]; last n entries zero.
+        c3[..len - abs_n].copy_from_slice(&c3a[abs_n..]);
+    } else {
+        // c3[i] = c3a[i - |n|]; first |n| entries zero.
+        c3[abs_n..].copy_from_slice(&c3a[..len - abs_n]);
+    }
+    c3
+}
+
+/// `fchisq`: WSJT-X-faithful chi-square objective for `afc9`.
+/// Applies the polynomial `twkfreq` mix to `c3` and returns the
+/// negated sync power (`−sum1/10000`) — smaller is better. Mirrors
+/// `lib/fchisq.f90`.
+fn fchisq(c3: &[Complex<f32>], a: [f32; 3]) -> f32 {
+    let mut work: Vec<Complex<f32>> = c3.to_vec();
+    twkfreq_poly(&mut work, a);
+    let mut sum1 = 0.0f32;
+    for j in 0..85usize {
+        let lo = j * NSPSD;
+        let mut z = Complex::new(0.0f32, 0.0);
+        for k in 0..NSPSD {
+            z += work[lo + k];
         }
-        if s > best_score {
-            best_score = s;
-            best_df = df;
+        if JT9_ISYNC[j] == 1 {
+            sum1 += z.norm_sqr();
         }
     }
-    best_df
+    -sum1 / 10_000.0
+}
+
+/// AFC result from [`afc9`].
+#[derive(Copy, Clone, Debug)]
+#[allow(dead_code)]
+pub struct Afc9Result {
+    /// Constant frequency offset, in Hz. Sign follows WSJT-X
+    /// convention: subtract from the assumed `fpk` to get the
+    /// corrected carrier (`freq = fpk − a0`).
+    pub a0: f32,
+    /// Linear drift parameter. WSJT-X reports `drift = −2·a1` Hz
+    /// per (TxT/2).
+    pub a1: f32,
+    /// Final integer-sample time shift that was applied to `c3a`.
+    pub time_shift: i32,
+    /// Final `−chisqr` value (= `sum1/10000` of the optimised
+    /// alignment). Higher = stronger sync.
+    pub syncpk: f32,
+}
+
+/// `afc9`: 3-parameter chi-square AFC over (frequency, drift,
+/// integer-sample time shift) using WSJT-X's parabolic line search.
+/// Mutates `c3a` in place to apply the discovered integer time shift,
+/// matching `lib/afc9.f90` (where `c3a=c3` at exit).
+///
+/// The caller should subsequently apply [`twkfreq_poly`] with
+/// `[a0, a1, 0]` (i.e. clearing the chirp parameter) to mix down the
+/// signal before symbol detection — same flow as
+/// `lib/softsym.f90:36-44`.
+pub fn afc9(c3a: &mut Vec<Complex<f32>>) -> Afc9Result {
+    let mut a = [0.0f32; 3];
+    let mut deltaa = [TONE_SPACING, TONE_SPACING, 1.0f32];
+    let nterms = 3usize;
+
+    // `a3_applied` tracks the integer shift currently baked into
+    // `c3` — we re-run shft only when `nint(a[2])` changes.
+    let mut c3 = c3a.clone();
+    let mut a3_applied = 0.0f32;
+
+    let mut chisqr = 0.0f32;
+    let mut chisqr0 = 1.0e6f32;
+
+    for _iter in 0..4 {
+        for j in 0..nterms {
+            // Re-shift c3 from c3a if a[2] changed.
+            if (a[2] - a3_applied).abs() > f32::EPSILON {
+                a3_applied = a[2];
+                c3 = shft(c3a, a3_applied.round() as i32);
+            }
+            let mut chisq1 = fchisq(&c3, a);
+            let mut fn_count = 0.0f32;
+            let mut delta = deltaa[j];
+            // Loop label 10: step until chisq2 != chisq1.
+            let mut chisq2;
+            loop {
+                a[j] += delta;
+                if j == 2 && (a[2] - a3_applied).abs() > f32::EPSILON {
+                    a3_applied = a[2];
+                    c3 = shft(c3a, a3_applied.round() as i32);
+                }
+                chisq2 = fchisq(&c3, a);
+                if chisq2 != chisq1 {
+                    break;
+                }
+            }
+            // If we stepped uphill, reverse direction.
+            if chisq2 > chisq1 {
+                delta = -delta;
+                a[j] += delta;
+                core::mem::swap(&mut chisq1, &mut chisq2);
+            }
+            // Loop label 20: continue stepping while chisq3 < chisq2.
+            let mut chisq3;
+            loop {
+                fn_count += 1.0;
+                a[j] += delta;
+                if j == 2 && (a[2] - a3_applied).abs() > f32::EPSILON {
+                    a3_applied = a[2];
+                    c3 = shft(c3a, a3_applied.round() as i32);
+                }
+                chisq3 = fchisq(&c3, a);
+                if chisq3 < chisq2 {
+                    chisq1 = chisq2;
+                    chisq2 = chisq3;
+                    continue;
+                }
+                break;
+            }
+            // Parabolic minimum from the last three samples — matches
+            // `lib/afc9.f90` exactly.
+            let frac = 1.0 / (1.0 + (chisq1 - chisq2) / (chisq3 - chisq2)) + 0.5;
+            let new_delta = delta * frac;
+            a[j] -= new_delta;
+            if j < 2 {
+                deltaa[j] *= fn_count / 3.0;
+            }
+        }
+        if (a[2] - a3_applied).abs() > f32::EPSILON {
+            a3_applied = a[2];
+            c3 = shft(c3a, a3_applied.round() as i32);
+        }
+        chisqr = fchisq(&c3, a);
+        if chisqr0.abs() > 1e-12 && chisqr / chisqr0 > 0.99 {
+            break;
+        }
+        chisqr0 = chisqr;
+    }
+
+    // Mirror `c3a=c3` at function exit: the integer shift is baked
+    // back into the caller's buffer.
+    *c3a = c3;
+
+    Afc9Result {
+        a0: a[0],
+        a1: a[1],
+        time_shift: a3_applied.round() as i32,
+        syncpk: -chisqr,
+    }
 }
 
 #[cfg(test)]
@@ -404,7 +573,7 @@ mod tests {
                 grid,
                 sc
             );
-            let llrs = llrs_from_c5(&c3);
+            let (_schk, llrs) = llrs_from_c5(&c3);
             let res = ConvFano232
                 .decode_soft(&llrs, &FecOpts::default())
                 .unwrap_or_else(|| panic!("Fano failed for {} {} {}", c1, c2, grid));
@@ -627,7 +796,7 @@ mod tests {
             sc
         );
 
-        let llrs = llrs_from_c5(&c3);
+        let (_schk, llrs) = llrs_from_c5(&c3);
         let res = ConvFano232
             .decode_soft(&llrs, &FecOpts::default())
             .expect("Fano must converge on clean synth via WSJT-X-faithful pipeline");

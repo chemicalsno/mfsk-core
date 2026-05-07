@@ -98,24 +98,13 @@ pub fn decode_scan(
     scan_params.score_threshold = 0.001;
     scan_params.max_candidates = 50_000; // no practical cap; NMS below limits processing
 
-    let all_cands = search::coarse_search(audio, sample_rate, nominal_start_sample, &scan_params);
+    let mut cands = search::coarse_search(audio, sample_rate, nominal_start_sample, &scan_params);
 
-    // Frequency-domain non-maximum suppression: keep only the best-scoring
-    // candidate per 5 Hz window.  This prevents a single strong signal from
-    // filling the entire candidate list with its many time-shifted variants.
-    // 5 Hz ≈ 2.9 tone-spacings — enough to separate distinct JT9 carriers.
-    let nms_hz = 5.0f32;
-    let mut nms_map: std::collections::HashMap<i32, search::SyncCandidate> =
-        std::collections::HashMap::new();
-    for c in all_cands {
-        let bin_idx = (c.freq_hz / nms_hz).round() as i32;
-        let entry = nms_map.entry(bin_idx).or_insert(c);
-        if c.score > entry.score {
-            *entry = c;
-        }
-    }
-
-    let mut cands: Vec<search::SyncCandidate> = nms_map.into_values().collect();
+    // Sort by coarse score so high-quality candidates get tried first.
+    // Duplicate-signal suppression happens after decode via `seen`
+    // (message + freq ± 4 Hz + time ± 1 symbol), mirroring WSJT-X
+    // `lib/jt9_decode.f90:157-163` which marks ±22 freq bins `done`
+    // around each successful decode rather than pre-filtering by NMS.
     cands.sort_unstable_by(|a, b| {
         b.score
             .partial_cmp(&a.score)

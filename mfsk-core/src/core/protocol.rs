@@ -340,6 +340,12 @@ pub struct FecOpts<'a> {
     /// `NormalizedMinSum { alpha: 0.75 }` to trade ~0.1 dB threshold
     /// for substantially faster decode on f32 / fixed-point math.
     pub bp_kind: BpKind,
+    /// Override for the Fano sequential decoder's per-information-bit
+    /// cycle budget. `None` = codec-supplied default
+    /// (`ConvFano232::DEFAULT_MAX_CYCLES = 10_000`, matching WSJT-X's
+    /// standard `limit=10000`). Used by JT9's deep-search retry path
+    /// (`lib/jt9_decode.f90:84-101`: 10k → 30k → 100k).
+    pub max_cycles_per_bit: Option<u64>,
 }
 
 impl<'a> Default for FecOpts<'a> {
@@ -350,6 +356,7 @@ impl<'a> Default for FecOpts<'a> {
             ap_mask: None,
             verify_info: None,
             bp_kind: BpKind::SumProduct,
+            max_cycles_per_bit: None,
         }
     }
 }
