@@ -310,38 +310,29 @@ tree is present at the expected sibling path):
 |-------------------------------------|-------------|------------------------|
 | `WSPR/150426_0918.wav` (8 frames)   | **8 / 8**   | sub-bin demod + neg-dt |
 | `FT4/000000_000002.wav` (6 frames)  | **6 / 6**   | Nuttall + sync4d       |
-| `JT9/130418_1742.wav` (5 frames)    | **1 / 5**   | encoder bug — see [#19](https://github.com/jl1nie/mfsk-core/issues/19) |
-| `MSK144/181211_120500.wav` (n/a)    | —           | MSK144 not implemented |
-| `JT65/*` (n/a)                      | —           | golden absent (WSJT-X v3 also fails on samples) |
-| `FST4/210115_0058.wav` (1 frame)    | —           | not yet wired against golden |
+| `JT9/130418_1742.wav` (5 frames)    | **5 / 5**   | full WSJT-X-faithful softsym pipeline (afc9 + chkss2 + xx0 mettab + sync9 collapse) |
+| `MSK144/181211_120500.wav` (n/a)    | —           | not implemented — [#25](https://github.com/jl1nie/mfsk-core/issues/25) |
+| `JT65/*` (n/a)                      | —           | golden harness pending — [#24](https://github.com/jl1nie/mfsk-core/issues/24) |
+| `FST4/210115_0058.wav` (1 frame)    | —           | golden harness pending — [#23](https://github.com/jl1nie/mfsk-core/issues/23) |
 
 #### Known limitations / quirks
 
-- **JT9** — `decode_scan` recall is **1 / 5** on the busy WSJT-X
-  reference. Self-roundtrip is consistent (`tests::softsym_golden_grid_roundtrips`
-  passes for all 5 messages including `K1JT N5KDV EM41`), but a
-  noiseless WAV synthesised by `synthesize_standard` is rejected
-  by WSJT-X itself, so the encoder is bit-incompatible with the
-  reference somewhere upstream of demod. The full WSJT-X
-  `softsym.f90` pipeline (`downsam9` + `peakdt9` + `symspec2`) is
-  in place on the demod side and ready for the fix. Tracked in
-  [#19](https://github.com/jl1nie/mfsk-core/issues/19); do not
-  rely on JT9 for real-world decode against on-air WSJT-X
-  transmissions yet.
 - **JT65** — `decode_scan` decodes synthesised JT65A frames cleanly
   via the Reed-Solomon(63, 12) FEC and the AP-list path lifts weak
   signals to within ~2 dB of WSJT-X. There's no golden WAV in this
   crate's regression set because the WSJT-X v3 reference samples
   themselves don't decode cleanly without the soft-symbol erasure
-  metadata that lives in private WSJT-X branches.
+  metadata that lives in private WSJT-X branches. Tracked in
+  [#24](https://github.com/jl1nie/mfsk-core/issues/24).
 - **FST4** — only the FST4-60A long-period variant is wired (sample
   duration / Costas layout for FST4-15 / FST4W are out of scope of
   the 0.5.x line). Recall against `samples/FST4/210115_0058.wav` is
-  not yet locked by a golden harness.
-- **MSK144** — not implemented in 0.5.x. The decode path is on the
-  post-0.5 roadmap because MSK144 needs a different correlator
-  geometry from the rest of the FT/JT/Q-family decoders this crate
-  is built around.
+  not yet locked by a golden harness — tracked in
+  [#23](https://github.com/jl1nie/mfsk-core/issues/23).
+- **MSK144** — not implemented in 0.5.x. The decode path needs a
+  different correlator geometry from the rest of the FT/JT/Q-family
+  decoders this crate is built around. Tracked in
+  [#25](https://github.com/jl1nie/mfsk-core/issues/25).
 
 #### What's solid
 
@@ -349,12 +340,21 @@ tree is present at the expected sibling path):
   WSJT-X reference (`210703_133430.wav`) JTDX-golden recall 6 / 18
   on the embedded LX7 ship config (host f32 builds get more, but
   the published numbers track the constrained M5StickS3 deployment).
+  AP-hint biasing is exposed on both the narrow-band (`decode_sniper_ap`)
+  and wide-band (`decode_frame_with_ap`) paths.
 - **WSPR** — 8 / 8 WSJT-X golden, ~0.88 s end-to-end on a desktop
   build. Sub-bin demod + 2-pass subtract+re-coarse + OSD-2 fallback +
   Type-3 phantom filter.
 - **FT4** — 6 / 6 WSJT-X golden after the 0.5.9 multi-slice port of
   the WSJT-X demod path (Nuttall window, `nsym = 4` LLR aggregation,
-  `sync4d` 2-pass refine, `rvec` scrambler).
+  `sync4d` 2-pass refine, `rvec` scrambler). Successive-interference
+  cancellation primitives (`subtract_signal*`, `refine_signal_freq`)
+  ported from `lib/ft4_subtract.f90`. WSJT-X Decode menu (Fast /
+  Normal / Deep) exposed via `decode_frame_with_options` for FT4
+  and FST4-60A.
+- **JT9** — 5 / 5 WSJT-X golden on `samples/JT9/130418_1742.wav`
+  via the full WSJT-X-faithful softsym pipeline (`afc9` + `chkss2`
+  + `xx0` mettab + `sync9` per-freq collapse). Closed [#19](https://github.com/jl1nie/mfsk-core/issues/19).
 - **Q65** — fast-fading + AP-list paths exercise both the WSJT-X
   6 m EME and the 10 GHz EME reference recordings.
 - **SNR (FT8)** — `xsnr2_db_simple` calibration (0.5.7 + 0.5.8) lands

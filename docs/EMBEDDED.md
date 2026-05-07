@@ -176,20 +176,30 @@ static mut BASIS_IM: [i16; SCRATCH_LEN] = [0; SCRATCH_LEN];
 ```
 
 `BASIS_SCRATCH_LEN = NTONES × NSPS = 15 360` (≈ 30 KB per axis,
-60 KB total). This lives **in fast internal RAM** (`.bss`, not
-PSRAM); on cached-PSRAM targets like Core2, putting basis in PSRAM
-costs 5–10 cycles per dot-product term and tanks the ASM kernel.
-The static-array form lands in `.bss` automatically. If you need
-heap allocation, prefer
-`heap_caps_malloc(BASIS_SCRATCH_LEN * 2, MALLOC_CAP_INTERNAL)` over
-the default heap.
+60 KB total). This buffer is the **dot-product inner-loop hot
+data** — the `dsps_dotprod_s16_ae32` ASM kernel runs at 1 cycle per
+2 MACs only when basis sits in fast internal SRAM (DRAM). On a
+Core2 with PSRAM enabled (the default), a PSRAM-resident basis
+costs 5–10 cycles per term through the cache, dropping the kernel
+to ~30 % of its rated speed and **doubling-to-tripling stage 3
+wall-clock**. The static-array form lands in `.bss` automatically;
+for heap allocation use ESP-IDF's capability-flagged allocator:
 
-The `decode_block_into` / `process_candidates_into` /
-`refine_candidates_into` family of `pub fn` exists specifically so
-embedded callers can thread that scratch through without per-decode
-allocation. The non-`_into` variants (`decode_block`, etc.) heap-
-allocate at the default heap, which on ESP32 with PSRAM means a
-slow basis on the hot path.
+```c
+int16_t *basis = heap_caps_malloc(BASIS_SCRATCH_LEN * sizeof(int16_t),
+                                  MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+```
+
+A plain `malloc` request of 60 KB silently lands in PSRAM under
+ESP-IDF's default routing. Keep the buffers across decode calls;
+they don't need to be reset between slots.
+
+The `_into` family of `pub fn` exists specifically so embedded
+callers can thread the scratch through without per-decode
+allocation. The non-`_into` variants (`decode_block`, etc.)
+heap-allocate at the default heap, which on PSRAM-enabled boards
+is the slow path described above — fine for host but a footgun on
+embedded.
 
 ## Q-format quick reference
 
@@ -237,8 +247,8 @@ typedef struct MfskFt8Result {
     char     text[40];   // NUL-terminated unpacked message
     float    freq_hz;    // carrier
     float    dt_sec;     // time offset relative to slot start
-    float    snr_db;     // see "Known limitations" — embedded
-                         // path reads ~4–12 dB low on strong sigs
+    float    snr_db;     // calibrated against JTDX absolute via
+                         // xsnr2_db_simple (within ±3 dB on real silicon)
     uint32_t hard_errors;
     uint8_t  pass;       // staircase stage (0=fast Bp, 1=full Bp,…)
 } MfskFt8Result;
@@ -278,30 +288,21 @@ MfskFt8Status mfsk_ft8_decode_i16_alloc(
 void mfsk_ft8_result_list_free(MfskFt8ResultList *list);
 ```
 
-### Why caller-supplied scratch (and why it's not optional on Core2)
+### Caller-managed BASIS scratch
 
-The 60 KB `BASIS` scratch (cos/sin Q15 rotators × 8 tones × 1920
-samples) is the **dot-product inner-loop hot data**. The esp-dsp
-ASM kernel `dsps_dotprod_s16_ae32` runs at 1 cycle per 2 MACs only
-when the basis sits in fast internal SRAM (DRAM). On a Core2 with
-PSRAM enabled (the default), the standard `malloc` heap lands in
-PSRAM, and PSRAM-resident reads cost **5–10 cycles/sample of stall**
-through the cache, dropping the kernel to ~30 % of its rated speed.
-Stage 3 wall-clock literally **doubles to triples** if BASIS is in
-PSRAM.
-
-You can't predict which heap a `malloc` call lands in from C —
-ESP-IDF's heap allocator routes between internal RAM and PSRAM by
-size and capability flags, and a 60 KB request lands in PSRAM
-unless explicitly capped. So a "convenience" entry that hides a
-60 KB `malloc` would silently de-tune any embedded caller. We
-deliberately don't ship one for embedded — `mfsk_ft8_decode_i16`
-takes the scratch as parameters, full stop. The caller decides:
+The C ABI mirrors the Rust `_into` family — `mfsk_ft8_decode_i16`
+takes the basis arrays as parameters rather than hiding a `malloc`
+inside. The reasoning is the same as documented in
+[BASIS scratch](#basis-scratch) above (PSRAM placement breaks the
+ASM kernel); for the FFI path the consequence is that the decoder
+deliberately does **not** ship a "convenience" wrapper that
+internally `malloc`s, because the C caller can't tell which heap
+the allocation lands in. The caller decides:
 
 ```c
-// The simplest correct pattern: static .bss arrays.
-// They land in internal DRAM automatically and persist for the
-// process lifetime.
+// The simplest correct pattern: static .bss arrays — they land
+// in internal DRAM automatically and persist for the process
+// lifetime.
 #include "mfsk_ft8.h"
 static int16_t basis_re[15360];   // = mfsk_ft8_basis_scratch_len()
 static int16_t basis_im[15360];
@@ -314,11 +315,6 @@ MfskFt8Status st = mfsk_ft8_decode_i16(
     basis_re, basis_im,
     &results);
 ```
-
-If you must allocate dynamically, use ESP-IDF's capability-flagged
-allocator: `heap_caps_malloc(15360 * sizeof(int16_t),
-MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)`. Keep the buffers around
-across decode calls — they don't need to be reset between slots.
 
 ### Streaming capture: I2S / USB Audio → 12 kHz ring
 
@@ -714,15 +710,3 @@ plus an optional 8 KB-per-candidate cs Box (~120 KB peak across
 SRAM budget on bare ESP32 (no PSRAM needed strictly for the decode
 path; PSRAM helps only for the wider spectrogram).
 
-## Known limitations on the embedded path
-
-- **SNR estimate.** On the block-decode path, `DecodeResult.snr_db`
-  reads ~4–12 dB low on strong signals compared to the host
-  wide-band `decode_frame`. The block path uses direct DFT at the
-  decoded freq and skips channel equalisation; the wide-band path
-  uses a downsampled FFT plus per-tone Wiener equalisation that
-  boosts strong-signal estimates. Same delta on host f32 and
-  fixed-point — not a quantisation issue. Constant-offset
-  workaround possible at the application layer; a proper fix needs
-  the equalisation pass to run on the block path's cs (deferred
-  post-0.5.0 — non-trivial PSRAM allocation pattern).

@@ -169,18 +169,29 @@ static mut BASIS_IM: [i16; SCRATCH_LEN] = [0; SCRATCH_LEN];
 ```
 
 `BASIS_SCRATCH_LEN = NTONES × NSPS = 15 360` (約 30 KB / 軸、
-2 軸合計 60 KB)。これは **internal RAM (`.bss`、PSRAM 不可)** に
-置く必要があります。Core2 のような cached-PSRAM ターゲットでは
-PSRAM 上の basis は内積 1 項あたり 5–10 サイクル余分にかかり、
-ASM kernel が遅くなります。`static` 配列形式は `.bss` に自動配置されます。
-ヒープ確保したい場合は `heap_caps_malloc(BASIS_SCRATCH_LEN * 2,
-MALLOC_CAP_INTERNAL)` を使ってください。
+2 軸合計 60 KB)。これは **dot-product 内ループの hot data** で、
+esp-dsp の `dsps_dotprod_s16_ae32` ASM kernel が 2 MAC/cycle で
+回るのは basis が**高速な内部 SRAM (DRAM)** に乗っているときのみ。
+PSRAM 有効な Core2 では、PSRAM-resident な basis はキャッシュ越しで
+1 項あたり 5–10 cycle のストールを発生させ、kernel が定格の ~30 % に
+落ちます — **stage 3 wall-clock が文字通り 2〜3 倍**になります。
+`static` 配列なら `.bss` に自動配置 (内部 DRAM)、heap で確保したい
+場合は ESP-IDF の capability-flag アロケータを:
 
-`decode_block_into` / `process_candidates_into` /
-`refine_candidates_into` の `pub fn` 群は、組み込みコール元が
-basis を decode 毎にアロケートせず通せるよう用意されています。
-非 `_into` 版 (`decode_block` など) は標準ヒープに確保するため、
-PSRAM 構成の ESP32 では低速 basis でホットパスが走ります。
+```c
+int16_t *basis = heap_caps_malloc(BASIS_SCRATCH_LEN * sizeof(int16_t),
+                                  MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+```
+
+通常の `malloc` で 60 KB 要求すると ESP-IDF のデフォルトルーティングで
+PSRAM に流れます。複数 decode 呼び出しを跨いで保持してください — slot
+ごとに reset 不要。
+
+`_into` 系 `pub fn` 群は、組み込みコール元が basis を decode 毎に
+アロケートせず通せるよう用意されています。非 `_into` 版
+(`decode_block` など) は標準ヒープに確保するため、PSRAM 有効な
+組み込み環境では上記の slow path に落ちます — ホストでは問題ないが
+組み込みで足を撃ちやすい。
 
 ## Q-format 早見表
 
@@ -226,8 +237,8 @@ typedef struct MfskFt8Result {
     char     text[40];   // NUL-終端 unpack メッセージ
     float    freq_hz;    // キャリア周波数
     float    dt_sec;     // スロット先頭からの時間オフセット
-    float    snr_db;     // 既知制限 — embedded path は強信号で
-                         // ~4–12 dB 低めに出る
+    float    snr_db;     // xsnr2_db_simple で校正済み (実機で
+                         // JTDX 絶対値と ±3 dB 以内)
     uint32_t hard_errors;
     uint8_t  pass;       // staircase ステージ (0=fast Bp, 1=full Bp,…)
 } MfskFt8Result;
@@ -266,27 +277,18 @@ MfskFt8Status mfsk_ft8_decode_i16_alloc(
 void mfsk_ft8_result_list_free(MfskFt8ResultList *list);
 ```
 
-### なぜ caller-supply scratch (組み込みでは選択肢ですらない)
+### Caller-managed BASIS scratch
 
-60 KB の `BASIS` scratch (cos/sin Q15 rotator × 8 tone × 1920 sample) は
-**dot-product 内ループの hot data** です。esp-dsp の ASM kernel
-`dsps_dotprod_s16_ae32` が 2 MAC / cycle のピークで回るのは、
-basis が**高速な内部 SRAM (DRAM)** にあるときのみ。Core2 で PSRAM が
-有効 (デフォルト) の場合、標準 `malloc` heap は PSRAM に流れ、
-PSRAM-resident な読み出しはキャッシュ越しで **5–10 cycle/sample の
-ストール**を発生させ、kernel が定格の ~30 % まで落ちます。BASIS が
-PSRAM にあると stage 3 wall-clock が文字通り **2〜3 倍**になります。
-
-C から `malloc` の戻り先は予測できません — ESP-IDF の heap は
-size と capability flag で内部 RAM/PSRAM をルーティングし、60 KB
-要求は明示的に絞らない限り PSRAM に行きます。なので 60 KB malloc を
-裏で隠す「簡便版」は組み込み側で必ず性能を毀損する。組み込みには
-わざと用意せず、`mfsk_ft8_decode_i16` は scratch を引数で受け取る
-形に統一しています。呼び出し側がポリシーを決める:
+C ABI は Rust 側 `_into` 系をミラーした形 — `mfsk_ft8_decode_i16`
+は basis を引数で受け取る方式で、内部 `malloc` を隠しません。理由は
+[BASIS scratch](#basis-scratch) 節で説明した通り (PSRAM 配置で
+ASM kernel が崩れる)。FFI 側でも同じ理由で「内部 `malloc` する
+簡便ラッパー」は意図的に提供しません — C 呼び出し側からは戻り先
+heap が読めないため。呼び出し側がポリシーを決めます:
 
 ```c
-// 一番シンプルで正しいパターン: static .bss 配列。
-// 自動的に内部 DRAM に乗り、プロセス寿命中保持される。
+// 一番シンプルで正しいパターン: static .bss 配列 — 内部 DRAM に
+// 自動配置され、プロセス寿命中保持される。
 #include "mfsk_ft8.h"
 static int16_t basis_re[15360];   // = mfsk_ft8_basis_scratch_len()
 static int16_t basis_im[15360];
@@ -299,11 +301,6 @@ MfskFt8Status st = mfsk_ft8_decode_i16(
     basis_re, basis_im,
     &results);
 ```
-
-動的確保したいなら ESP-IDF の capability-flag アロケータを:
-`heap_caps_malloc(15360 * sizeof(int16_t),
-MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)`。複数 decode 呼び出しを
-跨いで保持してください — slot ごとに reset 不要。
 
 ### Build flag
 
@@ -583,14 +580,3 @@ dispatch + Job enum)。
 約 920 KB。ライブラリ側だけのコードサイズはおおよそ **150-200 KB**
 の見積もり (esp-idf を分離して測ると正確)。
 
-## 組み込みパスの既知制限
-
-- **SNR 推定値**: ブロックデコードパスの `DecodeResult.snr_db` は
-  強信号で `decode_frame` (ホスト広帯域) より 4–12 dB 低めに出ます。
-  ブロックパスは exact tone freq での直接 DFT を使い、
-  `decode_frame` が使う 200 Hz baseband ダウンサンプル + Wiener
-  チャネルイコライズを通っていないため。ホスト f32 と固定小数点
-  パスで同じ delta が出るので量子化問題ではありません。アプリ
-  レイヤで定数オフセットを当てる workaround は可能。proper fix は
-  ブロック cs に対してイコライズを走らせる必要があり (PSRAM
-  確保パターンが重い) post-0.5.0 の課題。
