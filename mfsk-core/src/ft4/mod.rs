@@ -35,6 +35,8 @@ pub mod decode;
 pub mod encode;
 #[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub mod refine_fine;
+#[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
+pub mod subtract;
 
 /// FT4 protocol marker: 4-GFSK, 103 symbols over 7.5 s slot, 20.833 Hz tone
 /// spacing, four different Costas-4 arrays, LDPC(174,91) FEC, WSJT 77-bit
@@ -49,7 +51,7 @@ impl ModulationParams for Ft4 {
     const SYMBOL_DT: f32 = 0.048;
     const TONE_SPACING_HZ: f32 = 20.833;
     const GRAY_MAP: &'static [u8] = &[0, 1, 3, 2];
-    const GFSK_BT: f32 = 1.0;
+    const GFSK_BT: f32 = 2.0;
     const GFSK_HMOD: f32 = 1.0;
     const NFFT_PER_SYMBOL_FACTOR: u32 = 4; // NFFT1 = 4 × NSPS = 2304
     const NSTEP_PER_SYMBOL: u32 = 2; // half-symbol coarse-sync step (24 ms)
