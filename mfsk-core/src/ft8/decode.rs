@@ -317,6 +317,57 @@ pub fn decode_frame(
         &[],
         EqMode::Off,
         None,
+        None,
+    )
+    .0
+}
+
+/// Wide-band decode with an a-priori (AP) callsign / grid hint applied
+/// to every candidate.
+///
+/// Unlike [`decode_sniper_ap`] which scans only ±250 Hz around a target
+/// frequency, this function scans the full `freq_min..freq_max` band and
+/// attempts AP-assisted decoding on each sync candidate. Useful when an
+/// operator has an active QSO and wants the whole band searched with
+/// the known callsigns biasing FEC LLRs:
+///
+/// ```ignore
+/// use mfsk_core::ft8::decode::{decode_frame_with_ap, ApHint, DecodeDepth};
+/// let ap = ApHint::new().with_call1("CQ").with_call2("K1ABC");
+/// let results = decode_frame_with_ap(
+///     &audio, 100.0, 3000.0, 1.0, None,
+///     DecodeDepth::BpAllOsd, 50, Some(&ap),
+/// );
+/// ```
+///
+/// AP gain is typically 1–3 dB at the FT8 decode threshold when at
+/// least one of `call1` / `call2` matches a station actually on air.
+/// When the hint is wrong, decode quality degrades only slightly
+/// because the AP path is gated behind sync-quality and BP score
+/// checks; spurious AP-locked decodes are caught by the post-FEC CRC.
+pub fn decode_frame_with_ap(
+    audio: &[i16],
+    freq_min: f32,
+    freq_max: f32,
+    sync_min: f32,
+    freq_hint: Option<f32>,
+    depth: DecodeDepth,
+    max_cand: usize,
+    ap_hint: Option<&ApHint>,
+) -> Vec<DecodeResult> {
+    decode_frame_inner(
+        audio,
+        freq_min,
+        freq_max,
+        sync_min,
+        freq_hint,
+        depth,
+        max_cand,
+        DecodeStrictness::Normal,
+        &[],
+        EqMode::Off,
+        None,
+        ap_hint,
     )
     .0
 }
@@ -345,6 +396,7 @@ pub fn decode_frame_with_cache(
         DecodeStrictness::Normal,
         &[],
         EqMode::Off,
+        None,
         None,
     )
 }
@@ -667,6 +719,7 @@ fn decode_frame_inner(
     known: &[DecodeResult],
     eq_mode: EqMode,
     precomputed_fft: Option<&[num_complex::Complex<f32>]>,
+    ap_hint: Option<&ApHint>,
 ) -> (Vec<DecodeResult>, Vec<num_complex::Complex<f32>>) {
     let candidates = coarse_sync(audio, freq_min, freq_max, sync_min, freq_hint, max_cand);
     if candidates.is_empty() {
@@ -687,7 +740,7 @@ fn decode_frame_inner(
         .par_iter()
         .filter_map(|cand| {
             process_candidate(
-                cand, audio, &fft_cache, depth, strictness, known, eq_mode, None,
+                cand, audio, &fft_cache, depth, strictness, known, eq_mode, ap_hint,
             )
         })
         .collect();
@@ -696,7 +749,7 @@ fn decode_frame_inner(
         .iter()
         .filter_map(|cand| {
             process_candidate(
-                cand, audio, &fft_cache, depth, strictness, known, eq_mode, None,
+                cand, audio, &fft_cache, depth, strictness, known, eq_mode, ap_hint,
             )
         })
         .collect();
@@ -760,6 +813,7 @@ pub fn decode_frame_subtract(
             &all_results,
             EqMode::Off,
             None,
+            None,
         );
 
         for r in &new {
@@ -822,6 +876,7 @@ pub fn decode_frame_subtract_with_known(
             &all_results,
             EqMode::Off,
             fft,
+            None,
         );
 
         for r in &new {
@@ -1043,6 +1098,78 @@ fn decode_sniper_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `decode_frame_with_ap` accepts the AP hint and round-trips a
+    /// clean self-synthesised signal with the hint matching. Doesn't
+    /// directly assert the AP gain (that needs a low-SNR fixture);
+    /// just guards against signature drift and validates the
+    /// "hint-aware decode of a perfect signal still succeeds" invariant.
+    #[test]
+    fn decode_frame_with_ap_round_trips_clean_signal() {
+        use crate::ft8::wave_gen::{message_to_tones, tones_to_i16};
+        use crate::msg::wsjt77::pack77;
+
+        let m77 = pack77("CQ", "K1ABC", "FN42").expect("pack77");
+        let tones = message_to_tones(&m77);
+        let samples = tones_to_i16(&tones, 1500.0, 20_000);
+
+        // 15 s slot, signal at 0.5 s offset.
+        let mut audio = vec![0i16; 15 * 12_000];
+        let off = 6_000usize;
+        let len = samples.len().min(audio.len() - off);
+        audio[off..off + len].copy_from_slice(&samples[..len]);
+
+        // Provide a matching AP hint.
+        let ap = ApHint::new().with_call1("CQ").with_call2("K1ABC");
+        let results = decode_frame_with_ap(
+            &audio,
+            100.0,
+            3000.0,
+            1.0,
+            None,
+            DecodeDepth::BpAllOsd,
+            50,
+            Some(&ap),
+        );
+        assert!(
+            results.iter().any(|r| r.message77 == m77),
+            "expected to decode the self-synthesized signal with matching AP hint"
+        );
+    }
+
+    /// `decode_frame_with_ap` with `ap_hint = None` should produce
+    /// exactly the same results as `decode_frame` (legacy path).
+    #[test]
+    fn decode_frame_with_ap_none_matches_legacy() {
+        use crate::ft8::wave_gen::{message_to_tones, tones_to_i16};
+        use crate::msg::wsjt77::pack77;
+
+        let m77 = pack77("CQ", "W7VV", "CN87").expect("pack77");
+        let tones = message_to_tones(&m77);
+        let samples = tones_to_i16(&tones, 1200.0, 18_000);
+
+        let mut audio = vec![0i16; 15 * 12_000];
+        let off = 6_000usize;
+        let len = samples.len().min(audio.len() - off);
+        audio[off..off + len].copy_from_slice(&samples[..len]);
+
+        let r_legacy = decode_frame(&audio, 100.0, 3000.0, 1.0, None, DecodeDepth::BpAllOsd, 50);
+        let r_ap_none = decode_frame_with_ap(
+            &audio,
+            100.0,
+            3000.0,
+            1.0,
+            None,
+            DecodeDepth::BpAllOsd,
+            50,
+            None,
+        );
+        assert_eq!(
+            r_legacy.iter().map(|r| r.message77).collect::<Vec<_>>(),
+            r_ap_none.iter().map(|r| r.message77).collect::<Vec<_>>(),
+            "ap_hint=None must match legacy decode_frame exactly"
+        );
+    }
 
     /// Silence produces no decoded messages and does not panic.
     #[test]
