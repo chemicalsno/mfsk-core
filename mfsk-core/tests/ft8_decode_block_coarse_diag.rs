@@ -13,11 +13,10 @@ use mfsk_core::ft8::decode::{DecodeDepth, decode_frame};
 use mfsk_core::ft8::decode_block::{coarse_sync, compute_spectrogram};
 use mfsk_core::msg::wsjt77::unpack77;
 
-const QSO_WAVS: &[&str] = &[
-    "/home/ubuntu/src/rs-ft8n/ft8-bench/testdata/191111_110130.wav",
-    "/home/ubuntu/src/rs-ft8n/ft8-bench/testdata/191111_110200.wav",
-    "/home/ubuntu/src/WSJT-X/samples/FT8/210703_133430.wav",
-];
+#[allow(dead_code)]
+mod common;
+
+const QSO_WAVS: &[&str] = common::REAL_QSO_WAVS;
 
 fn load_wav_i16(path: &Path) -> Vec<i16> {
     let bytes = std::fs::read(path).expect("read wav");
