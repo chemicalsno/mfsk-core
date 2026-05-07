@@ -764,18 +764,17 @@ fn decode_frame_inner(
     ap_hint: Option<&ApHint>,
 ) -> (Vec<DecodeResult>, Vec<num_complex::Complex<f32>>) {
     let candidates = coarse_sync(audio, freq_min, freq_max, sync_min, freq_hint, max_cand);
-    if candidates.is_empty() {
-        let fft_cache = match precomputed_fft {
-            Some(c) => c.to_vec(),
-            None => build_fft_cache(audio),
-        };
-        return (Vec::new(), fft_cache);
-    }
-
+    // Build (or clone) the FFT cache exactly once. The cache is needed both
+    // when there are no candidates (early return) and when running BP/OSD
+    // per candidate, so do it before the early-exit branch to avoid a
+    // redundant clone of `precomputed_fft` on the candidates path.
     let fft_cache = match precomputed_fft {
         Some(c) => c.to_vec(),
         None => build_fft_cache(audio),
     };
+    if candidates.is_empty() {
+        return (Vec::new(), fft_cache);
+    }
 
     #[cfg(feature = "parallel")]
     let raw: Vec<DecodeResult> = candidates
@@ -898,6 +897,12 @@ pub fn decode_frame_subtract_with_ap(
 /// The first pass reuses `precomputed_fft` when available; subsequent
 /// passes recompute the FFT from the post-subtraction residual.
 ///
+/// Caller-supplied `known` signals are subtracted from the working
+/// buffer after Pass 0 (before Pass 1 / Pass 2 begin), so subsequent
+/// passes see a residual with all known signals removed. Without this,
+/// strong known carriers would re-decode in later passes and crowd out
+/// the new candidates this function exists to surface.
+///
 /// Returns only **newly** decoded messages (those not in `known`).
 pub fn decode_frame_subtract_with_known(
     audio: &[i16],
@@ -931,6 +936,11 @@ pub fn decode_frame_subtract_with_known(
 ///
 /// `ap_hint = None` reproduces [`decode_frame_subtract_with_known`]
 /// bit-for-bit.
+///
+/// Caller-supplied `known` signals are subtracted from the working
+/// buffer after Pass 0 (before Pass 1 / Pass 2 begin), so subsequent
+/// passes see a residual with all known signals removed. This applies
+/// regardless of whether `ap_hint` is supplied.
 #[allow(clippy::too_many_arguments)]
 pub fn decode_frame_subtract_with_known_and_ap(
     audio: &[i16],
@@ -945,16 +955,59 @@ pub fn decode_frame_subtract_with_known_and_ap(
     precomputed_fft: Option<FftCache>,
     ap_hint: Option<&ApHint>,
 ) -> Vec<DecodeResult> {
+    let (results, _residual) = decode_frame_subtract_with_known_and_ap_inner(
+        audio,
+        freq_min,
+        freq_max,
+        sync_min,
+        freq_hint,
+        depth,
+        max_cand,
+        strictness,
+        known,
+        precomputed_fft,
+        ap_hint,
+    );
+    results
+}
+
+/// Shared SIC loop for `decode_frame_subtract_with_known_and_ap` and its
+/// `#[cfg(test)]` debug counterpart. Returns the newly-decoded messages
+/// (excluding `known`) plus the residual buffer after all passes
+/// complete.
+///
+/// Pass 0 uses the pre-computed FFT (built from the *original* audio) to
+/// discover any signals missed in Phase 1; only after that do we subtract
+/// both the caller-supplied `known` signals and the newly discovered
+/// signals from the residual. Subtracting before Pass 0 would require
+/// either (a) recomputing the FFT cache against the modified residual
+/// or (b) using a stale cache that no longer matches the audio. Either
+/// would defeat the cache-reuse optimization.
+#[allow(clippy::too_many_arguments)]
+fn decode_frame_subtract_with_known_and_ap_inner(
+    audio: &[i16],
+    freq_min: f32,
+    freq_max: f32,
+    sync_min: f32,
+    freq_hint: Option<f32>,
+    depth: DecodeDepth,
+    max_cand: usize,
+    strictness: DecodeStrictness,
+    known: &[DecodeResult],
+    precomputed_fft: Option<FftCache>,
+    ap_hint: Option<&ApHint>,
+) -> (Vec<DecodeResult>, Vec<i16>) {
     let mut residual = audio.to_vec();
     let mut all_results: Vec<DecodeResult> = known.to_vec();
     let known_count = known.len();
 
     let passes: &[f32] = &[1.0, 0.75, 0.5];
+    let mut residual_dirty = false;
 
     for (i, &factor) in passes.iter().enumerate() {
-        // Reuse the pre-computed FFT cache only for the first pass
-        // (the audio hasn't been modified yet).
-        let fft = if i == 0 {
+        // Reuse the pre-computed FFT cache only on Pass 0, and only while
+        // `residual` has not yet been modified by any subtraction step.
+        let fft = if i == 0 && !residual_dirty {
             precomputed_fft.as_deref()
         } else {
             None
@@ -975,15 +1028,75 @@ pub fn decode_frame_subtract_with_known_and_ap(
             ap_hint,
         );
 
+        // After Pass 0, also subtract every `known` signal supplied by
+        // the caller (typically Phase 1 results). Without this, those
+        // strong known signals continue to mask weaker ones in Pass 1
+        // and Pass 2 of the SIC loop, defeating the whole purpose of
+        // successive interference cancellation.
+        if i == 0 {
+            for r in known {
+                let sub_gain = qsb_partial_gain(r.sync_cv);
+                subtract_signal_weighted(&mut residual, r, sub_gain);
+            }
+            if !known.is_empty() {
+                residual_dirty = true;
+            }
+        }
+
         for r in &new {
             let sub_gain = qsb_partial_gain(r.sync_cv);
             subtract_signal_weighted(&mut residual, r, sub_gain);
+        }
+        if !new.is_empty() {
+            residual_dirty = true;
         }
         all_results.extend(new);
     }
 
     // Return only the newly decoded messages (exclude `known`).
-    all_results.split_off(known_count)
+    (all_results.split_off(known_count), residual)
+}
+
+/// Test-only variant that returns the residual buffer after all
+/// subtraction passes complete, alongside the decoded messages. Used
+/// by regression tests that need to verify successive-interference-
+/// cancellation actually cancels the caller-supplied `known` signals
+/// from the residual.
+///
+/// Implemented as a thin shim over the same private inner that the
+/// production [`decode_frame_subtract_with_known_and_ap`] uses, so the
+/// SIC pass structure, gain schedule, FFT-cache validity logic, and
+/// `known`-subtraction placement can never drift between the two. The
+/// only difference is that this variant exposes the residual buffer
+/// the production function discards.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_frame_subtract_with_known_and_ap_debug_residual(
+    audio: &[i16],
+    freq_min: f32,
+    freq_max: f32,
+    sync_min: f32,
+    freq_hint: Option<f32>,
+    depth: DecodeDepth,
+    max_cand: usize,
+    strictness: DecodeStrictness,
+    known: &[DecodeResult],
+    precomputed_fft: Option<FftCache>,
+    ap_hint: Option<&ApHint>,
+) -> (Vec<DecodeResult>, Vec<i16>) {
+    decode_frame_subtract_with_known_and_ap_inner(
+        audio,
+        freq_min,
+        freq_max,
+        sync_min,
+        freq_hint,
+        depth,
+        max_cand,
+        strictness,
+        known,
+        precomputed_fft,
+        ap_hint,
+    )
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1379,6 +1492,104 @@ mod tests {
             Some(&ap),
         );
         assert!(r_some.is_empty());
+    }
+
+    /// Regression test for the Phase-2 SIC correctness bug: when caller-supplied
+    /// `known` signals are *not* subtracted from the residual, a strong known
+    /// signal continues to mask weaker signals throughout the SIC loop. With
+    /// the fix in place, the residual is cleaned of the known signal after
+    /// Pass 0 so subsequent passes operate on a near-zero baseline at the
+    /// known signal's frequency.
+    ///
+    /// We assert this directly by measuring the residual energy at the known
+    /// signal's narrow band before vs. after the function runs. Without the
+    /// fix, residual energy at f0 ≈ original input energy at f0. With the
+    /// fix, it drops by an order of magnitude.
+    #[test]
+    fn decode_frame_subtract_with_known_and_ap_subtracts_known_before_phase2() {
+        use crate::ft8::wave_gen::{message_to_tones, tones_to_i16};
+        use crate::msg::wsjt77::pack77;
+
+        let m_known = pack77("CQ", "K1ABC", "FN42").expect("pack77 known");
+        let tones_known = message_to_tones(&m_known);
+
+        // Strong, clean signal at 1500 Hz.
+        let f0 = 1500.0_f32;
+        let mut audio = vec![0i16; 15 * 12_000];
+        let off = 6_000usize;
+        let buf = tones_to_i16(&tones_known, f0, 20_000);
+        let n_sig = buf.len().min(audio.len() - off);
+        audio[off..off + n_sig].copy_from_slice(&buf[..n_sig]);
+
+        // Phase 1: decode A. We need a real DecodeResult (with proper sync_cv,
+        // freq_hz, dt_sec) so subtract_signal_weighted can reconstruct A.
+        let phase1 = decode_frame(&audio, 200.0, 2800.0, 1.0, None, DecodeDepth::BpAllOsd, 50);
+        let known_results: Vec<DecodeResult> = phase1
+            .iter()
+            .filter(|r| r.message77 == m_known)
+            .cloned()
+            .collect();
+        assert!(
+            !known_results.is_empty(),
+            "Phase 1 must decode the known signal for this test to be meaningful"
+        );
+
+        // Helper: narrow-band energy ~f0, ±50 Hz, via Goertzel-ish DFT bin sum.
+        // Sums |sample| as a coarse-but-monotonic proxy; precise enough to
+        // differentiate "signal present" from "signal subtracted".
+        fn band_energy(samples: &[i16], f_lo: f32, f_hi: f32) -> f64 {
+            let n = samples.len();
+            let fs = 12_000.0_f64;
+            let k_lo = ((f_lo as f64) * (n as f64) / fs).floor() as usize;
+            let k_hi = ((f_hi as f64) * (n as f64) / fs).ceil() as usize;
+            let mut energy = 0.0_f64;
+            // Direct DFT magnitude sum over the narrow band — exact, slow,
+            // but the test buffer is 180 000 samples and the band is ~1 Hz
+            // wide so this is bounded.
+            for k in k_lo..=k_hi {
+                let mut re = 0.0_f64;
+                let mut im = 0.0_f64;
+                let w = 2.0 * core::f64::consts::PI * (k as f64) / (n as f64);
+                for (i, &s) in samples.iter().enumerate() {
+                    let phi = w * (i as f64);
+                    re += (s as f64) * phi.cos();
+                    im -= (s as f64) * phi.sin();
+                }
+                energy += re * re + im * im;
+            }
+            energy
+        }
+
+        // Restrict the band to a 2 Hz window so the DFT loop stays cheap.
+        let e_before = band_energy(&audio, f0 - 1.0, f0 + 1.0);
+
+        let (new_results, residual) = decode_frame_subtract_with_known_and_ap_debug_residual(
+            &audio,
+            200.0,
+            2800.0,
+            1.0,
+            None,
+            DecodeDepth::BpAllOsd,
+            50,
+            DecodeStrictness::Normal,
+            &known_results,
+            None,
+            None,
+        );
+        let _ = new_results; // not under test here
+
+        let e_after = band_energy(&residual, f0 - 1.0, f0 + 1.0);
+
+        // With the SIC fix, the known signal is subtracted from the residual,
+        // so band energy at f0 must drop substantially. Use a conservative
+        // 2× threshold so the test is robust to subtraction-gain (qsb_partial)
+        // and refine residue, not 0.5× which is the typical empirical drop.
+        assert!(
+            e_after * 2.0 < e_before,
+            "expected residual band energy at known signal's frequency \
+             to drop by >2× after SIC; got e_before={e_before:.3e}, \
+             e_after={e_after:.3e} (fix not applied?)"
+        );
     }
 
     /// Silence produces no decoded messages and does not panic.
