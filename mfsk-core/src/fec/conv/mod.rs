@@ -12,6 +12,9 @@ pub mod fano;
 
 use alloc::vec;
 
+#[cfg(not(feature = "std"))]
+use num_traits::Float;
+
 use super::FecCodec;
 use crate::core::{FecOpts, FecResult};
 

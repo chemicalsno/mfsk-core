@@ -42,7 +42,13 @@ use crate::msg::Wspr50Message;
 pub mod baseband;
 #[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub mod coarse_baseband;
+// `decode` and `demod` pull in the FFT-gated baseband / search /
+// subtract / osd modules — only compile them when an FFT backend
+// is selected, so the `--features wspr` (TX-only embedded beacon)
+// build remains valid.
+#[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub mod decode;
+#[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub mod demod;
 #[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub mod osd;

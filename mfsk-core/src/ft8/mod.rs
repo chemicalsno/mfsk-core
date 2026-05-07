@@ -73,6 +73,9 @@ pub mod params;
 pub mod refine_fine;
 #[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub mod resample;
+// `subtract` consumes `super::decode::DecodeResult`, which is itself
+// FFT-gated — match the gate so `--features ft8` (TX-only) builds.
+#[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub mod subtract;
 #[cfg(any(feature = "fft-rustfft", feature = "fft-extern"))]
 pub mod sync;
