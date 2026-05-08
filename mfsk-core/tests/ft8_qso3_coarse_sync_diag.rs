@@ -224,7 +224,7 @@ fn closest_to_target(cands: &[(usize, f32, f32, f32)], target_hz: f32) -> Option
     for c in cands {
         let (rank, freq, dt, score) = *c;
         let df = (freq - target_hz).abs();
-        if df <= FREQ_TOL_HZ && best.as_ref().map(|b| df < b.df_to_target).unwrap_or(true) {
+        if df <= FREQ_TOL_HZ && dt.abs() <= DT_TOL_S && best.as_ref().map(|b| df < b.df_to_target).unwrap_or(true) {
             best = Some(CandRef {
                 rank,
                 freq_hz: freq,
