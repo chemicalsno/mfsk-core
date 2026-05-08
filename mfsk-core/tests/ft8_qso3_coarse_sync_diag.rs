@@ -350,7 +350,7 @@ fn ft8_qso3_coarse_sync_diag() {
         let near: Vec<(usize, &mfsk_core::ft8::sync::SyncCandidate)> = host_loose
             .iter()
             .enumerate()
-            .filter(|(_, c)| (c.freq_hz - tgt.freq_hz).abs() <= FREQ_TOL_HZ)
+            .filter(|(_, c)| (c.freq_hz - tgt.freq_hz).abs() <= FREQ_TOL_HZ && c.dt_sec.abs() <= DT_TOL_S)
             .collect();
         if near.is_empty() {
             println!(
