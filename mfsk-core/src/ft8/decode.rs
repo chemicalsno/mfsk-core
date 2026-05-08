@@ -487,7 +487,31 @@ fn process_candidate(
     let cand_owned = refined.clone();
     let cand: &SyncCandidate = &cand_owned;
 
-    let i_start = ((refined.dt_sec + 0.5) * 200.0).round() as usize;
+    // Compute symbol-window start in cd0 sample units (200 sps). For
+    // refined dt < -0.5 s the nominal start is negative, which the
+    // previous `as usize` cast saturated to 0 — silently reading the
+    // wrong window and emitting garbage LLRs / nsync ≈ 0. Mirror the
+    // decode_block path (decode_block.rs:1203,1228 — i32 ibest with
+    // all-or-nothing zero fill outside cd0). Implementation: when
+    // nominal_i0 < 0, prepend `|nominal_i0|` zero samples to cd0 and
+    // shift i_start to 0. Symbols that fall in the prepended region
+    // become all-zero (matches WSJT-X csymb=0 zero fill), the rest
+    // read from the original cd0 at the correct offset.
+    //
+    // Repro: qso3_busy.wav 1196 Hz F5RXL rank-7 cand has refined
+    // dt_sec = -0.78 → nominal_i0 = -56. Pre-fix: i_start = 0,
+    // sync_quality = 0/1, candidate dies at the nsync gate.
+    let nominal_i0 = ((refined.dt_sec + 0.5) * 200.0).round() as i32;
+    let (cd0, i_start) = if nominal_i0 < 0 {
+        let pad = (-nominal_i0) as usize;
+        let mut padded: alloc::vec::Vec<num_complex::Complex<f32>> =
+            alloc::vec::Vec::with_capacity(pad + cd0.len());
+        padded.resize(pad, num_complex::Complex::new(0.0, 0.0));
+        padded.extend_from_slice(&cd0);
+        (padded, 0usize)
+    } else {
+        (cd0, nominal_i0 as usize)
+    };
     let cs_raw = symbol_spectra(&cd0, i_start);
     let nsync = sync_quality(&cs_raw);
     if nsync <= 6 {

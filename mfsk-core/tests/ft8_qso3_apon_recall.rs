@@ -98,7 +98,7 @@ const JTDX_AP_ON_EXTRAS: &[&str] = &[
 /// `JTDX_AP_ON_EXTRAS.len()` and the test will start gating the
 /// fix-forward. Until then the test reports JTDX coverage as
 /// informational diagnostics.
-const JTDX_EXTRAS_HARD_FLOOR: usize = 0;
+const JTDX_EXTRAS_HARD_FLOOR: usize = 1;
 
 /// Cap on total output. AP-on adds passes 5..12; we expect a few
 /// extra decodes but not a flood. Set generously so the test
