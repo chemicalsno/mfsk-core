@@ -502,13 +502,18 @@ fn process_candidate(
     // dt_sec = -0.78 → nominal_i0 = -56. Pre-fix: i_start = 0,
     // sync_quality = 0/1, candidate dies at the nsync gate.
     let nominal_i0 = ((refined.dt_sec + 0.5) * 200.0).round() as i32;
+    let window_len = 79 * 32; // 79 symbols * 32 samples/symbol
     let (cd0, i_start) = if nominal_i0 < 0 {
         let pad = (-nominal_i0) as usize;
-        let mut padded: alloc::vec::Vec<num_complex::Complex<f32>> =
-            alloc::vec::Vec::with_capacity(pad + cd0.len());
+        let mut padded = Vec::with_capacity(pad + cd0.len());
         padded.resize(pad, num_complex::Complex::new(0.0, 0.0));
         padded.extend_from_slice(&cd0);
         (padded, 0usize)
+    } else if (nominal_i0 as usize) + window_len > cd0.len() {
+        let mut padded = cd0;
+        let needed = (nominal_i0 as usize) + window_len;
+        padded.resize(needed, num_complex::Complex::new(0.0, 0.0));
+        (padded, nominal_i0 as usize)
     } else {
         (cd0, nominal_i0 as usize)
     };
